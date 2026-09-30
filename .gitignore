@@ -46,3 +46,6 @@ Thumbs.db
 
 # graphify knowledge-graph output
 graphify-out/
+
+# VisDrone dataset files
+VisDrone_dataset/
