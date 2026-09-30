@@ -43,3 +43,6 @@ Thumbs.db
 # Secrets
 .env
 *.key
+
+# graphify knowledge-graph output
+graphify-out/
