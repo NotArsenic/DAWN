@@ -23,8 +23,9 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data (large files -- download separately)
-data/
+# Data (large files -- download separately). The manifests are small and committed.
+data/*
+!data/manifests/
 *.pt
 *.pth
 *.ckpt
@@ -48,4 +49,4 @@ Thumbs.db
 graphify-out/
 
 # VisDrone dataset files
-VisDrone_dataset/
+data/VisDrone_dataset/*
