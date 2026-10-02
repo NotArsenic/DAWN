@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Stage 1: Train the flow matching model.
+
+Trains the DINOv3 encoder + velocity transformer to predict bilateral grid
+coefficients via conditional flow matching / rectified flow.
+
+Usage:
+    python scripts/train_flow.py --config configs/flow.yaml
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+import torch
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train flow matching model (Stage 1)")
+    parser.add_argument("--config", type=str, default="configs/flow.yaml", help="Config file")
+    parser.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
+    parser.add_argument("--override", nargs="*", default=[],
+                        help="Extra YAML files merged on top, in order (e.g. configs/debug.yaml)")
+    parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
+    parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    args = parser.parse_args()
+
+    logger.info("Stage 1: Flow matching training")
+    logger.info(f"  Config: {args.config}")
+    logger.info(f"  Device: {args.device}")
+
+    # TODO: Implement training loop. Raw vs standardized grids: docs/conventions.md section 5.
+    # 1. Load configs (omegaconf): cfg = merge(flow.yaml, data.yaml, *args.override)
+    # 2. Build dataset + dataloader (VisDroneDataset on the "day" manifest)
+    # 3. Build models: DINOEncoder.from_config(cfg.encoder) (peft LoRA), velocity transformer,
+    #    noise head
+    # 4. Build optimizer + scheduler (LoRA params at encoder.lora_lr, the rest at optim.lr)
+    # 5. Training loop:
+    #    a. Sample batch: (night, night_clean, day, noise_params), all linear RGB
+    #    b. Fit oracle grids (raw): grid, node_weights = fit_grid(night_clean, day,
+    #       compute_guidance(night_clean))
+    #    c. z_1 = standardize(grid)
+    #    d. Encode once per image: enc = encoder(night_256, return_attn=True), and
+    #       enc_frozen = encoder.forward_frozen(night_256) as the L_align target
+    #    e. Per image, sample flow.timesteps_per_image times: z_0 ~ N(0, I), t ~ U(0, 1)
+    #    f. z_t = (1-t)*z_0 + t*z_1
+    #    g. Predict velocity: v = velocity_model(z_t, t, enc.patch_tokens, enc.patch_attn)
+    #    h. Predict noise: (log_a, log_b) = noise_head(enc.patch_tokens)
+    #    i. Render: z1_hat = z_t + (1-t)*v, then unstandardize, slice_grid and apply_affine on
+    #       night_clean_256 -> applied_pred
+    #    j. Loss: L_flow + L_render + L_noise + L_align, weights from cfg.flow
+    #       (TODO(confirm): what flow.warmup_steps gates)
+    #    k. Backward + step + EMA; if logging.log_attn_gates, log each block's dino_gate
+    # 6. Periodic validation, logging, checkpointing (the checkpoint embeds the grid stats)
+
+    logger.warning("Training loop not yet implemented.")
+
+
+if __name__ == "__main__":
+    main()

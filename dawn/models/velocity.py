@@ -1,0 +1,199 @@
+"""Velocity transformer for bilateral grid flow matching.
+
+6-block DiT that predicts the velocity field v(z_t, t, c) where:
+    z_t: noisy STANDARDIZED grid coefficients at time t, (B, 12, K, gy, gx).
+    t:   flow time in [0, 1] (0 = noise, 1 = data).
+    c:   conditioning from the DINOv3 encoder.
+
+Uses adaLN-Zero for time conditioning and an optional additive bias from DINO attention.
+
+The grid is tokenized here and only here, with `dawn.grid.layout.grid_to_tokens` /
+`tokens_to_grid`: 256 tokens (one per spatial cell) of 96 values (K bins x 12 coefficients).
+Layout and token order: docs/conventions.md section 2.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+
+class AdaLNZero(nn.Module):
+    """Adaptive Layer Normalization (Zero init) for time conditioning.
+
+    Projects time embedding to (shift, scale, gate) per channel.
+    Initialized so gate ≈ 0, making each block a no-op at init.
+    """
+
+    def __init__(self, hidden_dim: int, cond_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.proj = nn.Linear(cond_dim, 3 * hidden_dim)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (normalized_x * (1 + scale) + shift, gate)."""
+        shift, scale, gate = self.proj(cond).chunk(3, dim=-1)
+        x_normed = self.norm(x)
+        return x_normed * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate
+
+
+class DiTBlock(nn.Module):
+    """Single Diffusion Transformer block.
+
+    Multi-head self-attention + MLP, both gated via adaLN-Zero.
+    Optional additive bias from DINO attention maps:
+        logits = QK^T / sqrt(d) + dino_gate * log(dino_attn + 1e-6)
+    with one learned scalar `dino_gate` per block, initialized at 0.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        num_heads: int = 4,
+        mlp_ratio: int = 4,
+        dropout: float = 0.0,
+        use_dino_attn: bool = True,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.adaln_attn = AdaLNZero(hidden_dim, hidden_dim)
+        self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        self.adaln_mlp = AdaLNZero(hidden_dim, hidden_dim)
+        mlp_hidden = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, hidden_dim),
+            nn.Dropout(dropout),
+        )
+
+        self.use_dino_attn = use_dino_attn
+        if use_dino_attn:
+            self.dino_gate = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        dino_attn: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: (B, N, D) hidden states (N = grid_h * grid_w = 256 tokens, D = hidden_dim).
+            t_emb: (B, D) time embedding.
+            dino_attn: (B, N, N) head-averaged DINO patch-to-patch attention, added to the
+                logits of every head as described in the class docstring (optional).
+
+        Returns:
+            x: (B, N, D) updated hidden states.
+        """
+        raise NotImplementedError
+
+
+class VelocityTransformer(nn.Module):
+    """Predicts velocity v(z_t, t, c) for conditional flow matching.
+
+    Architecture:
+        1. Tokenize the grid: (B, 12, K, gy, gx) → (B, 256, K*12) via `grid_to_tokens`,
+           then Linear(K*12 → D).
+        2. Add sinusoidal time embedding.
+        3. Add DINO features (Linear 384 → D) as conditioning and, optionally, DINO attention
+           as a per-block attention bias.
+        4. 6x DiTBlock with adaLN-Zero.
+        5. Linear proj back to K*12 values per token (zero-initialized).
+        6. `tokens_to_grid` back to (B, 12, K, gy, gx).
+
+    Total: ~7M params, ~1.2 GMACs/step.
+    """
+
+    def __init__(
+        self,
+        grid_h: int = 16,
+        grid_w: int = 16,
+        num_bins: int = 8,
+        coeffs: int = 12,
+        hidden_dim: int = 256,
+        num_heads: int = 4,
+        num_blocks: int = 6,
+        mlp_ratio: int = 4,
+        dino_dim: int = 384,
+        dropout: float = 0.0,
+        detach_dino_attn: bool = True,
+    ):
+        super().__init__()
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.num_bins = num_bins
+        self.num_tokens = grid_h * grid_w
+        self.token_dim = num_bins * coeffs
+        self.detach_dino_attn = detach_dino_attn
+
+        self.input_proj = nn.Linear(self.token_dim, hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, self.token_dim)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+        self.dino_proj = nn.Linear(dino_dim, hidden_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.blocks = nn.ModuleList(
+            [DiTBlock(hidden_dim, num_heads, mlp_ratio, dropout) for _ in range(num_blocks)]
+        )
+
+    def _sinusoidal_embedding(self, t: torch.Tensor, dim: int) -> torch.Tensor:
+        """Sinusoidal positional embedding for continuous time t ∈ [0, 1].
+
+        Args:
+            t: (B,) time values.
+            dim: Embedding dimension.
+
+        Returns:
+            (B, dim) time embedding.
+        """
+        half_dim = dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)
+
+    def forward(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        dino_features: torch.Tensor,
+        dino_attn: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict velocity field.
+
+        Args:
+            z_t: (B, 12, K, gy, gx) STANDARDIZED noisy grid at time t.
+            t: (B,) time in [0, 1].
+            dino_features: (B, 256, dino_dim) patch tokens from the encoder.
+            dino_attn: (B, 256, 256) head-averaged patch-to-patch DINO attention for the
+                attention bias. Detached first when `detach_dino_attn` is set.
+
+        Returns:
+            v: (B, 12, K, gy, gx) predicted velocity, standardized.
+        """
+        raise NotImplementedError
+
+    def num_params(self) -> int:
+        """Total parameter count (should be ~7M)."""
+        return sum(p.numel() for p in self.parameters())

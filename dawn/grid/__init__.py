@@ -1,0 +1,1 @@
+"""Bilateral grid operations: fit, slice, apply, guidance."""

@@ -1,0 +1,76 @@
+"""Visualization utilities for evaluation.
+
+Creates side-by-side comparison grids:
+    input | enhanced | ground-truth | uncertainty
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import torch
+
+
+def make_comparison_grid(
+    night: torch.Tensor,
+    enhanced: torch.Tensor,
+    day: torch.Tensor,
+    uncertainty: torch.Tensor | None = None,
+    nrow: int = 4,
+) -> torch.Tensor:
+    """Create a comparison grid image.
+
+    Arranges images as columns: [night | enhanced | day | uncertainty].
+    Each row is one sample.
+
+    Args:
+        night: (N, 3, H, W) input night images.
+        enhanced: (N, 3, H, W) enhanced outputs.
+        day: (N, 3, H, W) ground-truth day images.
+        uncertainty: (N, 1, H, W) uncertainty maps (optional).
+        nrow: Number of samples per row.
+
+    Returns:
+        grid: (3, grid_H, grid_W) single image tensor.
+    """
+    raise NotImplementedError
+
+
+def colorize_uncertainty(
+    uncertainty: torch.Tensor,
+    cmap: str = "magma",
+) -> torch.Tensor:
+    """Apply a colormap to a single-channel uncertainty map.
+
+    Args:
+        uncertainty: (B, 1, H, W) uncertainty values.
+        cmap: Matplotlib colormap name.
+
+    Returns:
+        colored: (B, 3, H, W) RGB-colored uncertainty.
+    """
+    raise NotImplementedError
+
+
+def save_comparison(
+    output_dir: str | Path,
+    batch_idx: int,
+    night: torch.Tensor,
+    enhanced: torch.Tensor,
+    day: torch.Tensor,
+    uncertainty: torch.Tensor | None = None,
+) -> list[Path]:
+    """Save per-sample comparison images to disk.
+
+    Args:
+        output_dir: Directory to save images.
+        batch_idx: Batch index for filename disambiguation.
+        night: (N, 3, H, W) night inputs.
+        enhanced: (N, 3, H, W) enhanced outputs.
+        day: (N, 3, H, W) day ground truth.
+        uncertainty: (N, 1, H, W) uncertainty maps (optional).
+
+    Returns:
+        List of saved file paths.
+    """
+    raise NotImplementedError

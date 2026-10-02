@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Sanity check: degradation pipeline.
+
+Apply synthetic nighttime degradation to a sample image and visualize:
+    - Original day image
+    - Degraded (clean, no noise)
+    - Degraded (with noise)
+    - Noise variance map
+
+Runs on CPU, no GPU required.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import torch
+from PIL import Image
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize synthetic night degradation")
+    parser.add_argument("--image", type=str, required=True, help="Path to a day image")
+    parser.add_argument("--output", type=str, default="outputs/check_degradation", help="Output dir")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # TODO: Load image, apply degradation, save side-by-side
+    print("check_degradation.py: not yet implemented")
+    print(f"  Would process: {args.image}")
+    print(f"  Output to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()

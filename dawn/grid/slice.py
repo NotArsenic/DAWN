@@ -1,0 +1,78 @@
+"""Trilinear grid slicing and affine application.
+
+Given a bilateral grid (B, 12, K, gy, gx) and a per-pixel guidance map, interpolate the grid
+trilinearly at each pixel's (x, y, guidance) coordinate, then apply the resulting 3x4 affine
+to the pixel.
+
+Layout, coefficient order and the cell-center coordinate convention are defined in
+docs/conventions.md (sections 2 and 3). `trilinear_weights` is the only implementation of the
+corner nodes and weights; `fit.py` uses it too.
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+def trilinear_weights(
+    guidance: torch.Tensor,
+    grid_size: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Corner nodes and trilinear weights of every pixel (cell-center convention).
+
+    For pixel (r, c) of an H x W image with guidance g:
+        yf = (r + 0.5) * gy / H - 0.5
+        xf = (c + 0.5) * gx / W - 0.5
+        zf = g * K - 0.5
+    Each coordinate is clamped to [0, N-1]; then i0 = floor(f), i1 = min(i0 + 1, N-1),
+    w1 = f - i0, w0 = 1 - w1. A corner's weight is the product of its three axis weights.
+
+    Args:
+        guidance: (B, 1, H, W) in [0, 1], from `compute_guidance`.
+        grid_size: (K, gy, gx) = (num_bins, grid_h, grid_w).
+
+    Returns:
+        node_index: (B, 8, H, W) int64, flat index k*gy*gx + y*gx + x into a (K, gy, gx) grid.
+        weight: (B, 8, H, W) float32, non-negative, sums to 1 over dim 1.
+            Corner n = 4*dz + 2*dy + dx, where d* in {0, 1} picks i0 or i1.
+    """
+    raise NotImplementedError
+
+
+def slice_grid(
+    grid: torch.Tensor,
+    guidance: torch.Tensor,
+) -> torch.Tensor:
+    """Trilinear-interpolate the bilateral grid at each pixel.
+
+    The output resolution is the guidance resolution. May use F.grid_sample for speed at full
+    resolution, but must agree with `trilinear_weights` (docs/conventions.md section 3).
+
+    Args:
+        grid: (B, 12, K, gy, gx) raw affine coefficients.
+        guidance: (B, 1, H, W) in [0, 1], from `compute_guidance`.
+
+    Returns:
+        coeffs: (B, 12, H, W) per-pixel affine coefficients, same channel order as the grid.
+    """
+    raise NotImplementedError
+
+
+def apply_affine(
+    coeffs: torch.Tensor,
+    image: torch.Tensor,
+) -> torch.Tensor:
+    """Apply per-pixel 3x4 affine transforms to an image.
+
+    out[i] = sum_j(M[i, j] * image[j]) + t[i]   for i in {R, G, B}
+
+    Args:
+        coeffs: (B, 12, H, W) per-pixel affine coefficients.
+            Channels 0-8: M (3x3 matrix, row-major, row = output channel).
+            Channels 9-11: t (offsets).
+        image: (B, 3, H, W) linear RGB input.
+
+    Returns:
+        out: (B, 3, H, W) transformed linear RGB, clamped to [0, 1].
+    """
+    raise NotImplementedError

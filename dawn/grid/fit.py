@@ -1,0 +1,73 @@
+"""Weighted least-squares bilateral grid fitting.
+
+For each spatial cell and brightness bin, fits a 3x4 affine color matrix that maps
+night_clean pixels to day pixels, weighting every pixel by its trilinear slice weights.
+
+This produces the ground-truth grid targets for flow matching training. The grid is RAW
+(physical coefficients); standardize it before using it as a flow target. Layout and
+coefficient order: docs/conventions.md section 2.
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+def fit_grid(
+    night_clean: torch.Tensor,
+    day: torch.Tensor,
+    guidance: torch.Tensor,
+    grid_h: int = 16,
+    grid_w: int = 16,
+    num_bins: int = 8,
+    ridge_alpha: float = 1e-3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit a bilateral affine grid from night_clean to day via weighted least squares.
+
+    For each cell (y, x) and bin k, solves:
+        min_A ||W^{1/2} (A @ [night_clean; 1] - day)||^2 + ridge * ||A||^2
+
+    where W are the trilinear interpolation weights. They come from
+    `dawn.grid.slice.trilinear_weights`: this function never computes coordinates, floors or
+    corner weights itself (docs/conventions.md section 8, rule 1).
+
+    Ridge pulls sparse bins toward the cell's all-bin fit, and sparse cells toward the
+    whole-image fit. NOT toward identity (identity = "don't brighten").
+
+    Args:
+        night_clean: (B, 3, H, W) linear RGB, no noise.
+        day: (B, 3, H, W) linear RGB ground truth.
+        guidance: (B, 1, H, W) from `compute_guidance(night_clean)`, in [0, 1].
+        grid_h: Grid cell rows (gy).
+        grid_w: Grid cell columns (gx).
+        num_bins: Number of brightness bins (K).
+        ridge_alpha: Regularization strength.
+
+    Returns:
+        grid: (B, 12, K, gy, gx) raw fitted coefficients, canonical coefficient order.
+        node_weights: (B, K, gy, gx) sum of trilinear weights per node ("pixel counts").
+    """
+    raise NotImplementedError
+
+
+def _solve_affine_wls(
+    src: torch.Tensor,
+    tgt: torch.Tensor,
+    weights: torch.Tensor,
+    ridge: float = 1e-3,
+) -> torch.Tensor:
+    """Solve weighted least squares for a single cell/bin.
+
+    Solves: X = (Phi^T W Phi + ridge I)^{-1} Phi^T W Y
+    where Phi = [src, 1] (homogeneous), Y = tgt. X is 4x3, so M = X[:3].T and t = X[3].
+
+    Args:
+        src: (N, 3) source pixels (night_clean).
+        tgt: (N, 3) target pixels (day).
+        weights: (N,) trilinear interpolation weights.
+        ridge: Regularization.
+
+    Returns:
+        coeffs: (12,) in canonical order: M row-major (9), then t (3).
+    """
+    raise NotImplementedError

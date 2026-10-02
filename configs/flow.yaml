@@ -1,0 +1,82 @@
+# Stage 1: Flow model training configuration.
+# Layouts and conventions: docs/conventions.md
+
+# Grid specification.
+grid:
+  spatial_size: 16       # 16x16 spatial cells
+  num_bins: 8            # brightness bins
+  coeffs_per_bin: 12     # 3x3 matrix (row-major) + 3 offsets, see docs/conventions.md section 2.2
+  # Ridge regularization for grid fitting.
+  ridge_alpha: 1.0e-3
+  # Normalization stats are computed once and cached.
+  stats_cache: data/grid_stats.pt
+  stats_num_samples: 2000
+
+# Encoder: DINOv3 ViT-S+/16 with peft LoRA. One interface, two backends (dawn/models/encoder.py).
+encoder:
+  backend: timm            # timm | transformers
+  model_ids:
+    timm: vit_small_plus_patch16_dinov3.lvd1689m                 # needs timm>=1.0.20
+    transformers: facebook/dinov3-vits16plus-pretrain-lvd1689m   # gated; needs the `transformers` extra
+  patch_size: 16
+  input_size: 256          # 256 / 16 = 16x16 patch tokens, matching grid.spatial_size
+  num_register_tokens: 4   # patch tokens start after CLS + registers (index 1 + 4)
+  lora_rank: 8
+  lora_alpha: 8
+  lora_dropout: 0.0
+  lora_lr: 1.0e-4
+  # peft target_modules per backend: attention qkv + output projection of every block.
+  # A string is a regex (full match), a list matches module-name suffixes. The timm regex keeps
+  # patch_embed.proj out. Verify the matched names with scripts/smoke_dino.py.
+  lora_targets:
+    timm: '.*blocks\.\d+\.attn\.(qkv|proj)'
+    transformers: [q_proj, k_proj, v_proj, o_proj]
+
+# Velocity transformer.
+velocity:
+  hidden_dim: 256
+  num_heads: 4
+  num_blocks: 6
+  mlp_ratio: 4
+  dropout: 0.0
+  # Attention bias from DINO patch-to-patch attention.
+  dino_attn_gate_init: 0.0  # learned per block, init at 0
+  detach_dino_attn: true    # no gradient into the encoder through the attention bias
+
+# Flow matching.
+flow:
+  num_train_steps: 40000    # 30-50K on the 16 GB card (the original plan said 100K)
+  num_inference_steps: 2    # NFE at inference
+  timesteps_per_image: 4    # t samples per image per step: one encoder pass feeds 4 velocity passes
+  # Loss weights.
+  velocity_weight: 1.0      # L_flow
+  apply_weight: 0.1         # L_render: L1(applied grid, day image)
+  noise_weight: 1.0         # L_noise: MSE on (log a, log b)
+  align_weight: 0.5         # L_align: adapted vs frozen (adapters disabled) DINO features
+  # Bin-count weighting: scale loss per bin by pixel count.
+  bin_count_weighting: true
+  # TODO(confirm): the "5K-step schedule" from the design notes. What it gates is not recorded
+  # in the repo. Candidates: render-loss ramp-in (loss.py skips the render loss at early steps),
+  # LoRA unfreeze, or an L_align ramp.
+  warmup_steps: 5000
+
+# Optimization.
+optim:
+  optimizer: adamw
+  lr: 2.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  batch_size: 32          # images per step (16 GB card); x flow.timesteps_per_image velocity samples each
+  grad_clip: 1.0
+  precision: bf16         # bf16 | fp32
+  ema_decay: 0.999
+
+# Logging.
+logging:
+  wandb_project: dawn
+  wandb_mode: online      # online | offline | disabled
+  log_every: 100
+  log_attn_gates: true    # log each block's learned DINO-attention gate every log_every steps
+  save_every: 5000
+  val_every: 5000
+  num_val_samples: 64

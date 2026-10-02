@@ -1,0 +1,114 @@
+"""Grid coefficient standardization.
+
+Flow matching targets should be roughly N(0, 1)-scaled. We compute a mean and std per
+(coefficient, bin) from a subset of fitted RAW grids, then standardize / unstandardize.
+`standardize` and `unstandardize` are the only places a grid changes space; where they are
+called is pinned in docs/conventions.md section 5.
+
+Grids are (B, 12, K, gy, gx); stats are (12, K), broadcast as (1, 12, K, 1, 1).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import torch
+
+# std is floored by both standardize and unstandardize, so they stay exact inverses.
+STD_FLOOR = 1e-6
+
+
+@torch.no_grad()
+def compute_grid_stats(
+    dataset,
+    num_samples: int = 2000,
+    device: torch.device = torch.device("cpu"),
+) -> dict[str, torch.Tensor]:
+    """Compute per-(coefficient, bin) mean and std from fitted RAW grids.
+
+    Grids are fit on the fly: for each sample, `fit_grid(night_clean, day,
+    compute_guidance(night_clean))`.
+
+    Args:
+        dataset: Dataset that yields dicts with 'night_clean' and 'day' (linear RGB).
+        num_samples: Number of samples to use.
+        device: Computation device.
+
+    Returns:
+        dict with 'mean' and 'std', each (12, K) float32, statistics over samples and cells.
+    """
+    raise NotImplementedError
+
+
+def _broadcast(stat: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """(12, K) stats -> (1, 12, K, 1, 1), on the grid's device and dtype."""
+    return stat.reshape(1, *stat.shape, 1, 1).to(device=grid.device, dtype=grid.dtype)
+
+
+def standardize(
+    grid: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    """Raw -> standardized: (grid - mean) / std, per (coefficient, bin).
+
+    Args:
+        grid: (B, 12, K, gy, gx) raw coefficients.
+        mean: (12, K) per-(coefficient, bin) mean.
+        std: (12, K) per-(coefficient, bin) std.
+
+    Returns:
+        Standardized grid, same shape.
+    """
+    return (grid - _broadcast(mean, grid)) / _broadcast(std, grid).clamp(min=STD_FLOOR)
+
+
+def unstandardize(
+    grid: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    """Standardized -> raw: grid * std + mean, per (coefficient, bin).
+
+    Args:
+        grid: (B, 12, K, gy, gx) standardized coefficients.
+        mean: (12, K) per-(coefficient, bin) mean.
+        std: (12, K) per-(coefficient, bin) std.
+
+    Returns:
+        Raw grid, same shape.
+    """
+    return grid * _broadcast(std, grid).clamp(min=STD_FLOOR) + _broadcast(mean, grid)
+
+
+def load_or_compute_stats(
+    cache_path: str | Path,
+    dataset=None,
+    num_samples: int = 2000,
+    device: torch.device = torch.device("cpu"),
+) -> dict[str, torch.Tensor]:
+    """Load cached stats or compute and save them.
+
+    Training caches here; checkpoints embed the stats they were trained with and inference
+    reads them from the checkpoint, not from this cache.
+
+    Args:
+        cache_path: Path to cached .pt file.
+        dataset: Dataset to compute from (if cache missing).
+        num_samples: Number of samples for computation.
+        device: Computation device.
+
+    Returns:
+        dict with 'mean' and 'std' tensors, each (12, K).
+    """
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        return torch.load(cache_path, map_location=device, weights_only=True)
+
+    if dataset is None:
+        raise FileNotFoundError(f"Stats cache not found at {cache_path} and no dataset provided.")
+
+    stats = compute_grid_stats(dataset, num_samples, device)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(stats, cache_path)
+    return stats

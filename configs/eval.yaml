@@ -1,0 +1,33 @@
+# Evaluation configuration.
+
+eval:
+  checkpoint: checkpoints/dawn.pt
+  data_dir: data/visdrone
+  output_dir: outputs/eval
+  num_inference_steps: 2
+  batch_size: 16
+
+metrics:
+  # Synthetic test set (quantitative).
+  compute_psnr: true
+  compute_ssim: true
+  compute_lpips: true
+  # Object-crop metrics using VisDrone detection boxes.
+  object_crop_metrics: true
+
+uncertainty:
+  # Calibration: predicted std vs actual |error|.
+  calibration_bins: 20
+  save_calibration_plot: true
+
+hallucination_audit:
+  # Run YOLO on input and output, count objects that appear/disappear.
+  enabled: true
+  detector: yolov8n  # lightweight, off-the-shelf
+  confidence_threshold: 0.25
+  iou_threshold: 0.5
+
+visualization:
+  num_samples: 32
+  save_grids: true          # input | enhanced | uncertainty side-by-side
+  save_uncertainty_maps: true

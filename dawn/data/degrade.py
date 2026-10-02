@@ -1,0 +1,70 @@
+"""Synthetic nighttime degradation pipeline.
+
+Transforms a daytime image into a realistic night image in two physical stages:
+    1. lighting.py  scene illumination (moonlit / streetlit) -> night_clean
+    2. camera.py    sensor noise + ISP (gamma, 8-bit, JPEG)  -> night
+
+This module only composes them. Everything is linear RGB in and out (docs/conventions.md
+section 1); the pipeline yields both the clean degraded image (grid-fitting supervision) and the
+noisy one (model input), plus the sensor noise parameters (a, b) of section 6.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from dawn.data.camera import CameraParams, apply_camera, sample_camera_params
+from dawn.data.lighting import LightingParams, apply_lighting, sample_lighting_params
+
+
+@dataclass
+class DegradationParams:
+    """Randomly sampled degradation parameters for one image."""
+
+    lighting: LightingParams
+    camera: CameraParams
+
+
+def sample_degradation_params(
+    height: int,
+    width: int,
+    cfg: dict,
+    device: torch.device = torch.device("cpu"),
+) -> DegradationParams:
+    """Sample random degradation parameters from config ranges.
+
+    Args:
+        height: Image height.
+        width: Image width.
+        cfg: The `degradation` section of data.yaml (with `lighting` and `camera` subsections).
+        device: Tensor device.
+
+    Returns:
+        DegradationParams with all random values filled in.
+    """
+    return DegradationParams(
+        lighting=sample_lighting_params(height, width, cfg["lighting"], device),
+        camera=sample_camera_params(cfg["camera"], device),
+    )
+
+
+def apply_degradation(
+    day_linear: torch.Tensor,
+    params: DegradationParams,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[float, float]]:
+    """Apply nighttime degradation to a linear-RGB daytime image.
+
+    Args:
+        day_linear: (3, H, W) linear RGB image in [0, 1].
+        params: Sampled degradation parameters.
+
+    Returns:
+        night_clean: (3, H, W) relit linear RGB, no noise.
+        night: (3, H, W) linear RGB after sensor noise, 8-bit quantization and JPEG.
+        (a, b): sensor noise parameters, Var[y | x] = a*x + b; `b` is a variance.
+    """
+    night_clean = apply_lighting(day_linear, params.lighting)
+    night = apply_camera(night_clean, params.camera)
+    return night_clean, night, (params.camera.noise_a, params.camera.noise_b)

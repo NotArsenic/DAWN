@@ -1,0 +1,1 @@
+"""Analytic uncertainty propagation through affine transforms."""

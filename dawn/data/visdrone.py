@@ -1,0 +1,66 @@
+"""VisDrone dataset class with synthetic night degradation.
+
+Reads the PNG copies and manifests made by scripts/prepare_visdrone.py, applies on-the-fly
+synthetic nighttime degradation, and returns training samples. Every image tensor is linear
+RGB (docs/conventions.md section 1): files are decoded and linearized here, sRGB never leaves
+this module.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import torch
+from torch.utils.data import Dataset
+
+
+class VisDroneDataset(Dataset):
+    """VisDrone-DET dataset with on-the-fly nighttime degradation.
+
+    Each sample is a dict:
+        night: (3, crop, crop) linear night image (degraded + noisy), the model input.
+        night_clean: (3, crop, crop) linear night image (degraded, no noise), for grid fitting.
+        day: (3, crop, crop) linear daytime ground truth.
+        noise_params: dict with keys 'a' and 'b' (Poisson-Gaussian; `b` is a variance).
+        meta: dict with image path, original size, etc.
+    """
+
+    def __init__(
+        self,
+        prepared_dir: str | Path,
+        split: str = "train",
+        subset: str = "day",
+        crop_size: int = 256,
+        degradation_cfg: Optional[dict] = None,
+        max_images: Optional[int] = None,
+    ) -> None:
+        """
+        Args:
+            prepared_dir: Output directory of scripts/prepare_visdrone.py.
+            split: VisDrone split ("train" or "val").
+            subset: Which manifest to read: "day" (training), "night" (real night,
+                evaluation) or "ambiguous".
+            crop_size: Training crop size.
+            degradation_cfg: The `degradation` section of data.yaml.
+            max_images: Cap on the number of images (debug runs).
+        """
+        super().__init__()
+        self.prepared_dir = Path(prepared_dir)
+        self.split = split
+        self.subset = subset
+        self.crop_size = crop_size
+        self.degradation_cfg = degradation_cfg or {}
+        self.max_images = max_images
+        self.image_paths: list[Path] = []
+        self._scan_images()
+
+    def _scan_images(self) -> None:
+        """Read `<prepared_dir>/manifests/<split>_<subset>.txt` into `self.image_paths`."""
+        raise NotImplementedError
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        raise NotImplementedError

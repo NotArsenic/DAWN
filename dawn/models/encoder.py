@@ -1,0 +1,150 @@
+"""DINOv3 ViT-S+/16 encoder with peft LoRA adapters, behind one interface for two backends.
+
+Backends (config: encoder.backend):
+    timm          timm.create_model(model_id); needs timm >= 1.0.20.
+    transformers  AutoModel.from_pretrained(model_id); needs the `transformers` extra and
+                  approved access to the gated facebook/dinov3-* repo.
+
+Both are wrapped so `DINOEncoder.forward` returns the same `EncoderOutput`; nothing outside
+this module knows which backend is in use.
+
+LoRA comes from peft only (no hand-rolled LoRA layer). That also gives the L_align target for
+free: `disable_adapter()` runs the same network with the adapters off, i.e. the frozen
+pretrained features (see `forward_frozen`).
+
+Backend libraries are imported lazily inside the loaders so this module imports without them.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Literal, Mapping, NamedTuple
+
+import torch
+import torch.nn as nn
+
+logger = logging.getLogger(__name__)
+
+Backend = Literal["timm", "transformers"]
+
+
+class EncoderOutput(NamedTuple):
+    """Backend-independent encoder result.
+
+    N = (H / 16) * (W / 16) patches in row-major (y, x) order; C = 384 for ViT-S+.
+    CLS and register tokens are stripped from the patch outputs (layout: [CLS, 4 registers,
+    patches]).
+    """
+
+    patch_tokens: torch.Tensor  # (B, N, C)
+    cls_token: torch.Tensor  # (B, C)
+    patch_attn: torch.Tensor | None  # (B, N, N) last layer, head-averaged; only if requested
+
+
+class DINOEncoder(nn.Module):
+    """DINOv3 ViT-S+/16 with LoRA on the attention qkv and output projections.
+
+    The pretrained weights are frozen; only the LoRA parameters train (peft freezes the rest).
+    """
+
+    def __init__(
+        self,
+        backend: Backend = "timm",
+        model_id: str = "vit_small_plus_patch16_dinov3.lvd1689m",
+        lora_rank: int = 8,
+        lora_alpha: float = 8.0,
+        lora_dropout: float = 0.0,
+        lora_targets: str | list[str] | None = None,
+        pretrained: bool = True,
+    ):
+        super().__init__()
+        self.backend = backend
+        self.model_id = model_id
+        backbone = self._load_backbone(backend, model_id, pretrained)
+        self.backbone: nn.Module = self._apply_lora(
+            backbone, lora_rank, lora_alpha, lora_dropout, lora_targets
+        )
+
+    @classmethod
+    def from_config(cls, cfg: Mapping) -> "DINOEncoder":
+        """Build from the `encoder:` section of configs/flow.yaml."""
+        backend = cfg["backend"]
+        targets = cfg["lora_targets"][backend]
+        return cls(
+            backend=backend,
+            model_id=cfg["model_ids"][backend],
+            lora_rank=cfg["lora_rank"],
+            lora_alpha=cfg["lora_alpha"],
+            lora_dropout=cfg["lora_dropout"],
+            lora_targets=targets if isinstance(targets, str) else list(targets),
+        )
+
+    def _load_backbone(self, backend: Backend, model_id: str, pretrained: bool) -> nn.Module:
+        """Load the raw (not yet LoRA-wrapped) backbone for the chosen backend."""
+        if backend == "timm":
+            return self._load_timm(model_id, pretrained)
+        if backend == "transformers":
+            return self._load_transformers(model_id, pretrained)
+        raise ValueError(f"Unknown encoder backend {backend!r}; expected 'timm' or 'transformers'.")
+
+    def _load_timm(self, model_id: str, pretrained: bool) -> nn.Module:
+        """timm.create_model(model_id, pretrained=pretrained), 256x256 input, no classifier."""
+        raise NotImplementedError
+
+    def _load_transformers(self, model_id: str, pretrained: bool) -> nn.Module:
+        """AutoModel.from_pretrained(model_id); attention maps need the eager attention path."""
+        raise NotImplementedError
+
+    def _apply_lora(
+        self,
+        backbone: nn.Module,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        targets: str | list[str] | None,
+    ) -> nn.Module:
+        """Wrap the backbone with peft: get_peft_model(backbone, LoraConfig(...)).
+
+        `targets` is peft's target_modules: a str is a regex (full match), a list matches
+        module-name suffixes. They must hit only the attention qkv / output projections of
+        every block, NOT patch_embed.proj. peft freezes all non-LoRA parameters.
+        """
+        raise NotImplementedError
+
+    def forward(
+        self,
+        image_linear: torch.Tensor,
+        return_attn: bool = False,
+    ) -> EncoderOutput:
+        """Extract patch features (and optionally attention) from a linear-RGB image.
+
+        Converts to sRGB and applies ImageNet mean/std internally, because DINO is pretrained
+        on sRGB. Callers pass linear RGB like everywhere else in the pipeline
+        (docs/conventions.md section 1).
+
+        Args:
+            image_linear: (B, 3, 256, 256) linear RGB in [0, 1], already resized by the caller.
+            return_attn: Also return the last-layer patch-to-patch attention, head-averaged,
+                with CLS and register rows/columns stripped (needs an eager attention path).
+
+        Returns:
+            EncoderOutput with patch_tokens (B, 256, 384), cls_token (B, 384) and
+            patch_attn (B, 256, 256) or None.
+        """
+        raise NotImplementedError
+
+    def forward_frozen(
+        self,
+        image_linear: torch.Tensor,
+        return_attn: bool = False,
+    ) -> EncoderOutput:
+        """Same network with the LoRA adapters disabled: the pretrained features.
+
+        This is the L_align target. No gradients.
+        """
+        with torch.no_grad(), self.backbone.disable_adapter():
+            return self.forward(image_linear, return_attn)
+
+    def num_trainable_params(self) -> int:
+        """Return count of trainable parameters (~0.2M: rank 8 on qkv + proj, 12 blocks)."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

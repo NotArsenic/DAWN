@@ -1,0 +1,43 @@
+"""Noise parameter prediction head.
+
+Small MLP appended to the DINO encoder that predicts the Poisson-Gaussian
+noise parameters (log a, log b) used for analytic uncertainty propagation.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+class NoiseHead(nn.Module):
+    """Predicts Poisson-Gaussian noise parameters from DINO features.
+
+    The sensor noise model is: Var[pixel] = a * pixel + b
+    where a is the Poisson scale and b is the readout variance.
+
+    We predict (log a, log b) for positivity.
+
+    Input: global-average-pooled DINO features.
+    Output: (B, 2) with (log_a, log_b).
+    """
+
+    def __init__(self, dino_dim: int = 384, hidden_dim: int = 128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dino_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, dino_features: torch.Tensor) -> torch.Tensor:
+        """Predict noise parameters.
+
+        Args:
+            dino_features: (B, num_patches, dino_dim) patch features.
+
+        Returns:
+            (B, 2) with (log_a, log_b).
+        """
+        pooled = dino_features.mean(dim=1)
+        return self.mlp(pooled)

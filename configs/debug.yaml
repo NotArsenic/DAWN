@@ -1,0 +1,26 @@
+# Debug overlay: a tiny, fast stage-1 run that exercises the whole loop end to end.
+#
+# Merged on top of flow.yaml + data.yaml, later files winning:
+#   python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu
+#
+# Every key here must already exist in flow.yaml or data.yaml (tests/test_configs.py checks it),
+# so a typo cannot silently do nothing.
+
+visdrone:
+  max_images: 16
+
+flow:
+  num_train_steps: 50
+  timesteps_per_image: 2
+  warmup_steps: 10
+
+optim:
+  batch_size: 2
+  precision: fp32          # no bf16 autocast on CPU; easier to chase NaNs
+
+logging:
+  wandb_mode: disabled
+  log_every: 1
+  save_every: 25
+  val_every: 25
+  num_val_samples: 4

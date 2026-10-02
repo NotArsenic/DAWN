@@ -1,0 +1,41 @@
+# Dataset and degradation configuration.
+
+visdrone:
+  root: data/visdrone              # raw download (scripts/download_visdrone.py)
+  prepared_dir: data/visdrone_512  # PNG copies + manifests (scripts/prepare_visdrone.py)
+  train_split: train
+  val_split: val
+  image_size: 512   # long side of the prepared PNG copies
+  crop_size: 256    # training crop size
+  max_images: null  # cap the dataset size (debug runs)
+
+# scripts/prepare_visdrone.py classifies every image by its median sRGB luma (0-255) and writes
+# one manifest per class: < night_below is real night (held out for evaluation), >= day_above is
+# day (training), anything in between is ambiguous (unused).
+prepare:
+  night_below: 40
+  day_above: 70   # TODO: calibrate on the luma histogram of the raw set
+
+degradation:
+  # dawn/data/lighting.py: scene illumination -> night_clean.
+  lighting:
+    # Exposure reduction.
+    exposure_range: [0.01, 0.15]  # LogUniform
+    # Spatially-varying illumination field.
+    illum_grid_size: 4
+    illum_range: [0.4, 1.5]
+    # Regimes: moonlit with probability moonlight_prob, otherwise streetlit.
+    moonlight_prob: 0.2
+    moonlight_temp_range: [3800, 4300]  # Kelvin
+    # Streetlit: lamp pools, halos and color temperature.
+    num_lights_range: [0, 8]
+    light_sigma_range: [20, 150]  # pixels at 512 long-side
+    color_temp_range: [2000, 4500]  # Kelvin, sodium to LED
+    halo_intensity: 0.02
+  # dawn/data/camera.py: sensor noise + ISP -> night.
+  camera:
+    # Poisson-Gaussian noise, Var[y | x] = a*x + b.
+    noise_a_range: [1.0e-4, 5.0e-3]
+    noise_b_range: [1.0e-6, 1.0e-4]  # read-noise variance, not std
+    # Compression.
+    jpeg_quality_range: [70, 95]

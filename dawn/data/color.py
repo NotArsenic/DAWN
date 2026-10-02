@@ -1,0 +1,65 @@
+"""Color space conversion utilities.
+
+sRGB <-> linear RGB, gamma curves, and related helpers.
+All functions operate on (*, 3, H, W) or (*, 3) tensors.
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+def srgb_to_linear(img: torch.Tensor) -> torch.Tensor:
+    """Convert sRGB [0, 1] to linear RGB [0, 1].
+
+    Applies the inverse sRGB transfer function (IEC 61966-2-1).
+    """
+    threshold = 0.04045
+    low = img / 12.92
+    high = ((img + 0.055) / 1.055).clamp(min=0.0) ** 2.4
+    return torch.where(img <= threshold, low, high)
+
+
+def linear_to_srgb(img: torch.Tensor) -> torch.Tensor:
+    """Convert linear RGB [0, 1] to sRGB [0, 1].
+
+    Applies the sRGB transfer function (IEC 61966-2-1).
+    """
+    threshold = 0.0031308
+    low = img * 12.92
+    high = 1.055 * img.clamp(min=0.0) ** (1.0 / 2.4) - 0.055
+    return torch.where(img <= threshold, low, high).clamp(0.0, 1.0)
+
+
+def kelvin_to_rgb(temperature: float) -> torch.Tensor:
+    """Convert color temperature in Kelvin to an RGB multiplier in [0, 1].
+
+    Uses Tanner Helland's approximation, which fits display (sRGB) colors. The returned
+    multipliers are applied to LINEAR RGB (lighting.py tints the scene with them), so
+    linearize the fitted color before returning it.
+
+    Args:
+        temperature: Color temperature in Kelvin (1000-40000).
+
+    Returns:
+        (3,) tensor of linear-RGB multipliers.
+    """
+    raise NotImplementedError
+
+
+def srgb_gamma_slope(linear_val: torch.Tensor) -> torch.Tensor:
+    """Derivative of the sRGB transfer function at a given linear value.
+
+    Useful for propagating variance from linear space to sRGB display space:
+        Var_srgb ≈ (d_srgb/d_linear)^2 * Var_linear
+
+    Args:
+        linear_val: Linear RGB values in [0, 1].
+
+    Returns:
+        Slope of the sRGB gamma curve at each value.
+    """
+    threshold = 0.0031308
+    low_slope = torch.tensor(12.92, device=linear_val.device)
+    high_slope = (1.055 / 2.4) * linear_val.clamp(min=1e-8) ** (1.0 / 2.4 - 1.0)
+    return torch.where(linear_val <= threshold, low_slope, high_slope)

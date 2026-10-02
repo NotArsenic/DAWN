@@ -1,0 +1,33 @@
+# Stage 2: Denoiser training configuration.
+
+denoiser:
+  in_channels: 4        # transformed image (3) + log-variance map (1)
+  hidden_channels: 24
+  out_channels: 3
+  num_blocks: 2
+  kernel_size: 5         # depthwise conv
+  residual_scale: 0.1    # out = y + scale * tanh(residual)
+  # Receptive field: 9x9 pixels. Cannot draw VisDrone-scale objects (>=16x16).
+
+train:
+  num_steps: 30000
+  crop_size: 256          # random crops at native resolution
+  use_fitted_grids: true  # stage 2a: train on fitted grids
+  finetune_on_predicted: true   # stage 2b: finetune on flow-predicted grids
+  finetune_steps: 5000
+
+optim:
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 0.01
+  batch_size: 32
+  precision: bf16
+
+loss:
+  pixel_weight: 1.0      # L1(out, day)
+  residual_weight: 0.01  # |residual| penalty
+
+logging:
+  wandb_project: dawn
+  log_every: 100
+  save_every: 2000

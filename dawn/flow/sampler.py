@@ -1,0 +1,72 @@
+"""ODE sampler for flow matching inference.
+
+Samples grid coefficients by integrating the velocity field from t=0 to t=1.
+Uses Euler or midpoint method with 1-2 function evaluations (NFE).
+
+Works in STANDARDIZED grid space, (B, 12, K, gy, gx): the result must go through
+`unstandardize` once before slicing (docs/conventions.md section 5).
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+@torch.no_grad()
+def euler_sample(
+    velocity_fn,
+    z_0: torch.Tensor,
+    num_steps: int = 2,
+) -> torch.Tensor:
+    """Euler ODE integration from z_0 to z_1.
+
+    z_{k+1} = z_k + dt * v(z_k, t_k, c)
+
+    Args:
+        velocity_fn: Callable(z_t, t) -> v. Should capture conditioning internally.
+        z_0: (B, 12, K, gy, gx) initial noise sample.
+        num_steps: Number of Euler steps (NFE = num_steps).
+
+    Returns:
+        z_1: (B, 12, K, gy, gx) predicted grid coefficients, standardized.
+    """
+    dt = 1.0 / num_steps
+    z_t = z_0.clone()
+    for k in range(num_steps):
+        t = torch.full((z_t.shape[0],), k * dt, device=z_t.device, dtype=z_t.dtype)
+        v = velocity_fn(z_t, t)
+        z_t = z_t + dt * v
+    return z_t
+
+
+@torch.no_grad()
+def midpoint_sample(
+    velocity_fn,
+    z_0: torch.Tensor,
+    num_steps: int = 1,
+) -> torch.Tensor:
+    """Midpoint method ODE integration. NFE = 2 * num_steps.
+
+    Args:
+        velocity_fn: Callable(z_t, t) -> v.
+        z_0: (B, 12, K, gy, gx) initial noise.
+        num_steps: Number of midpoint steps.
+
+    Returns:
+        z_1: (B, 12, K, gy, gx) predicted grid coefficients, standardized.
+    """
+    dt = 1.0 / num_steps
+    z_t = z_0.clone()
+    for k in range(num_steps):
+        t_start = k * dt
+        t_mid = t_start + 0.5 * dt
+
+        t_s = torch.full((z_t.shape[0],), t_start, device=z_t.device, dtype=z_t.dtype)
+        v_start = velocity_fn(z_t, t_s)
+
+        z_mid = z_t + 0.5 * dt * v_start
+        t_m = torch.full((z_t.shape[0],), t_mid, device=z_t.device, dtype=z_t.dtype)
+        v_mid = velocity_fn(z_mid, t_m)
+
+        z_t = z_t + dt * v_mid
+    return z_t
