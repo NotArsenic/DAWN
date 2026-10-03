@@ -20,22 +20,22 @@ pytest                      # CPU only, offline
 ruff check dawn scripts tests
 ```
 
-Every script in `scripts/` takes `--help`. Once stage 1 exists, a tiny end-to-end debug run is `python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu`. Ruff still reports some unused imports in scaffold files nobody has touched yet; leave those alone rather than churning unrelated files.
+Every script in `scripts/` takes `--help`. A tiny end-to-end debug run is `python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu`; the debug overlay sets `loader.synthetic_images` and `encoder.pretrained: false`, so it needs neither VisDrone on disk nor an HF token. Add `--overfit` to validate on the training set (the sanity check to run before any full training). Ruff still reports some unused imports in scaffold files nobody has touched yet; leave those alone rather than churning unrelated files.
 
 ## Working rules
 
 - All files are UTF-8 with LF line endings. The first scaffold commit was accidentally UTF-16; do not reintroduce it.
 - Do not commit or push unless asked. The maintainer reviews and commits.
 - LoRA comes from peft only; do not add a hand-rolled LoRA layer. `DINOEncoder.forward_frozen` uses `disable_adapter()` to produce the L_align target.
-- DINOv3 weights are gated (HF token and license acceptance). Tests must not download weights; use `scripts/smoke_dino.py` for real-backend checks.
+- DINOv3 weights are gated (HF token and license acceptance). Tests must not download weights; they build a randomly initialized, two-block backbone (`tests/flow_helpers.py: tiny_encoder`). Use `scripts/smoke_dino.py` for real-backend checks.
+- `flow.warmup_steps` gates the conditioning detach: before it, the encoder's patch tokens and CLS are detached before the velocity net and the noise head, so LoRA trains on L_align alone. `optim.lr_warmup_steps` is the separate, unrelated LR warmup.
 - Target hardware is a 16 GB GPU (RTX 5060 Ti): batch 32 images with 4 timesteps each, 30-50K steps.
 
 ## Open decisions (ask, do not guess)
 
-- `flow.warmup_steps` in `configs/flow.yaml`: what the "5K-step schedule" gates was never recorded (render-loss ramp-in, LoRA unfreeze, or L_align ramp).
-- Day / night labels come from hand labels in `data/labels/visdrone_labels.csv` (sequence ID or image ID -> day / night / dusk / exclude; unlabelled images are in no manifest). Video sequences are labelled from the `label-sheets` output. Still open: how to label the 6,497 images in the 49 `99999xx` still collections, which mix day and night frame by frame (per image by hand, or pre-sorted by the noise / highlight features).
+Nothing open. Delete an item here once it is decided; add one rather than guessing.
 
-Delete an item here once it is decided.
+Decided and implemented: the 6,497 images of the 49 `99999xx` still collections are auto-accepted as day by cutoffs on median luminance and highlight ratio, fitted to make zero errors on the hand-labelled frames (`dawn/data/splitting.py`, docs/conventions.md section 10.1). `prepare_visdrone.py split` writes a 200-image contact sheet of what they accepted, which is the intended spot check.
 
 ## Stale: `plans/night2day_bilateral_grid.md`
 

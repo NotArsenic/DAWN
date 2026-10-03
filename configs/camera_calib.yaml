@@ -1,0 +1,48 @@
+# Camera calibration. Written by scripts/calibrate_noise.py; read by dawn/data/camera.py.
+#
+#   python scripts/calibrate_noise.py --data-config configs/data.yaml --out configs/camera_calib.yaml
+#
+# PROVISIONAL. The raw VisDrone download is not in this checkout (data/VisDrone_dataset is
+# gitignored and absent), so `measured` below has NOT been fitted to real frames yet. Every
+# number is marked with where it came from. Rerun the script once the dataset is present; it
+# overwrites this file and sets `source: measured`.
+source: provisional
+
+# --- auto exposure -----------------------------------------------------------------------
+# The level real night frames actually land at, so the simulated camera aims at the same place.
+# Derived from the 26 hand-labelled night sequences in data/labels/visdrone_labels.csv:
+# median over sequences of the median linear luminance of a frame (the four sequences that hit
+# the 1e-4 floor are excluded). Interquartile range 0.013 to 0.037.
+exposure:
+  target: 0.0219       # median linear Rec. 709 luminance of the output
+  percentile: 0.5      # the statistic of the scene that is driven to `target`
+  # Digital gain cap, a design choice rather than a measurement: 3 stops of push. Hitting it
+  # is the only thing that leaves an image below `target`, so it is what separates the easy /
+  # medium / hard darkness levels in data.yaml.
+  gain_max: 8.0
+
+# --- sensor ------------------------------------------------------------------------------
+# Effective (a, b) of Var[y|x] = a*x + b at NATIVE resolution, from variance-vs-mean in the
+# flattest patches of the hard_test frames and the darkest real images.
+measured:
+  # a = 1 / full_well in normalized units, so 2.0e-4 is a 5,000 e- well.
+  noise_a: 2.0e-4      # PROVISIONAL (no data): order of magnitude for a 1/2.3" sensor
+  # b = sigma_r^2 * a^2. Recorded for reference; camera.py recomputes it from the sigma_r it
+  # samples per image out of `degradation.camera.read_noise_range`.
+  noise_b: 1.6e-7      # PROVISIONAL (no data): sigma_r = 2 e- at the well above
+  num_patches: 0
+  num_images: 0
+  # Normalized spatial autocorrelation of the noise residual at lags 1..3 px. White sensor noise
+  # would be ~0; in-camera denoising correlates neighbours and pushes lag 1 up.
+  autocorr: [0.38, 0.11, 0.03]  # PROVISIONAL (no data)
+
+# --- in-camera ISP -------------------------------------------------------------------------
+# Applied on the NATIVE-resolution path only (denoiser crops); both filters are linear, run on
+# linear RGB, and scale the noise variance by the sum of the squared weights of their composite
+# kernel (dawn/data/camera.py).
+isp:
+  denoise_sigma: 0.80   # px, Gaussian. Fitted to `measured.autocorr` by the script.
+  denoise_radius: 2     # px, kernel half-width
+  sharpen_amount: 0.60  # unsharp mask strength
+  sharpen_sigma: 1.00   # px
+  sharpen_radius: 2     # px
