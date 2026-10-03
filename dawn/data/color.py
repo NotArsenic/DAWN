@@ -89,7 +89,9 @@ def linear_to_srgb8(img: torch.Tensor) -> torch.Tensor:
 def _planckian_xy(kelvin: float) -> tuple[float, float]:
     """
     CIE 1931 chromaticity (x, y) on the Planckian locus, 1,667-25,000 K.
-    Cubic in `1/T` for x, then cubic in x for y, with break points at 4,000 K (x and y) and 2,222 K (y). Agrees with the exact locus to about 5e-4 above 3,000 K and 3e-3 at 1,700 K.
+    Cubic in `1/T` for x, then cubic in x for y, with break points at 4,000 K (x and y)
+    and 2,222 K (y). Agrees with the exact locus to about 5e-4 above 3,000 K and 3e-3
+    at 1,700 K.
     """
     t = kelvin
     if t <= 4000.0:

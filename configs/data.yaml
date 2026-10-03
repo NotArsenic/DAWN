@@ -17,26 +17,78 @@ visdrone:
     drop_categories: [0, 11]  # 0 ignored regions, 11 "others"
     min_size: 16              # px on either side, at the returned resolution
 
+# Phase 2 of prepare_visdrone.py: hand labels -> train_day / val_day / test_day / hard_test.
+# dawn/data/prepare.py. The hand labels are never edited; `label_map` is how their vocabulary
+# (day / night / dusk / exclude) becomes this project's (day / hard_test / dropped).
+split:
+  label_map:
+    day: day
+    night: hard_test
+    dusk: null        # neither a clean day source nor a real night test: dropped
+    exclude: null
+  # 99999xx still collections carry no hand label. They are auto-accepted as day when their
+  # median luminance is high enough and their highlight ratio low enough; the two cutoffs are
+  # chosen on the hand-labelled video frames to make zero false "day" calls there.
+  auto_day:
+    enabled: true
+    margin: 0.10          # shrink both cutoffs by this fraction of their span, away from the
+                          # nearest non-day frame, so the boundary is not a single image wide
+    min_recall: 0.20      # fail loudly if the zero-error cutoffs keep less than this share of
+                          # the hand-labelled day frames (the features would be useless)
+    contact_sheet: 200    # auto-day images exported for spot-checking
+  # Re-split train+val by group (sequence ID, or the collection ID for 99999xx stills).
+  regroup:
+    val_fraction: 0.10
+    seed: 20261003
+    test_split: test-dev  # left as is; its group IDs must not appear in train or val
+
 degradation:
-  # dawn/data/lighting.py: scene illumination -> night_clean.
+  # dawn/data/lighting.py: scene illumination -> relative scene radiance (ambient white = 1).
   lighting:
-    # Exposure reduction.
-    exposure_range: [0.01, 0.15]  # LogUniform
-    # Spatially-varying illumination field.
+    # Mode weights. streetlit and starlight need a flat, overcast-looking source image; moonlit
+    # takes any. `overcast_ratio_range` is on p95/p05 of the linear luminance of the day image:
+    # at or below the first number the image counts as fully overcast, at or above the second
+    # it is never used for streetlit / starlight.
+    mode_weights:
+      moonlit: 1.0
+      streetlit: 1.6
+      starlight: 0.6
+    overcast_only: [streetlit, starlight]
+    overcast_ratio_range: [6.0, 30.0]
+    # Ambient light: relative level 1, colour 3,800-4,300 K. Starlight sits slightly redder.
+    moonlight_temp_range: [3800, 4300]   # Kelvin; also the streetlit ambient
+    starlight_temp_range: [3800, 4050]   # Kelvin, slightly redder
+    # Spatially-varying ambient gain, renormalized to mean 1 so "ambient = 1" still holds.
     illum_grid_size: 4
     illum_range: [0.4, 1.5]
-    # Regimes: moonlit with probability moonlight_prob, otherwise streetlit.
-    moonlight_prob: 0.2
-    moonlight_temp_range: [3800, 4300]  # Kelvin
-    # Streetlit: lamp pools, halos and color temperature.
+    # Streetlit lamps. Illuminance on the ground from a lamp at height h, horizontal distance r,
+    # is proportional to h / (h^2 + r^2)^1.5; `light_peak_range` is the value at r = 0, relative
+    # to the ambient. Lengths are fractions of the image WIDTH, so aspect ratio is preserved.
     num_lights_range: [0, 8]
-    light_sigma_range: [20, 150]  # pixels at 512 long-side
-    color_temp_range: [2000, 4500]  # Kelvin, sodium to LED
-    halo_intensity: 0.02
-  # dawn/data/camera.py: sensor noise + ISP -> night.
+    light_height_range: [0.04, 0.30]
+    light_peak_range: [10.0, 100.0]      # LogUniform, x ambient
+    light_margin: 0.15                   # lamps may sit this far outside the frame
+    sodium_prob: 0.55
+    sodium_temp_range: [2000, 2200]      # Kelvin
+    led_temp_range: [3000, 4500]         # Kelvin
+  # dawn/data/camera.py: sensor + ISP -> night. Noise model: Var[y | x] = a*x + b, docs 6.
   camera:
-    # Poisson-Gaussian noise, Var[y | x] = a*x + b.
-    noise_a_range: [1.0e-4, 5.0e-3]
-    noise_b_range: [1.0e-6, 1.0e-4]  # read-noise variance, not std
-    # Compression.
+    # Electrons from a white pixel (relative radiance 1) at NATIVE resolution, LogUniform.
+    # This, not an exposure multiplier, is what makes a night image dark and noisy.
+    n_white_range:
+      moonlit: [10.0, 1200.0]
+      streetlit: [20.0, 2500.0]
+      starlight: [4.0, 300.0]
+    # Fixed seeded val/test sets pick a band of the LogUniform range above. The bands are
+    # quantiles, 0 = darkest. Below about 69 electrons the auto-exposure gain caps out
+    # (exposure.gain_max in camera_calib.yaml) and the frame stays dark, which is what makes
+    # `hard` hard: it is both darker and noisier, not just noisier.
+    darkness_levels:
+      easy: [0.60, 1.00]
+      medium: [0.30, 0.60]
+      hard: [0.00, 0.30]
+    read_noise_range: [1.0, 4.0]   # sigma_r, electrons per NATIVE pixel
+    gain_min: 0.1   # the AE may also expose DOWN; gain_max is in camera_calib.yaml
+    white_balance_strength: [0.3, 0.8]  # 0 = keep the full colour cast, 1 = fully corrected
+    quant_bits: 12
     jpeg_quality_range: [70, 95]

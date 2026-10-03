@@ -21,8 +21,10 @@ encoder:
   patch_size: 16
   input_size: 256          # 256 / 16 = 16x16 patch tokens, matching grid.spatial_size
   num_register_tokens: 4   # patch tokens start after CLS + registers (index 1 + 4)
+  pretrained: true         # false gives a randomly initialized backbone (offline debug runs)
+  grad_checkpointing: false  # recompute DINO blocks in the backward pass (16 GB card)
   lora_rank: 8
-  lora_alpha: 8
+  lora_alpha: 16
   lora_dropout: 0.0
   lora_lr: 1.0e-4
   # peft target_modules per backend: attention qkv + output projection of every block.
@@ -55,21 +57,34 @@ flow:
   align_weight: 0.5         # L_align: adapted vs frozen (adapters disabled) DINO features
   # Bin-count weighting: scale loss per bin by pixel count.
   bin_count_weighting: true
-  # TODO(confirm): the "5K-step schedule" from the design notes. What it gates is not recorded
-  # in the repo. Candidates: render-loss ramp-in (loss.py skips the render loss at early steps),
-  # LoRA unfreeze, or an L_align ramp.
+  # The "5K-step schedule": until this step the encoder's patch tokens and CLS are DETACHED
+  # before the velocity net and the noise head, so LoRA is trained by L_align alone. After it,
+  # everything trains jointly. This is not the optimizer's LR warmup (optim.lr_warmup_steps).
   warmup_steps: 5000
+  # Render loss on a random subset of the batch_size x timesteps_per_image samples. null = all.
+  # Only a VRAM valve: 128 renders at 256^2 cost about 0.6 GB of activations.
+  render_subset: null
 
 # Optimization.
 optim:
   optimizer: adamw
   lr: 2.0e-4
-  weight_decay: 0.01
+  weight_decay: 0.01      # not applied to norms, biases, attention gates or the pos embedding
   betas: [0.9, 0.999]
   batch_size: 32          # images per step (16 GB card); x flow.timesteps_per_image velocity samples each
   grad_clip: 1.0
   precision: bf16         # bf16 | fp32
   ema_decay: 0.999
+  lr_warmup_steps: 1000   # linear LR warmup, then cosine decay over flow.num_train_steps
+
+# Dataloader.
+loader:
+  num_workers: 4          # workers run dawn/data/degrade.py on the CPU
+  pin_memory: true
+  val_level: medium       # fixed val set darkness (dawn/data/degrade.py: DARKNESS_LEVELS)
+  # Debug escape hatch: train on N procedurally generated images (dawn/flow/dataset.py:
+  # SyntheticDay) instead of a manifest, so the loop runs with no VisDrone on disk.
+  synthetic_images: null
 
 # Logging.
 logging:
