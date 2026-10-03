@@ -107,8 +107,13 @@ pytest
 ### Training
 
 ```bash
-# Tiny end-to-end debug run (overlay config merged on top of flow.yaml)
+# Tiny end-to-end debug run (overlay config merged on top of flow.yaml). Needs neither the
+# VisDrone dataset nor an HF token: the overlay generates its images and skips the DINO weights.
 python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu
+
+# Overfit sanity check: validate on the training set, so render PSNR can be read against the
+# fitted-grid oracle. Run this before any full training.
+python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --overfit
 
 # Stage 1: flow model (encoder LoRA + velocity transformer)
 python scripts/train_flow.py --config configs/flow.yaml
@@ -169,7 +174,9 @@ dawn/
 │   │   └── noise_head.py    # Sensor noise parameter predictor
 │   ├── flow/                # Flow matching training and sampling
 │   │   ├── loss.py          # Rectified flow loss + apply, noise and align losses
-│   │   └── sampler.py       # Euler ODE solver (1–4 steps)
+│   │   ├── sampler.py       # Euler / midpoint ODE solvers, counted in NFE
+│   │   ├── dataset.py       # Degradation transform for the dataloader workers
+│   │   └── trainer.py       # Stage 1: one step, one validation, one checkpoint
 │   ├── uncertainty/         # Uncertainty estimation
 │   │   └── propagate.py     # Analytic Var = A·Σ·Aᵀ propagation
 │   └── eval/                # Evaluation utilities

@@ -543,6 +543,46 @@ def save_contact_sheets(
     return written
 
 
+def save_auto_day_sheet(
+    layout: VisDroneLayout,
+    stats: Sequence[ImageStats],
+    image_ids: Sequence[str],
+    out_dir: str | Path,
+    count: int = 200,
+    seed: int = 0,
+    workers: int = 1,
+) -> Path | None:
+    """Contact sheet of `count` random auto-accepted day stills, for spot-checking by eye.
+
+    Nothing hand-labelled the 99999xx collections, so the auto-day cutoffs
+    (`dawn.data.splitting`) are the only thing standing between a night still and the daytime
+    training pool. This sheet is how a person checks that: darkest first, each thumbnail
+    labelled with its log10 median luminance, so a night frame that slipped through shows up at
+    the top left rather than hiding in the middle. Same seed, same sheet.
+
+    Returns:
+        The written path, or None when `image_ids` is empty.
+    """
+    if not image_ids:
+        return None
+    by_id = {row.image_id: row for row in stats}
+    rows = [by_id[image_id] for image_id in image_ids if image_id in by_id]
+    picked = random.Random(f"{seed}/auto_day").sample(rows, min(count, len(rows)))
+    picked.sort(key=lambda r: (r.lum_median, r.image_id))
+    thumbs = run_parallel(
+        thumbnail, [(layout, r.split, r.image_id) for r in picked], workers, desc="auto-day sheet"
+    )
+    labels = [f"{_log_luminance(r.lum_median):+.2f}" for r in picked]
+    title = (
+        f"auto-day stills: {len(picked)} of {len(rows)} accepted, darkest first; "
+        "label = log10 median luminance. Any night frame here is a false accept."
+    )
+    path = Path(out_dir) / "auto_day.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _tile(thumbs, labels, title).save(path, quality=90)
+    return path
+
+
 def thumbnail(
     layout: VisDroneLayout, split: str, image_id: str, box: tuple[int, int] = THUMB_BOX
 ) -> torch.Tensor:

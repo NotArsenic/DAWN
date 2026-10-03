@@ -9,6 +9,9 @@
 visdrone:
   max_images: 16
 
+encoder:
+  pretrained: false        # no HF token, no gated download: random weights are enough here
+
 flow:
   num_train_steps: 50
   timesteps_per_image: 2
@@ -17,6 +20,12 @@ flow:
 optim:
   batch_size: 2
   precision: fp32          # no bf16 autocast on CPU; easier to chase NaNs
+  lr_warmup_steps: 5
+
+loader:
+  num_workers: 0           # degradation in-process: a traceback instead of a worker crash
+  pin_memory: false
+  synthetic_images: 16     # generated images, so the run needs nothing on disk
 
 logging:
   wandb_mode: disabled
