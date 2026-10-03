@@ -55,6 +55,37 @@ def linear_to_srgb(img: torch.Tensor, clamp: bool = True) -> torch.Tensor:
     return torch.where(img <= LINEAR_BREAKPOINT, img * 12.92, high)
 
 
+def srgb8_to_linear(img: torch.Tensor) -> torch.Tensor:
+    """
+    Decode 8-bit sRGB codes to linear float32 [0, 1] (the file-input boundary).
+
+    Bit-identical to `srgb_to_linear(img.float() / 255)`, through a 256-entry lookup table.
+
+    Args:
+        img: uint8 sRGB codes, any shape.
+
+    Raises:
+        TypeError: `img` is not uint8.
+    """
+    if img.dtype != torch.uint8:
+        raise TypeError(f"expected uint8 sRGB codes, got {img.dtype}")
+    lut = srgb_to_linear(torch.arange(256, dtype=torch.float32, device=img.device) / 255)
+    return lut[img.long()]
+
+
+def linear_to_srgb8(img: torch.Tensor) -> torch.Tensor:
+    """
+    Encode linear [0, 1] to 8-bit sRGB codes (the file-output boundary): clamp, gamma, round.
+
+    Args:
+        img: Linear values, any shape.
+
+    Returns:
+        uint8 tensor of the same shape.
+    """
+    return (linear_to_srgb(img) * 255).round().to(torch.uint8)
+
+
 def _planckian_xy(kelvin: float) -> tuple[float, float]:
     """
     CIE 1931 chromaticity (x, y) on the Planckian locus, 1,667-25,000 K.

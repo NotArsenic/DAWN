@@ -1,57 +1,180 @@
 #!/usr/bin/env python3
-"""Prepare VisDrone-DET for training: luminance split, manifests and 512-px PNG copies.
+"""Prepare VisDrone-DET in three phases; dawn/data/prepare.py does the work.
 
-Run after scripts/download_visdrone.py. For every image in the requested splits:
-    1. Compute the median luma of the sRGB image (0-255).
-    2. Classify it with the `prepare` thresholds in configs/data.yaml:
-           median <  night_below  -> "night"      real night, held out for evaluation
-           median >= day_above    -> "day"        used for training
-           otherwise              -> "ambiguous"  unused
-    3. Write a PNG copy resized to `visdrone.image_size` on the long side into
-       <out>/<split>/images/.
-    4. Write one manifest per (split, class): <out>/manifests/<split>_<class>.txt, one path per
-       line, relative to <out>. VisDroneDataset reads these.
+    stats         Slow, run once. Every raw image of every split: native size, luminance
+                  median / mean / 5th / 95th percentile (256-px linear copy), box count, noise
+                  level and highlight ratio (native) -> `visdrone.stats_csv`. Every CPU core.
+    label-sheets  Labelling sheets, one row per video sequence (darkest, median and brightest
+                  frame), and, if it does not exist yet, the hand-label CSV `visdrone.labels_csv`
+                  with one blank row per sequence in the same order.
+    split         Instant, rerun freely. Stats CSV + hand labels ->
+                  <manifest_dir>/<split>/{day,night,dusk}.txt (excluded and unlabelled images
+                  are in none), a luminance histogram, a noise-vs-highlight scatter and one
+                  contact sheet per manifest, next to the stats CSV.
+    resize        512-px copies (long side, aspect kept), area-averaged in linear space, 8-bit
+                  sRGB PNG under `visdrone.prepared_dir`. Existing copies are kept, so it resumes.
+
+Paths come from the `visdrone` section of configs/data.yaml.
 
 Usage:
-    python scripts/prepare_visdrone.py --root data/visdrone --out data/visdrone_512
+    python scripts/prepare_visdrone.py stats
+    python scripts/prepare_visdrone.py label-sheets
+    python scripts/prepare_visdrone.py split
+    python scripts/prepare_visdrone.py resize
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def run_stats(cfg: dict, args: argparse.Namespace) -> None:
+    from dawn.data.prepare import compute_image_stats, run_parallel
+    from dawn.data.visdrone import BoxFilter, VisDroneLayout, write_stats_csv
+
+    layout = VisDroneLayout.from_config(cfg["visdrone"])
+    box_filter = BoxFilter.from_config(cfg["visdrone"].get("box_filter"))
+    jobs = []
+    for split in args.splits:
+        image_ids = layout.raw_image_ids(split)[: args.limit]
+        if not image_ids:
+            raise SystemExit(f"No images in {layout.raw_image(split, 'x').parent}")
+        logger.info(f"  {split}: {len(image_ids)} images")
+        jobs += [(layout, split, image_id, box_filter) for image_id in image_ids]
+    rows = run_parallel(compute_image_stats, jobs, args.workers, desc="stats")
+    write_stats_csv(layout.stats_csv, rows)
+    logger.info(f"Wrote {len(rows)} rows to {layout.stats_csv}")
+
+
+def run_label_sheets(cfg: dict, args: argparse.Namespace) -> None:
+    from dawn.data.prepare import save_sequence_sheets, write_labels_template
+    from dawn.data.visdrone import (
+        VisDroneLayout,
+        is_still_collection,
+        read_labels,
+        read_stats_csv,
+        sequence_id,
+    )
+
+    layout = VisDroneLayout.from_config(cfg["visdrone"])
+    labels_csv = Path(cfg["visdrone"]["labels_csv"])
+    stats = [row for row in read_stats_csv(layout.stats_csv).values() if row.split in args.splits]
+    out_dir = layout.stats_csv.parent / "labelling"
+    pages = save_sequence_sheets(layout, stats, out_dir, args.per_page, args.workers)
+    logger.info(f"{len(pages)} sequence sheets in {out_dir}")
+    if not labels_csv.exists():
+        write_labels_template(stats, labels_csv)
+        logger.info(f"Wrote {labels_csv}: fill in the label column (day / night / dusk / exclude)")
+        return
+    listed = set(read_labels(labels_csv))
+    videos = {sequence_id(r.image_id) for r in stats} - listed
+    missing = sorted(seq for seq in videos if not is_still_collection(seq))
+    logger.info(f"{labels_csv} exists and was left alone; video sequences not in it: {missing}")
+
+
+def run_split(cfg: dict, args: argparse.Namespace) -> None:
+    from dawn.data.prepare import (
+        plot_feature_scatter,
+        plot_log_luminance_histogram,
+        resolve_labels,
+        save_contact_sheets,
+        write_manifests,
+    )
+    from dawn.data.visdrone import VisDroneLayout, read_labels, read_stats_csv
+
+    layout = VisDroneLayout.from_config(cfg["visdrone"])
+    labels_csv = Path(cfg["visdrone"]["labels_csv"])
+    stats = [row for row in read_stats_csv(layout.stats_csv).values() if row.split in args.splits]
+    if labels_csv.exists():
+        labels = resolve_labels(stats, read_labels(labels_csv))
+    else:
+        logger.warning(f"No {labels_csv} yet (run label-sheets): every image is unlabelled")
+        labels = resolve_labels(stats, {})
+
+    counts = write_manifests(stats, labels, layout.manifest_dir)
+    names = ("day", "night", "dusk", "exclude", "unlabelled")
+    logger.info(f"Manifests in {layout.manifest_dir} (only day, night and dusk get one):")
+    logger.info("  " + f"{'split':<10}" + "".join(f"{name:>11}" for name in names))
+    for split, by_label in counts.items():
+        logger.info("  " + f"{split:<10}" + "".join(f"{by_label[name]:>11}" for name in names))
+
+    out_dir = layout.stats_csv.parent
+    for name, plot in [
+        ("log_luminance_hist.png", plot_log_luminance_histogram),
+        ("noise_vs_highlights.png", plot_feature_scatter),
+    ]:
+        plot(stats, labels, out_dir / name)
+        logger.info(f"Plot: {out_dir / name}")
+    sheets = save_contact_sheets(
+        layout,
+        stats,
+        labels,
+        out_dir / "contact_sheets",
+        per_sheet=args.per_sheet,
+        seed=args.seed,
+        workers=args.workers,
+    )
+    logger.info(f"Contact sheets: {len(sheets)} in {out_dir / 'contact_sheets'}")
+
+
+def run_resize(cfg: dict, args: argparse.Namespace) -> None:
+    from dawn.data.prepare import make_lowres_copy, run_parallel
+    from dawn.data.visdrone import VisDroneLayout
+
+    layout = VisDroneLayout.from_config(cfg["visdrone"])
+    long_side = cfg["visdrone"]["image_size"]
+    jobs = [
+        (layout, split, image_id, long_side, args.overwrite)
+        for split in args.splits
+        for image_id in layout.raw_image_ids(split)[: args.limit]
+    ]
+    run_parallel(make_lowres_copy, jobs, args.workers, desc="resize")
+    logger.info(f"{len(jobs)} copies at {long_side} px in {layout.prepared_dir}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Split VisDrone by luminance and make PNG copies")
-    parser.add_argument("--root", type=str, default="data/visdrone", help="Raw download directory")
-    parser.add_argument("--out", type=str, default="data/visdrone_512", help="Prepared directory")
-    parser.add_argument("--splits", nargs="+", default=["train", "val"], help="Splits to prepare")
+    parser = argparse.ArgumentParser(
+        description="Prepare VisDrone-DET: stats, label-sheets, split, resize",
+        epilog="Run `<phase> --help` for the options of each phase.",
+    )
     parser.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
-    parser.add_argument("--night-below", type=float, default=None,
-                        help="Override prepare.night_below")
-    parser.add_argument("--day-above", type=float, default=None,
-                        help="Override prepare.day_above")
+    parser.add_argument("--splits", nargs="+", default=None, help="Override visdrone.splits")
+    parser.add_argument("--workers", type=int, default=os.cpu_count() or 1,
+                        help="Processes (default: every core)")
+    phases = parser.add_subparsers(dest="phase", required=True)
+
+    stats = phases.add_parser("stats", help="Phase 1: per-image stats CSV (slow, once)")
+    stats.add_argument("--limit", type=int, default=None, help="First N images per split only")
+    stats.set_defaults(run=run_stats)
+
+    sheets = phases.add_parser("label-sheets", help="Sequence labelling sheets + label CSV")
+    sheets.add_argument("--per-page", type=int, default=50, help="Sequences per sheet")
+    sheets.set_defaults(run=run_label_sheets)
+
+    split = phases.add_parser("split", help="Phase 2: labels -> manifests, plots, contact sheets")
+    split.add_argument("--per-sheet", type=int, default=50, help="Thumbnails per contact sheet")
+    split.add_argument("--seed", type=int, default=0, help="Contact-sheet sampling seed")
+    split.set_defaults(run=run_split)
+
+    resize = phases.add_parser("resize", help="Phase 3: 512-px linear-space PNG copies")
+    resize.add_argument("--limit", type=int, default=None, help="First N images per split only")
+    resize.add_argument("--overwrite", action="store_true", help="Redo existing copies")
+    resize.set_defaults(run=run_resize)
+
     args = parser.parse_args()
 
-    logger.info("Preparing VisDrone")
-    logger.info(f"  Raw: {args.root}")
-    logger.info(f"  Out: {args.out}")
-    logger.info(f"  Splits: {args.splits}")
+    from omegaconf import OmegaConf
 
-    # TODO: Implement
-    # 1. Load the data config (omegaconf); apply the CLI threshold overrides
-    # 2. Locate the raw images. download_visdrone.py extracts the official zips as they are
-    #    (<root>/VisDrone2019-DET-<split>/images/*.jpg) while its docstring says
-    #    <root>/<split>/images: reconcile the two
-    # 3. Per image: median sRGB luma -> class; resize to visdrone.image_size (long side); save PNG
-    # 4. Write the manifests and log the day/night/ambiguous counts per split
-    # 5. Log the median-luma histogram so the `day_above` TODO in data.yaml can be calibrated
-
-    logger.warning("Preparation not yet implemented.")
+    cfg = OmegaConf.to_container(OmegaConf.load(args.data_config), resolve=True)
+    args.splits = args.splits or cfg["visdrone"]["splits"]
+    logger.info(f"prepare_visdrone {args.phase}: splits {args.splits}, {args.workers} workers")
+    args.run(cfg, args)
 
 
 if __name__ == "__main__":

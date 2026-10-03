@@ -15,15 +15,16 @@ Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx
 | Grid coordinates | node values sit at cell **centers**; coordinates outside the outer centers clamp |
 | Guidance | `compute_guidance`: luminance → 5×5 box blur (replicate pad) → clamp ≥ 1e-4 → log10 → `(· + 4) / 4` |
 | Raw vs standardized | stats `(12, K)`; pixels see raw, flow sees standardized; convert only via `normalize.py` |
-| Noise | `Var[y \| x] = a·x + b`; `b` is a **variance** |
+| Downsampling | always area averaging of **linear** values, only through `area_downsample` (§4a) |
+| Noise | `Var[y \| x] = a·x + b`; `b` is a **variance**; `(a, b)` at native resolution, `(a/n, b/n)` after averaging `n` native pixels |
 | Flow time | `t = 0` noise, `t = 1` data |
 
 ## 1. Color space
 
 - Inside the pipeline every image is **linear RGB, float32, `[0, 1]`**, channel order R, G, B, layout `(B, 3, H, W)` (`(3, H, W)` for one sample). That covers `day`, `night_clean`, `night`, the output of `apply_affine`, and the denoiser's input and output. Clamp to `[0, 1]` after anything that can leave the range (noise, `apply_affine`, the denoiser).
 - sRGB exists only at these boundaries. Nothing else calls `srgb_to_linear` / `linear_to_srgb`:
-  1. File input: decode, then `srgb_to_linear` (dataset, `infer.py`).
-  2. File or display output: `linear_to_srgb`, then save (`infer.py`, `visualize.py`, scripts).
+  1. File input: decode, then `srgb_to_linear` (dataset, `prepare.py`, `infer.py`). 8-bit files use `srgb8_to_linear`, bit-identical to `srgb_to_linear(code / 255)`.
+  2. File or display output: `linear_to_srgb`, then save (`infer.py`, `visualize.py`, scripts). 8-bit files use `linear_to_srgb8` (the 512-px copies from `prepare.py`).
   3. `camera.py`: it simulates a camera ISP (gamma → 8-bit → JPEG) and ends by decoding back to linear, so `night` is exactly what a linearized real night JPEG looks like.
   4. `DINOEncoder.forward`: DINO is pretrained on sRGB, so the encoder takes **linear** RGB and converts to sRGB plus ImageNet mean/std itself. Callers never pre-convert.
   5. Display-unit uncertainty (`srgb_gamma_slope`).
@@ -98,6 +99,15 @@ Clamp each coordinate to `[0, N-1]` (`N` = `gy`, `gx`, `K`), then `i0 = floor(f)
 
 Guidance is computed from the image that is being indexed. Fitting, rendering in the flow loss, and `check_oracle.py` use `compute_guidance(night_clean)`; inference and stage-2 training use `compute_guidance(night)`.
 
+## 4a. Downsampling: area averaging
+
+Every downsample in the project is area averaging, in training, inference, grid fitting and data preparation alike, and it goes through one function: `dawn.data.resample.area_downsample(img, (h, w))`.
+
+- Each output pixel is the mean of the input over its footprint, `[i·s, (i+1)·s)` with `s = H_in / h_out` (likewise for width). Input pixels that straddle a footprint edge count by their overlap. For an integer factor this is the plain block mean; for any factor it preserves the image mean. (PIL's `BOX` filter is not this: it weights pixels 0 or 1 by where their center falls.)
+- Downsample **linear** images. Averaging sRGB values makes bright lights come out too dim.
+- Use `fit_long_side(H, W, long_side)` for the output size of an aspect-preserving resize. It never upsamples.
+- Why it matters beyond looks: an area-averaged pixel is exactly what a sensor with `n` times bigger pixels records, so the noise of a downsampled image follows from the native noise (§6). The 2000×1500 → 256×256 DINO input averages about 46 native pixels per input pixel, and training must see the same noise reduction, not noise added after downsampling.
+
 ## 5. Raw vs standardized grids
 
 One layout (§2.1), two spaces:
@@ -120,7 +130,9 @@ One layout (§2.1), two spaces:
 
 ## 6. Noise model
 
-`Var[y | x] = a·x + b` per pixel and channel, in linear `[0, 1]` units. `a` is the shot-noise gain, `b` the read-noise **variance** (σ², not a standard deviation). Both are positive. `camera.py` produces `(a, b)` as floats; the dataset exposes `noise_params = {"a": ..., "b": ...}`; `NoiseHead` predicts the natural logs `(log a, log b)`; `sensor_variance` takes raw `a`, `b`.
+`Var[y | x] = a·x + b` per pixel and channel, in linear `[0, 1]` units. `a` is the shot-noise gain, `b` the read-noise **variance** (σ², not a standard deviation). Both are positive. `camera.py` produces `(a, b)` as floats; the degradation transform exposes `noise_params = {"a": ..., "b": ...}`; `NoiseHead` predicts the natural logs `(log a, log b)`; `sensor_variance` takes raw `a`, `b`.
+
+**Resolution.** `(a, b)` are recorded at **native** resolution (the raw camera frame). A pixel that area-averages `n` native pixels (§4a) has `Var = (a/n)·x + b/n`: a sum of Poisson counts is Poisson and read-noise variances add, so this is exact. The camera model therefore simulates binned pixels: a 512-px training pixel stands for `n = W·H / (w·h)` native pixels, which is why `VisDroneDataset` returns `native_size` with every image.
 
 ## 7. Shapes at module boundaries
 
@@ -138,7 +150,8 @@ One layout (§2.1), two spaces:
 | `NoiseHead(dino_features)` | `(B,256,384)` → `(B,2)` |
 | `propagate_variance(coeffs, sigma_sq_in)` | `(B,12,H,W)`, `(B,3,H,W)` → `(B,3,H,W)` |
 | `BoundedDenoiser(enhanced, log_variance)` | `(B,3,H,W)` linear, `(B,1,H,W)` → `(B,3,H,W)` linear |
-| `VisDroneDataset[i]` | dict: `night`, `night_clean`, `day` (each `(3,h,w)` linear), `noise_params`, `meta` |
+| `area_downsample(img, (h, w))` | `(..., H, W)` float → `(..., h, w)`, same dtype and device |
+| `VisDroneDataset[i]` | dict: `day` `(3,h,w)` linear, `image_id`, `native_size` `(2,)` int64 `(W, H)`, `scale`; in `eval` mode also `boxes` `(N,4)` xyxy and `categories` `(N,)`. No degradation: that is a separate transform in the dataloader workers, which ends with fixed 256×256 `night`, `night_clean`, `day` and `noise_params` |
 
 ## 8. Rules
 
@@ -146,7 +159,8 @@ One layout (§2.1), two spaces:
 2. **One guidance function.** Fitting, slicing, rendering, inference, stage 2 and every script call `compute_guidance`. No inline luminance or `log10` code anywhere else.
 3. **One layout module.** Token reshapes and coefficient-order constants come from `dawn/grid/layout.py`; no ad-hoc `permute` / `view` of grids.
 4. **One conversion point for standardization** (§5).
-5. **Conventions change here first.** If one has to change, edit this file in the same commit as the code and update the affected docstrings.
+5. **One downsampling function.** `area_downsample` on linear images (§4a); no `F.interpolate`, PIL `resize` or `thumbnail` to shrink an image anywhere else.
+6. **Conventions change here first.** If one has to change, edit this file in the same commit as the code and update the affected docstrings.
 
 ## 9. Known limitations
 
