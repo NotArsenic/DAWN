@@ -13,7 +13,9 @@ from dawn.data.color import (
     color_temp_to_gains,
     color_temp_to_illuminant_rgb,
     linear_to_srgb,
+    linear_to_srgb8,
     luminance,
+    srgb8_to_linear,
     srgb_gamma_slope,
     srgb_to_linear,
 )
@@ -245,3 +247,35 @@ def test_gains_are_float32_with_three_channels():
     gains = color_temp_to_gains(3000)
     assert gains.shape == (3,)
     assert gains.dtype == torch.float32
+
+
+# --- 8-bit sRGB (file boundary) ----------------------------------------------------------------
+
+
+def test_srgb8_to_linear_is_exactly_srgb_to_linear_of_code_over_255():
+    codes = torch.arange(256, dtype=torch.uint8)
+    out = srgb8_to_linear(codes)
+    assert out.dtype == torch.float32
+    assert torch.equal(out, srgb_to_linear(codes.float() / 255))
+
+
+def test_srgb8_to_linear_keeps_the_image_shape():
+    img = torch.randint(0, 256, (2, 3, 5, 7), dtype=torch.uint8)
+    assert srgb8_to_linear(img).shape == (2, 3, 5, 7)
+
+
+def test_every_8bit_code_survives_a_round_trip_through_linear():
+    codes = torch.arange(256, dtype=torch.uint8).view(1, 16, 16).expand(3, 16, 16)
+    assert torch.equal(linear_to_srgb8(srgb8_to_linear(codes)), codes)
+
+
+def test_linear_to_srgb8_clamps_and_returns_uint8():
+    out = linear_to_srgb8(torch.tensor([-0.5, 0.0, 1.0, 2.0]))
+    assert out.dtype == torch.uint8
+    assert out.tolist() == [0, 0, 255, 255]
+
+
+def test_srgb8_to_linear_rejects_float_input():
+    # A float image here almost always means it was already divided by 255 (or linearized).
+    with pytest.raises(TypeError, match="uint8"):
+        srgb8_to_linear(torch.rand(3, 4, 4))

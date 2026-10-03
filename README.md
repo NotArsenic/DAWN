@@ -64,11 +64,20 @@ DINOv2 (Apache 2.0) works as a drop-in fallback if licensing is a concern.
 We train on synthetic nighttime degradations of [VisDrone-DET](https://github.com/VisDrone/VisDrone-Dataset) daytime images.
 
 ```bash
-# Download VisDrone-DET train set
-python scripts/download_visdrone.py --split train --dest data/visdrone
+# Download VisDrone-DET (extracts to <root>/VisDrone2019-DET-<split>/; data.yaml: visdrone.root)
+python scripts/download_visdrone.py --root data/VisDrone_dataset --splits train val test
 
-# Split by median luminance into day / night / ambiguous manifests, and write 512-px PNG copies
-python scripts/prepare_visdrone.py --root data/visdrone --out data/visdrone_512
+# Phase 1, slow, once: size, luminance, box count, noise level, highlight ratio per image
+python scripts/prepare_visdrone.py stats
+# Labelling sheets (one row per video sequence) + data/labels/visdrone_labels.csv to fill in
+python scripts/prepare_visdrone.py label-sheets
+# Fill it in from the terminal, one keypress per sequence (images inline in Ghostty / kitty / iTerm2)
+python scripts/label_visdrone.py
+# Phase 2, instant: hand labels -> day / night / dusk manifests (data/manifests, committed),
+# a luminance histogram, a noise-vs-highlight scatter and contact sheets
+python scripts/prepare_visdrone.py split
+# Phase 3: 512-px PNG copies, area-averaged in linear space
+python scripts/prepare_visdrone.py resize
 
 # Verify degradation pipeline matches real night statistics
 python scripts/check_degradation.py --data_dir data/visdrone
@@ -140,11 +149,13 @@ dawn/
 │   └── conventions.md       # Grid layout, coordinates, color space: read before touching grid code
 ├── dawn/                    # Main package
 │   ├── data/                # Dataset and degradation
-│   │   ├── visdrone.py      # VisDrone dataset class
+│   │   ├── visdrone.py      # VisDrone layout, file formats, box filter, dataset (3 modes)
+│   │   ├── prepare.py       # The three prepare_visdrone.py phases: stats, split, resize
+│   │   ├── resample.py      # area_downsample: the only downsampling in the project
 │   │   ├── degrade.py       # Synthetic night degradation: composes lighting + camera
 │   │   ├── lighting.py      # Moonlit / streetlit scene illumination
 │   │   ├── camera.py        # Sensor noise + ISP (gamma, 8-bit, JPEG)
-│   │   └── color.py         # sRGB ↔ linear, color temperature utilities
+│   │   └── color.py         # sRGB ↔ linear, luminance, color temperature utilities
 │   ├── grid/                # Bilateral grid operations
 │   │   ├── layout.py        # Canonical grid layout constants and token reshapes
 │   │   ├── fit.py           # Weighted least-squares grid fitting
@@ -169,7 +180,7 @@ dawn/
 │   ├── check_degradation.py # CPU: synthetic vs real night comparison
 │   ├── check_oracle.py      # CPU: grid fitting PSNR ceiling
 │   ├── download_visdrone.py # Dataset download helper
-│   ├── prepare_visdrone.py  # Luminance split into manifests + 512-px PNG copies
+│   ├── prepare_visdrone.py  # stats CSV, luminance split into manifests, 512-px PNG copies
 │   ├── smoke_dino.py        # DINO backend / LoRA / VRAM smoke test
 │   ├── train_flow.py        # Stage 1 training
 │   ├── train_denoiser.py    # Stage 2 training

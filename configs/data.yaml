@@ -1,20 +1,21 @@
 # Dataset and degradation configuration.
 
 visdrone:
-  root: data/visdrone              # raw download (scripts/download_visdrone.py)
-  prepared_dir: data/visdrone_512  # PNG copies + manifests (scripts/prepare_visdrone.py)
+  # Layout: dawn/data/visdrone.py. Raw images: <root>/VisDrone2019-DET-<split>/{images,annotations}.
+  root: data/VisDrone_dataset
+  stats_csv: data/stats/visdrone_stats.csv  # prepare_visdrone.py stats: one row per raw image
+  labels_csv: data/labels/visdrone_labels.csv  # hand labels (committed): sequence or image -> label
+  manifest_dir: data/manifests       # prepare_visdrone.py split: <split>/{day,night,dusk}.txt
+  prepared_dir: data/visdrone_512    # prepare_visdrone.py resize: <split>/<image_id>.png
+  splits: [train, val, test-dev]
   train_split: train
   val_split: val
   image_size: 512   # long side of the prepared PNG copies
   crop_size: 256    # training crop size
   max_images: null  # cap the dataset size (debug runs)
-
-# scripts/prepare_visdrone.py classifies every image by its median sRGB luma (0-255) and writes
-# one manifest per class: < night_below is real night (held out for evaluation), >= day_above is
-# day (training), anything in between is ambiguous (unused).
-prepare:
-  night_below: 40
-  day_above: 70   # TODO: calibrate on the luma histogram of the raw set
+  box_filter:       # eval-mode boxes; score-0 boxes are always dropped
+    drop_categories: [0, 11]  # 0 ignored regions, 11 "others"
+    min_size: 16              # px on either side, at the returned resolution
 
 degradation:
   # dawn/data/lighting.py: scene illumination -> night_clean.

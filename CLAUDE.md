@@ -33,7 +33,7 @@ Every script in `scripts/` takes `--help`. Once stage 1 exists, a tiny end-to-en
 ## Open decisions (ask, do not guess)
 
 - `flow.warmup_steps` in `configs/flow.yaml`: what the "5K-step schedule" gates was never recorded (render-loss ramp-in, LoRA unfreeze, or L_align ramp).
-- `prepare.day_above` in `configs/data.yaml` is uncalibrated.
+- Day / night labels come from hand labels in `data/labels/visdrone_labels.csv` (sequence ID or image ID -> day / night / dusk / exclude; unlabelled images are in no manifest). Video sequences are labelled from the `label-sheets` output. Still open: how to label the 6,497 images in the 49 `99999xx` still collections, which mix day and night frame by frame (per image by hand, or pre-sorted by the noise / highlight features).
 
 Delete an item here once it is decided.
 
