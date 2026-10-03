@@ -23,8 +23,10 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data (large files -- download separately)
-data/
+# Data (large files -- download separately). Hand labels and manifests are small and committed.
+data/*
+!data/manifests/
+!data/labels/
 *.pt
 *.pth
 *.ckpt
@@ -43,3 +45,9 @@ Thumbs.db
 # Secrets
 .env
 *.key
+
+# graphify knowledge-graph output
+graphify-out/
+
+# VisDrone dataset files
+data/VisDrone_dataset/*
