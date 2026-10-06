@@ -1,1 +1,1 @@
-"""Neural network modules: encoder, velocity transformer, denoiser."""
+"""Neural network modules: DINO encoder, velocity transformer, colour head."""
