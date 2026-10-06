@@ -1,8 +1,12 @@
-"""Builders shared by the stage-1 tests.
+"""Builders shared by the flow-stage tests.
 
 Everything here stays offline and CPU-sized: the encoder is a randomly initialized DINOv3 with
 `depth` blocks instead of 12, so no gated weights are downloaded and a test is seconds, not
-minutes. Shapes, token layout, register count and the LoRA target names are the real ones.
+minutes; the images are small synthetic ones whose brightness is an exact function of the thermal.
+Shapes, token layout, register count and the LoRA target names are the real ones.
+
+A tiny setup: a 64 x 80 input gives a 4 x 5 token grid, a 16 x 20 colour map and, at render size
+32 x 40, 8 x 8 render pixels per... patch of 8 x 8 (render / token grid).
 """
 
 from __future__ import annotations
@@ -19,6 +23,9 @@ CONFIGS = ROOT / "configs"
 TIMM_TARGETS = r".*blocks\.\d+\.attn\.(qkv|proj)"
 HF_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
+TINY_INPUT = (64, 80)  # (H, W) encoder input of the tiny setup
+TINY_RENDER = (32, 40)
+
 
 def require_backend(backend: str):
     """Skip unless peft and the backend's library are installed."""
@@ -26,7 +33,7 @@ def require_backend(backend: str):
     pytest.importorskip(backend)
 
 
-def tiny_encoder(backend: str = "timm", depth: int = 2, **kwargs):
+def tiny_encoder(backend: str = "timm", depth: int = 2, input_size=TINY_INPUT, **kwargs):
     """A randomly initialized DINOv3 ViT-S+ with `depth` blocks, LoRA attached."""
     require_backend(backend)
     from dawn.models.encoder import DINOEncoder
@@ -42,6 +49,7 @@ def tiny_encoder(backend: str = "timm", depth: int = 2, **kwargs):
         model_id=model_id,
         lora_targets=targets,
         pretrained=False,
+        input_size=input_size,
         backbone_kwargs=backbone_kwargs,
         **kwargs,
     )
@@ -63,41 +71,82 @@ def wake_up(module, std: float = 0.05, seed: int = 0):
     return module
 
 
-def load_configs(*overrides: str) -> tuple[dict, dict]:
-    """`(cfg, calib)`: flow.yaml + data.yaml + the named overrides, and camera_calib.yaml.
-
-    PARKED: `configs/camera_calib.yaml` was deleted with the old night-regime data code, so this
-    only works again once the flow phase replaces it. Only the parked `test_flow_train.py` calls it.
-    """
+def load_configs(*overrides: str) -> dict:
+    """flow.yaml + data.yaml + the named overrides (file names under configs/), as a plain dict."""
     omegaconf = pytest.importorskip("omegaconf")
     cfg = omegaconf.OmegaConf.merge(
         omegaconf.OmegaConf.load(CONFIGS / "flow.yaml"),
         omegaconf.OmegaConf.load(CONFIGS / "data.yaml"),
         *[omegaconf.OmegaConf.load(CONFIGS / name) for name in overrides],
     )
-    calib = omegaconf.OmegaConf.load(CONFIGS / "camera_calib.yaml")
-    return (
-        omegaconf.OmegaConf.to_container(cfg, resolve=True),
-        omegaconf.OmegaConf.to_container(calib, resolve=True),
+    return omegaconf.OmegaConf.to_container(cfg, resolve=True)
+
+
+def tiny_cfg(correction: bool = False, **updates) -> dict:
+    """The real flow config at the tiny resolution, random-weight 2-block DINO, fp32, no wandb."""
+    cfg = load_configs()
+    cfg["encoder"].update(
+        input_size=list(TINY_INPUT),
+        pretrained=False,
+        grad_checkpointing=False,
+        backbone_kwargs={"depth": 2},
     )
+    cfg["flow"].update(
+        render_size=list(TINY_RENDER), num_train_steps=6, warmup_steps=2, timesteps_per_image=2
+    )
+    cfg["optim"].update(batch_size=2, precision="fp32", lr_warmup_steps=1)
+    cfg["color"]["bgu"].update(bins=4, grid=[2, 2])
+    cfg["brightness_correction"]["enabled"] = correction
+    cfg["loader"].update(num_workers=0, pin_memory=False)
+    cfg["logging"].update(wandb_mode="disabled", log_every=1, val_every=3, save_every=3)
+    for section, values in updates.items():
+        cfg[section].update(values)
+    return cfg
 
 
-def unit_stats(num_coeffs: int = 12, num_bins: int = 8) -> dict:
-    """Identity grid stats, for tests that care about shapes rather than scaling."""
-    return {
-        "mean": torch.zeros(num_coeffs, num_bins),
-        "std": torch.ones(num_coeffs, num_bins),
-    }
+def tiny_layout(correction: bool = False, num_bins: int = 8):
+    from dawn.flow.tokens import TokenLayout
+
+    return TokenLayout(num_bins=num_bins, grid=(4, 5), block=4, correction=correction)
 
 
-def night_batch(num_images: int, cfg: dict, calib: dict, level: str | None = "medium") -> dict:
-    """A collated `NightPairs` batch of `num_images` synthetic images.
+def synthetic_batch(batch: int = 2, size=TINY_INPUT, seed: int = 0, fallback=None) -> dict:
+    """A collated `AlignedPairs`-style batch whose L*/100 is an exact affine map of the thermal.
 
-    PARKED: `dawn.flow.dataset` was deleted with the old night-regime data code, so this raises
-    ImportError until the flow phase supplies a replacement. Only `test_flow_train.py` calls it.
+    thermal  smooth field in [0.1, 0.9]
+    rgb      linear RGB of Lab(100 * (0.25 + 0.45 * thermal), a(x), b(y)): the brightness grid can
+             reproduce the lightness exactly, and the a*b* vary smoothly (inside the gamut)
+    valid / moving / vehicles   bool masks with odd-aligned edges (so a 2x downsample
+             gives fractional weights); `moving` and `vehicles` each cover one corner block
     """
-    from dawn.flow.dataset import NightPairs, SyntheticDay, collate_night_pairs
+    import torch.nn.functional as F
 
-    source = SyntheticDay(num_images=num_images, size=256)
-    pairs = NightPairs(source, cfg["degradation"], calib, level=level)
-    return collate_night_pairs([pairs[i] for i in range(num_images)])
+    from dawn.data.color import lab_to_linear
+
+    generator = torch.Generator().manual_seed(seed)
+    height, width = size
+    coarse = torch.rand(batch, 1, 6, 8, generator=generator)
+    thermal = F.interpolate(coarse, size=size, mode="bilinear", align_corners=False)
+    thermal = thermal * 0.8 + 0.1
+    ys = torch.linspace(-1, 1, height).view(1, 1, height, 1)
+    xs = torch.linspace(-1, 1, width).view(1, 1, 1, width)
+    lightness = 100 * (0.25 + 0.45 * thermal)
+    a_star = 14 * torch.sin(2 * xs + torch.arange(batch).view(-1, 1, 1, 1)) + 0 * ys
+    b_star = 12 * torch.cos(2 * ys) + 0 * xs + 6
+    lab = torch.cat([lightness, a_star.expand_as(thermal), b_star.expand_as(thermal)], dim=1)
+    rgb = lab_to_linear(lab).clamp(0, 1)
+
+    def block(row0, col0, rows, cols):
+        m = torch.zeros(batch, 1, height, width, dtype=torch.bool)
+        m[..., row0 : row0 + rows, col0 : col0 + cols] = True
+        return m
+
+    return {
+        "thermal": thermal.float(),
+        "rgb": rgb.float(),
+        "valid": ~block(0, 0, 5, width),
+        "moving": block(height - 13, 0, 13, 17),
+        "vehicles": block(height - 21, 0, 21, 31),
+        "image_id": [f"train_{seed:02d}{i:03d}" for i in range(batch)],
+        "fallback": torch.tensor(fallback if fallback is not None else [False] * batch),
+    }
