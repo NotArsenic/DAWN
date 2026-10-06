@@ -15,8 +15,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import torch
-
 
 def main():
     parser = argparse.ArgumentParser(description="Oracle grid fitting sanity check")

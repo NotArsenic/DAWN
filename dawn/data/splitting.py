@@ -1,16 +1,19 @@
-"""Hand labels and image statistics -> the four manifests training reads.
+"""Hand labels and image statistics -> the five manifests training and evaluation read.
 
-    train_day   clean daytime sources for the degradation pipeline
-    val_day     the same, held out by GROUP
-    test_day    the official test-dev split, daytime only
-    hard_test   real night frames, never a source: the thing the model is judged on
+    train_day     clean daytime sources for the degradation pipeline
+    val_day       the same, held out by GROUP
+    test_day      the official test-dev split, daytime only
+    hard_test     real near-black night frames, never a source: the thing the model is judged on
+    night_normal  real ordinary night frames: qualitative comparison only, never synthesized
 
 Three things happen here, in this order.
 
-1. **Vocabulary.** The hand labels say day / night / dusk / exclude; training wants
-   day / hard_test / dropped. `configs/data.yaml: split.label_map` does the translation, so
-   `data/labels/visdrone_labels.csv` is never edited to suit the code. Dusk is dropped: it is
-   neither a clean daytime source nor a real night test.
+1. **Vocabulary and night partitioning.** The hand labels say day / night / dusk / exclude;
+   `configs/data.yaml: split.label_map` translates day to day and night to night (dusk and
+   exclude are dropped). Frames labelled night are then split by median linear Rec. 709 luminance:
+   those with lum_median <= hard_test_max_lum (empirically near-black, many pixels code 0) go to
+   hard_test, and the rest go to night_normal. Dusk is dropped: it is neither a clean daytime
+   source nor a real night test.
 
 2. **Auto-labelling the still collections.** The 49 `99999xx` groups hold 6,497 unrelated
    stills, day and night interleaved frame by frame, and nobody hand-labelled them. Two cutoffs
@@ -41,9 +44,11 @@ from dawn.data.visdrone import ImageStats, is_still_collection, sequence_id, wri
 
 logger = logging.getLogger(__name__)
 
-FINAL_SUBSETS = ("train_day", "val_day", "test_day", "hard_test")
+FINAL_SUBSETS = ("train_day", "val_day", "test_day", "hard_test", "night_normal")
 DAY = "day"
+NIGHT = "night"
 HARD_TEST = "hard_test"
+NIGHT_NORMAL = "night_normal"
 LOG_FLOOR = 1e-4  # same floor as the guidance map (docs/conventions.md section 4)
 _EPS = 1e-9
 
@@ -102,8 +107,7 @@ class AutoDayCutoffs:
 
     def accepts(self, row: ImageStats) -> bool:
         return (
-            row.lum_median >= self.min_luminance
-            and row.highlight_ratio <= self.max_highlight_ratio
+            row.lum_median >= self.min_luminance and row.highlight_ratio <= self.max_highlight_ratio
         )
 
 
@@ -300,7 +304,7 @@ def build_final_manifests(
     image_labels: Mapping[str, str | None],
     cfg: dict,
 ) -> tuple[dict[str, list[str]], AutoDayCutoffs | None]:
-    """Hand labels + stats -> `{train_day, val_day, test_day, hard_test: [image_id]}`.
+    """Hand labels + stats -> the five manifests.
 
     Args:
         stats: Every row of the stats CSV.
@@ -340,20 +344,29 @@ def build_final_manifests(
 
     regroup = cfg.get("regroup", {})
     test_split = regroup.get("test_split", "test-dev")
+    hard_test_max_lum = float(cfg.get("night", {}).get("hard_test_max_lum", 0.005))
 
-    day_pool, test_day, hard_test = [], [], []
+    day_pool, test_day, hard_test, night_normal = [], [], [], []
     for image_id, label in sorted(training_labels.items()):
         row = by_id.get(image_id)
         if row is None:
             continue
         if label == HARD_TEST:
             hard_test.append(image_id)
+        elif label == NIGHT_NORMAL:
+            night_normal.append(image_id)
+        elif label == NIGHT:
+            if row.lum_median <= hard_test_max_lum:
+                hard_test.append(image_id)
+            else:
+                night_normal.append(image_id)
         elif label == DAY:
             (test_day if row.split == test_split else day_pool).append(image_id)
 
     manifests: dict[str, list[str]] = {name: [] for name in FINAL_SUBSETS}
     manifests["test_day"] = sorted(test_day)
     manifests["hard_test"] = sorted(hard_test)
+    manifests["night_normal"] = sorted(night_normal)
     if day_pool:
         train_groups, _ = regroup_train_val(
             day_pool,
@@ -366,7 +379,9 @@ def build_final_manifests(
         manifests["train_day"].sort()
         manifests["val_day"].sort()
 
-    assert_groups_disjoint({k: v for k, v in manifests.items() if k != "hard_test"})
+    assert_groups_disjoint(
+        {k: v for k, v in manifests.items() if k not in ("hard_test", "night_normal")}
+    )
     return manifests, cutoffs
 
 
