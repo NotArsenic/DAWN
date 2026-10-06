@@ -178,7 +178,7 @@ def test_data_config_decisions_hold():
     assert cfg["align"]["exclude_copied_boxes"] is True
 
 
-OVERLAYS = ["debug.yaml", "mps.yaml", "gpu_probe.yaml"]
+OVERLAYS = ["debug.yaml", "mps.yaml", "gpu_probe.yaml", "correction.yaml", "overfit_gpu.yaml"]
 
 
 @pytest.mark.parametrize("name", OVERLAYS)
@@ -213,6 +213,13 @@ def test_the_mac_overlay_is_fp32_and_the_gpu_probe_keeps_the_real_precision():
     probe = _merged("gpu_probe.yaml")
     assert probe["optim"]["precision"] == "bf16" and probe["optim"]["batch_size"] == 16
     assert probe["encoder"]["input_size"] == [512, 640] and probe["flow"]["warmup_steps"] < 50
+
+
+def test_the_correction_overlay_widens_the_token_and_the_overfit_overlay_keeps_the_real_size():
+    assert TokenLayout.from_config(_merged("correction.yaml")).dim == 64
+    gate = _merged("overfit_gpu.yaml")
+    assert gate["encoder"]["input_size"] == [512, 640] and gate["optim"]["precision"] == "bf16"
+    assert gate["flow"]["warmup_steps"] < gate["flow"]["num_train_steps"]
 
 
 def test_the_debug_overlay_runs_on_the_cpu_with_random_weights_and_no_wandb():

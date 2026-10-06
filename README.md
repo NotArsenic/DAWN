@@ -12,8 +12,10 @@ It treats thermal as a one-channel image and splits the job in two. Brightness i
 |---|---|
 | Data pipeline (DroneVehicle read, day filter, box-matched alignment, dedup, masks, aligned PNGs, dataset) | **Works.** Implemented, tested and run on the real data |
 | Alignment audit (contact sheets, fit histograms) | Works; thresholds are starting values awaiting the maintainer's decision |
-| Model (DINO encoder with LoRA, velocity transformer, brightness path, color path, losses) | **Not trained yet.** The code under `dawn/grid`, `dawn/models`, `dawn/flow`, `dawn/uncertainty` and `dawn/eval` is parked old-regime code (see below) and is rebuilt in the next phase |
-| Results | None yet. No numbers are claimed here |
+| Model code (DINO encoder with LoRA, velocity transformer on 1,280 tokens, brightness grid, colour map, the four losses, sampler, trainer, validation metrics) | **Done and tested; nothing is trained yet.** The debug run (40 steps on real pairs, CPU) and an overfit-100 run on a Mac (fp32, half resolution) have been run; the full 20K-step run is for the RTX 5060 Ti |
+| Brightness / colour oracle (`scripts/check_oracle.py`) | **Measured** on all 345 val pairs; the ceiling is in the next section |
+| Inference, evaluation, uncertainty maps, the optional refiner | **Not started** (`scripts/{infer,evaluate,benchmark_latency}.py`, `dawn/uncertainty/`, `dawn/eval/{calibration,visualize}.py` are stubs) |
+| Results | None. No trained-model number is claimed here; the only measured numbers are the oracle ceilings below |
 
 Few pairs survive the filter: of the 28,411 DroneVehicle pairs, about 8,500 are daytime and 5,385 pass alignment and dedup (3,662 train, 345 val, 1,378 test; `data/manifests/logs/summary.md`). 2,374 of them were aligned by the edge-correlation fallback instead of by boxes, so they are less trustworthy and have no moving mask (`data/manifests/fallback_pairs.txt`); for those a per-vehicle `vehicles` mask (every vehicle, stretched along its heading where it may have moved) stands in for it. Without the fallback it is 3,011. A small training set is the largest risk the plan names, and the audit exists to decide what else to loosen.
 
@@ -27,7 +29,7 @@ pip install -e ".[dev]"
 
 - Python ≥ 3.10, PyTorch ≥ 2.1. The data pipeline runs on CPU.
 - The model phase wants PyTorch built for CUDA 12.8 or newer on an RTX 5060 Ti (16 GB).
-- DINOv3 weights are gated. Accept the [license on Hugging Face](https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m) and `export HF_TOKEN=...`. The encoder loads through `timm` by default; `pip install -e ".[transformers]"` adds the other backend. Tests never download weights.
+- DINOv3 weights: the default `timm` backend loaded `vit_small_plus_patch16_dinov3.lvd1689m` without a Hugging Face token on 2026-10-06 (timm's own hosting). The `transformers` backend (`pip install -e ".[transformers]"`) needs the gated [facebook/dinov3-*](https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m) repo: accept its license and `export HF_TOKEN=...`. Either way the DINOv3 license applies. Tests never download weights.
 
 ```bash
 pytest                       # CPU only, offline, does not need the dataset
@@ -61,44 +63,94 @@ Outputs that are committed: `data/manifests/{train,val,test}_pairs.txt` (the fin
 
 The aligned pairs are served by `dawn.data.pairs.AlignedPairs` (thermal `(1, 512, 640)` = code / 255, linear RGB `(3, 512, 640)`, a `valid`, a `moving` and a `vehicles` mask, a `fallback` flag; flips and a random thermal contrast curve in training). Conventions, coordinate systems and every definition are in [`docs/conventions.md`](docs/conventions.md).
 
+## The model in one page
+
+One DINOv3 ViT-S+ pass on the thermal frame (LoRA, rank 8) conditions a 7.6M-parameter velocity transformer that generates, in 2 flow steps, one token per DINO patch: 16 values of its cell's brightness curve (8 thermal-intensity bins × gain and offset, mapping thermal to `L = L*/100`) and 32 values of its 4×4 block of a 128×160 a\*b\* map. The grid is applied at full resolution guided by the thermal; the colour map is upsampled bilinearly; the image is assembled in CIELAB and clipped to the sRGB gamut. Training uses four losses (flow, render, L_align on DINO features, L_color over 261 a\*b\* bins) on pairs whose pixel mask removes the invalid warp and the moving vehicles. Everything about layouts and units is in [`docs/conventions.md`](docs/conventions.md); the design and its reasons are in the plan.
+
+## The oracle: the measured ceiling
+
+`scripts/check_oracle.py` fits the best possible brightness grid and colour map to each real val pair, renders them with the same code the trainer validates with, and compares with the RGB. On all 345 val pairs at 640×512 (194 box-aligned, 151 fallback; `outputs/oracle/report.md` has p10/p50/p90 and each subset):
+
+| What | Mean |
+|---|---|
+| Brightness grid alone, L\* PSNR (peak 100), plain fit / refine 1 | 24.6 dB / 25.1 dB |
+| Grid + generated 128×160 L correction (bilinear), refine 1 | 26.9 dB |
+| Colour ceiling: true a\*b\* at 128×160, brought back up, mean \|Δa\*b\*\| (bilinear / best bilateral guided upsampling) | 0.90 / 1.28 |
+| Assembled oracle image, grid only, bilinear colour: CIEDE2000 | 3.33 |
+
+These are the **best any model could do with this parametrization**, not results. The grid alone is above the plan's 24 dB bar; the correction is off by default pending the worst-10% sheet (`outputs/oracle/worst10_grid_only_*.jpg`: cluttered yards, rubble, painted containers and roofs, and shadows, i.e. fine texture and surface paint that thermal does not carry). Bilateral guided upsampling, as the plan specifies, was worse than bilinear at every grid swept, so `color.upsample` is `bilinear` (`bgu` stays as a switch).
+
+## Training
+
+```bash
+python scripts/check_oracle.py                                   # the ceiling, on the val pairs (CPU is fine, minutes)
+python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu   # 40 steps, real pairs
+python scripts/train_flow.py --config configs/flow.yaml --override configs/mps.yaml --device mps --overfit 100   # Mac, fp32
+python scripts/train_flow.py --config configs/flow.yaml --device cuda   # the real run: batch 16 x 4 timesteps, bf16, 20K steps
+```
+
+`flow.yaml` is the real configuration (20K steps, a 3K-step detach warmup, batch 16 × 4, bf16 on CUDA only); overlays (`debug`, `mps`, `gpu_probe`, `overfit_gpu`, `correction`) change a few keys each. Validation logs full-resolution L\* PSNR, CIEDE2000 and colorfulness for the model at NFE 2 (Euler and midpoint) next to the oracle and the gap, for box-aligned and fallback pairs separately, and `loss/flow_brightness`, `loss/flow_color` (and `_correction`) beside the total.
+
+### GPU gate commands (RTX 5060 Ti, 16 GB)
+
+In this order; each is a gate for the next. The Mac cannot measure VRAM at 640×512.
+
+```bash
+# 0. setup: PyTorch built for CUDA 12.8+ with sm_120
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())"
+
+# 1. real weights, shapes, LoRA targets; peak VRAM of the encoder (batch 16) and the velocity net (16 x 4)
+python scripts/smoke_dino.py --backend timm --batch-size 16
+
+# 2. THE 50-STEP PROBE of the real configuration: peak VRAM and seconds/step, BEFORE an overnight run.
+#    DINO's attention reaches the velocity net as a float mask, so PyTorch has to pick an attention
+#    kernel that keeps 1,280-token attention affordable; this tells you. If it runs out of memory,
+#    put `optim: {batch_size: 8}` in a small YAML and add it to --override (the 8 x 4 fallback).
+python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_probe.yaml \
+    --device cuda --max-steps 50 --out-dir outputs/gpu_probe
+
+# 3. overfit-100 at full resolution, both modes: render L* PSNR must approach the matching oracle
+python scripts/train_flow.py --config configs/flow.yaml --override configs/overfit_gpu.yaml \
+    --device cuda --overfit 100 --out-dir outputs/overfit_gpu/off
+python scripts/train_flow.py --config configs/flow.yaml --override configs/overfit_gpu.yaml configs/correction.yaml \
+    --device cuda --overfit 100 --out-dir outputs/overfit_gpu/on
+
+# 4. the real run (resume with --resume checkpoints/run1/flow_last.pt)
+python scripts/train_flow.py --config configs/flow.yaml --device cuda --out-dir checkpoints/run1
+```
+
 ## Project structure
 
 ```
 dawn/
 ├── configs/
 │   ├── data.yaml            # DroneVehicle paths and every data threshold (commented)
-│   ├── flow.yaml            # parked: old-regime flow training
-│   ├── denoiser.yaml        # parked
-│   ├── eval.yaml            # parked
-│   └── debug.yaml           # overlay for a tiny debug run (flow phase)
+│   ├── flow.yaml            # stage 1: resolution, grid, colour, losses, schedule, optimizer
+│   ├── debug.yaml, mps.yaml, gpu_probe.yaml, overfit_gpu.yaml, correction.yaml   # overlays
+│   └── eval.yaml            # parked (inference/eval phase)
 ├── docs/
-│   ├── conventions.md       # layouts, coordinates, color spaces, data rules (read first)
+│   ├── conventions.md       # layouts, coordinates, color spaces, token layout, data rules (read first)
 │   └── Dawn Night-Vision to Day Colorization for Drone Imagery.md   # the plan / spec
 ├── data/manifests/          # {train,val,test}_pairs.txt and logs/ (committed)
 ├── release/visdrone_labels/ # earlier VisDrone day/night hand labels, pending a separate release
 ├── dawn/
-│   ├── data/                # CURRENT
-│   │   ├── dronevehicle.py  # raw layout, IDs, readers, border check, XML parsing
-│   │   ├── day_filter.py    # per-pair RGB stats, the day decision, histogram and sheets
-│   │   ├── align.py         # box matching, RANSAC, acceptance, edge check, warp, masks
-│   │   ├── dedup.py         # perceptual hashes, cross-split near-duplicates
-│   │   ├── pairs.py         # aligned PNG writer, AlignedPairs dataset, augmentation
-│   │   ├── report.py        # final verdicts, summary.md, stratified sampling
-│   │   ├── audit.py         # edge overlays, audit sheets, fit histograms
-│   │   ├── sheets.py        # contact sheets, process pool
-│   │   ├── color.py         # sRGB <-> linear, luminance, CIELAB
-│   │   ├── resample.py      # area_downsample: the only downsampling
-│   │   └── seeding.py       # seeds from image IDs
-│   ├── grid/ models/ flow/ uncertainty/ eval/    # PARKED: old night-regime grid, models and trainer
+│   ├── data/                # dronevehicle, day_filter, align, dedup, pairs, report, audit, sheets,
+│   │                        # color (sRGB, CIELAB), resample (area_downsample), seeding
+│   ├── grid/                # layout (gain/offset), guidance (thermal), slice, fit (one-input affine
+│   │                        # grid), upsample (bilinear | BGU), normalize (token standardization)
+│   ├── flow/                # tokens (the one token layout), targets, render (the one render path),
+│   │                        # color_bins (261 bins), loss, sampler, trainer, loaders, oracle
+│   ├── models/              # encoder (DINOv3 + LoRA, thermal in), velocity (DiT), color_head
+│   ├── eval/metrics.py      # masked L* PSNR, CIEDE2000, colorfulness (the rest is parked)
+│   └── uncertainty/         # parked: sample-spread maps land with the inference phase
 ├── scripts/
-│   ├── prepare_dronevehicle.py   # stats, day, align, dedup, write, all
-│   ├── audit_alignment.py        # audit sheets and histograms
-│   ├── smoke_dino.py, check_oracle.py                   # model-phase checks
-│   └── train_flow.py, train_denoiser.py, infer.py, evaluate.py, benchmark_latency.py   # parked
-└── tests/                   # CPU, offline; the data tests build a tiny fake DroneVehicle tree
+│   ├── prepare_dronevehicle.py, audit_alignment.py   # data
+│   ├── check_oracle.py, smoke_dino.py, train_flow.py # model phase
+│   └── infer.py, evaluate.py, benchmark_latency.py   # parked
+└── tests/                   # CPU, offline; tiny tensors, a tiny fake aligned tree, random-weight DINO
 ```
 
-"Parked" means the code and tests are kept in the tree as reference for the next phase, untouched, and are skipped where they cannot run. They describe the earlier night-enhancement design (a bilateral grid of affine transforms on a night image) and disagree with the plan in places; the plan wins.
+"Parked" means a stub the inference/eval phase fills in; its `--help` works and nothing else is promised.
 
 ## Known limitations
 
@@ -106,7 +158,7 @@ dawn/
 2. **A small training set.** Only the pairs that pass a strict alignment filter are used, and the filter currently keeps about 63% of the day pairs (35% by boxes alone, the rest through the edge fallback). The thresholds are under review.
 3. **Residual misalignment.** The cameras are not co-registered; pairs are aligned to roughly a pixel or two, and vehicles that moved between the exposures are masked, not fixed.
 4. **Day only.** Night pairs and other thermal cameras are out of scope.
-5. **Nothing is trained or measured yet.** Speed and quality numbers will come from the model phase.
+5. **Nothing is trained yet.** The oracle ceilings above are measured; speed (latency) and the quality of a trained model come with the GPU run and the inference/eval phase.
 
 ## License
 

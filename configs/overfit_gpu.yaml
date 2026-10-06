@@ -1,0 +1,23 @@
+# Overlay for the overfit-100 gate on the 16 GB GPU, at the REAL resolution and precision:
+#
+#   python scripts/train_flow.py --config configs/flow.yaml --override configs/overfit_gpu.yaml \
+#       --device cuda --overfit 100 --out-dir outputs/overfit_gpu/off
+#   (add configs/correction.yaml to --override for the correction-on run)
+#
+# Train and validate on the first 100 train pairs, no augmentation, live weights. The detach
+# schedule is scaled to the short run so both regimes (LoRA fed by L_align / L_color only, then by
+# every loss) happen; the gate compares the logged render L* PSNR with the matching oracle.
+
+flow:
+  num_train_steps: 3000
+  warmup_steps: 300
+
+optim:
+  lr_warmup_steps: 100
+
+logging:
+  wandb_mode: disabled
+  log_every: 50
+  save_every: 1000
+  val_every: 500
+  num_val_samples: 16

@@ -2,7 +2,7 @@
 
 The single source of truth for every layout, coordinate system, color space and definition that more than one module relies on. **If code and this file disagree, this file wins**: fix the code, or change this file in the same commit. Read it before touching `dawn/grid/`, `dawn/models/`, `dawn/flow/`, `dawn/data/` or `dawn/eval/`.
 
-> **Status, 2026-10-06.** The project moved from synthetic night RGB (VisDrone) to real **day thermal → RGB** (DroneVehicle), and the flow phase rebuilt the grid, token, model, flow and metric code for it. Everything here is current. The plan (`docs/Dawn Night-Vision to Day Colorization for Drone Imagery.md`) is the spec this file implements; where this file is more specific than the plan (the 261 a\*b\* bins instead of its 313, `L = L*/100` coefficients, a switchable brightness correction, the resolution as one knob) this file wins.
+> **Status, 2026-10-06.** The project moved from synthetic night RGB (VisDrone) to real **day thermal → RGB** (DroneVehicle), and the flow phase rebuilt the grid, token, model, flow and metric code for it. Everything here is current. The plan (`docs/Dawn Night-Vision to Day Colorization for Drone Imagery.md`) is the spec this file implements; where this file is more specific than the plan (the 261 a\*b\* bins instead of its 313, `L = L*/100` coefficients, a switchable brightness correction, bilinear colour upsampling instead of the BGU, the resolution as one knob) this file wins.
 
 Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx` token-grid rows/columns (32, 40 at the full 512×640 encoder input), `N = gy·gx` tokens, `D` values per token, `Q` a\*b\* bins (261). Sizes come from `configs/flow.yaml` (`encoder.input_size`, `grid.*`, `color.*`, `brightness_correction.enabled`); the token layout lives in `dawn/flow/tokens.py` and the coefficient constants in `dawn/grid/layout.py`. Nothing else hard-codes 40, 32, 1,280, 160, 128, 16, 32, 48 or 64: code and tests ask the layout. The one exception is `tests/test_tokens.py: test_layout_matches_the_plan`, which pins the plan's numbers as the spec.
 
@@ -19,14 +19,14 @@ Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx
 | Image IDs | `f"{split}_{stem}"`, e.g. `train_00001`; the three manifests are `{train,val,test}_pairs` (§10.1) |
 | Resolution | one knob: `encoder.input_size = (H, W)`, default `(512, 640)`. Token grid = input / 16; colour map = 4 × token grid; render size = `flow.render_size` (§3) |
 | Brightness grid | raw `(B, 2, K, gy, gx)` = (coefficient, bin, cell row, cell col); coefficient 0 = gain, 1 = offset; `L = gain · thermal + offset`, **`L = L*/100`** (§2) |
-| Colour map | raw `(B, 2, 4gy, 4gx)` a\*, b\* in CIELAB units, one value per colour pixel; optional correction `(B, 1, 4gy, 4gx)` in `L` units (§2.3) |
+| Colour map | raw `(B, 2, 4gy, 4gx)` a\*, b\* in CIELAB units, one value per colour pixel; optional correction `(B, 1, 4gy, 4gx)` in `L` units (§2.3); upsampled **bilinearly** by default, bilateral guided upsampling (BGU) behind `color.upsample` (§6.3) |
 | Token | `n = y·gx + x`, values `[brightness 2K \| colour 32 \| correction 16 (if enabled)]` = 48 or 64 (§2.3) |
 | Grid coordinates | node values sit at cell **centers**; coordinates outside the outer centers clamp (§3) |
 | Guidance | `compute_guidance(thermal)`: 5×5 replicate box blur, clamp to `[0, 1]`. No log, no stretch (§4) |
 | Raw vs standardized | per-segment stats, flattened to a `(D,)` mean and std by the layout; pixels see raw, flow sees standardized; convert only via `normalize.py` (§5) |
 | Downsampling | always area averaging, only through `area_downsample` (§4a); masks become fractions, targets masked means |
 | Colour bins | the 261 occupied cells of a 10-unit a\*b\* grid over the 8-bit sRGB gamut, sorted by a\* then b\* (§6) |
-| Render | `flow.render.render`: the one path from raw parts to L\*a\*b\* and linear RGB (§6) |
+| Render | `flow.render.render`: the one path from raw parts to L\*a\*b\* and linear RGB (§6.4) |
 | Flow time | `t = 0` noise, `t = 1` data |
 
 ## 1. Color space
@@ -159,7 +159,7 @@ Targets are built on the device in float32 with no gradient, from the thermal, t
 
 `t = 0` is noise, `t = 1` is data. `z_t = (1 - t)·z_0 + t·z_1`, `v_target = z_1 - z_0`, samplers integrate 0 → 1. **NFE is velocity evaluations, not steps.** Euler spends one per step, midpoint two, so `nfe = 2` is two Euler steps but a single midpoint step. `flow.num_inference_steps` is an NFE budget; `steps_for_nfe` converts.
 
-## 6. Colour map, a\*b\* bins, bilateral guided upsampling and the render path
+## 6. Colour map, a\*b\* bins, upsampling and the render path
 
 ### 6.1 The 261 a\*b\* bins
 
@@ -169,11 +169,16 @@ Targets are built on the device in float32 with no gradient, from the thermal, t
 
 ### 6.2 The correction is optional
 
-`brightness_correction.enabled` (default **false**) adds a generated `L` correction at the colour-map size. Its target is `L - L_grid(fitted target grid)` as a masked area average (§5.3); it is applied through the same bilateral guided upsampling as colour, guided by the grid's `L`, so its edges still come from thermal.
+`brightness_correction.enabled` (default **false**) adds a generated `L` correction at the colour-map size. Its target is `L - L_grid(fitted target grid)` as a masked area average (§5.3); it is upsampled by the same function as colour (§6.3) and added to the grid's `L`. Whether to turn it on is the maintainer's call after the worst-10% oracle sheet and the GPU gate: on the 345 val pairs at 640×512 the grid alone reaches 25.1 dB of L\* PSNR at `refine_steps: 1` (24.6 at 0) and the correction, bilinearly upsampled, 26.9.
 
-### 6.3 Bilateral guided upsampling (Chen et al., 2016)
+### 6.3 Upsampling the generated maps: bilinear by default, BGU as a switch
 
-`dawn.grid.upsample.bilateral_guided_upsample(low, guide_lo, guide_hi, weights_lo=None)`: fit, at low resolution, a per-(cell, bin) affine of `low` on its own guide `guide_lo` (both the regressor and the bin guidance) with `fit_affine_grid`, then slice that grid at `guide_hi` and apply it to `guide_hi`. The guides are `L` in `[0, 1]` and are treated as constants (no gradient through the bin assignment); the result is differentiable with respect to `low`, which is how L_render reaches the colour tokens. Grid size, bins and ridge are `color.bgu`, chosen with `scripts/check_oracle.py` against the bilinear baseline.
+`dawn.grid.upsample.upsample_map(low, guide_lo, guide_hi, mode, ...)` is the one entry point; `color.upsample` selects the mode for both the colour map and the correction.
+
+- **`bilinear`** (the default): `F.interpolate(..., mode="bilinear", align_corners=False)` to the render size. The maintainer chose it at the oracle checkpoint: on the real val pairs the **colour ceiling** (the true a\*b\* area-averaged to the colour size and brought back up, mean |Δa\*b\*| against the truth) is **0.90** bilinear against **1.28** for the best BGU found (`bins 8, 64×80 cells, ridge 0.1, refine 2`) and 2.1 at 16×20 cells, the BGU being worse at every grid swept; the assembled oracle CIEDE2000 is 3.33 against 3.50 with that best BGU (3.9 at 16×20). A stronger ridge does not help; more refine passes help a little (`scripts/check_oracle.py`, `outputs/oracle/report.md`). The BGU's per-cell affine model of colour on `L` smooths away colour detail that is not a function of `L` inside a cell.
+- **`bgu`**: bilateral guided upsampling (Chen et al., 2016): at low resolution fit a bilateral grid of `low ≈ gain · guide + offset` per (cell, bin) with `fit_affine_grid`, slice it at the high-resolution guide and apply it to it, so edges follow the guide's. The guides are `L` in `[0, 1]` and are constants (no gradient through the bin assignment). It stays implemented and tested (exact on affine data, sharper than bilinear on a guide step edge) for cases where the guide explains the colour; its grid, bins, ridge and refine steps are `color.bgu`.
+
+Both modes are differentiable with respect to `low`, which is how L_render reaches the colour tokens.
 
 ### 6.4 The render path
 
@@ -181,8 +186,8 @@ Targets are built on the device in float32 with no gradient, from the thermal, t
 
 1. Area-downsample `thermal` to `size` if it is larger.
 2. `g = compute_guidance(thermal_s)`; `L_grid = clamp(gain · thermal_s + offset, 0, 1)` from `slice_grid(grid, g)`.
-3. With the correction: `L = clamp(L_grid + BGU(corr, area(L_grid → colour size), L_grid), 0, 1)`; otherwise `L = L_grid`.
-4. `ab = BGU(ab_lo, area(L → colour size), L)`: colour is guided by the **output** `L`, so colour edges follow brightness edges.
+3. With the correction: `L = clamp(L_grid + upsample(corr), 0, 1)`; otherwise `L = L_grid`.
+4. `ab = upsample(ab_lo)`; in `bgu` mode the guide is the **output** `L`, so colour edges follow brightness edges.
 5. `lab = (100 · L, ab)`; `rgb = clamp(lab_to_linear(lab), 0, 1)` (clipped to the gamut).
 
 ## 7. Shapes at module boundaries
@@ -194,7 +199,7 @@ Targets are built on the device in float32 with no gradient, from the thermal, t
 | `fit_affine_grid(x, y, guidance, weights, grid_size, ridge_alpha, refine_steps)` | `x (B,1,H,W)`, `y (B,C,H,W)`, `guidance (B,1,H,W)`, `weights (B,1,H,W)` or None → raw `grid (B,2C,K,gy,gx)`, `node_weights (B,K,gy,gx)` |
 | `slice_grid(grid, guidance)` | raw grid `(B,C',K,gy,gx)`, `(B,1,H,W)` → `coeffs (B,C',H,W)` |
 | `apply_gain_offset(coeffs, x, clamp)` | `(B,2C,H,W)`, `(B,1,H,W)` → `(B,C,H,W)`, clamped to `[0,1]` when `clamp` |
-| `bilateral_guided_upsample(low, guide_lo, guide_hi, weights_lo)` | `(B,C,h,w)`, `(B,1,h,w)`, `(B,1,H,W)`, `(B,1,h,w)` or None → `(B,C,H,W)` |
+| `upsample_map(low, guide_lo, guide_hi, mode)` / `bilateral_guided_upsample(low, guide_lo, guide_hi, weights_lo)` | `(B,C,h,w)`, `(B,1,h,w)`, `(B,1,H,W)` (, `(B,1,h,w)` or None) → `(B,C,H,W)` |
 | `TokenLayout.pack(parts)` / `unpack(tokens)` | parts `grid (B,2,K,gy,gx)`, `ab (B,2,4gy,4gx)`, `corr (B,1,4gy,4gx)` ↔ `(B,N,D)` |
 | `TokenLayout.stats_vector(stats)` / `weights(node_weights, fraction)` | per-segment stats → `(D,)` mean and std; `(B,K,gy,gx)`, `(B,1,4gy,4gx)` → `(B,N,D)` |
 | `standardize` / `unstandardize(tokens, mean, std)` | tokens `(B,N,D)`, stats `(D,)` |
@@ -225,19 +230,19 @@ Targets are built on the device in float32 with no gradient, from the thermal, t
 2. **One guidance function.** Fitting, slicing, rendering, inference and every script call `compute_guidance`. No inline blur or clamp code anywhere else.
 3. **One token layout.** `dawn/flow/tokens.py` is the only place that packs, unpacks, slices or counts token values; the coefficient constants come from `dawn/grid/layout.py`. No ad-hoc `permute` / `view` of parts, no 16 / 32 / 48 / 64 literal outside the one layout test.
 4. **One conversion point for standardization** (§5.2).
-5. **One downsampling function.** `area_downsample` (§4a); no `F.interpolate`, PIL `resize` or `thumbnail` to shrink an image anywhere else. (The bilinear *up*sample inside a baseline in `check_oracle.py` is the one `F.interpolate` use: it is the thing the BGU is compared against.)
+5. **One downsampling function.** `area_downsample` (§4a); no `F.interpolate`, PIL `resize` or `thumbnail` to shrink an image anywhere else. The one sanctioned bilinear *up*sample is `upsample_map` (§6.3), which the colour-ceiling baseline in `check_oracle.py` calls too.
 6. **Conventions change here first.** If one has to change, edit this file in the same commit as the code and update the affected docstrings.
 7. **One thermal resample.** `align.warp_thermal` is the only place thermal is resampled: bilinear inverse mapping onto the RGB frame. It interpolates at arbitrary positions rather than shrinking an image, so it is the one sanctioned resample that is not an area average (§4a is about downsampling). The RGB image is never resampled.
 8. **Thermal is never sRGB** (§1), and the RGB target is never touched beyond the crop.
 9. **One render path.** `flow.render.render` (§6.4). L_render, validation, the oracle and inference do not re-implement any step of it.
-10. **`fit.py` and `upsample.py` use `slice.py`'s weights** (rule 1): the fitted grid and the rendered grid cannot drift apart.
+10. **`fit.py` and `upsample.py` use `slice.py`'s weights** (rule 1): the fitted grid and the rendered grid cannot drift apart. `upsample_map` is the only upsampling the render path calls.
 11. **Lab is averaged as values** (§4a): targets are masked area averages in Lab, masks are fractions.
 
 ## 9. Known limitations
 
 - The guidance blur is a fixed 5×5 **pixels**. At render size (256×320) 5 px is 1.6% of the width; at the 640×512 input it is 0.8%, so the effective smoothing differs between L_render and validation. If bins flicker at full resolution, scale the kernel with resolution and update §4.
 - **Splat-and-solve is biased.** `fit_affine_grid` solves each node against the pixels that touch it, as if that node alone applied to them; the renderer then blends 8 nodes per pixel. The two disagree wherever the grid changes quickly from node to node, so a fitted grid does not re-render its own target exactly even with no noise anywhere. The error is small on smooth grids and is what `refine_steps` buys down (about +0.5 dB), by fitting the render residual and adding the correction. Judge a fit on the **rendered** image, never on coefficient error against a reference grid.
-- **BGU sparsity.** The upsampling grid is small and has many empty (cell, bin) nodes; they take their cell's fit through the ridge, so a colour that appears in only one bin of one cell is smoothed toward its neighbours. `check_oracle.py` reports the colour ceiling against plain bilinear upsampling.
+- **BGU smoothing.** Even at 2×2 colour pixels per cell the BGU's per-(cell, bin) affine model of colour on `L` loses colour detail that is not a function of `L`, which is why bilinear is the default (§6.3). In `bgu` mode, empty (cell, bin) nodes take their cell's fit through the ridge, and the guide used at fit time is the area-averaged `L` while the slice sees the full-resolution `L`.
 - The token layout, the DINO patch grid and the brightness cells are one grid (§2.3); changing the encoder resolution changes all three together, and a checkpoint cannot be loaded at another resolution.
 - The 261 bins come from the sRGB gamut, so a\*b\* cells the model could generate outside it do not exist as classes; the render clips to the gamut anyway.
 
