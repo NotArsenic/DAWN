@@ -13,6 +13,8 @@ Reads the align log written by `prepare_dronevehicle.py align` and writes, under
     fallback_accepted_NN.jpg / fallback_rejected_NN.jpg   the pairs the edge-correlation fallback
                       aligned (no boxes behind them) and the ones it looked at and rejected, on
                       sheets of their own: audit these separately from the box-aligned pairs
+    vehicles_dense_01.jpg  the frames whose vehicles mask covers the most (flagged over 30% in
+                      vehicles.csv), mask tinted red: check what a dense frame loses
     usable_luminance.png  luminance of the usable pairs (the final manifests) against the day
                       pairs that were rejected later, per split
     usable_darkest.jpg / usable_random.jpg   RGB | thermal of the 24 darkest and of 24 random
@@ -32,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 import random
@@ -57,6 +60,9 @@ def main() -> None:
         type=int,
         default=60,
         help="Edge-fallback pairs to show, accepted (and rejected)",
+    )
+    parser.add_argument(
+        "--dense", type=int, default=20, help="Densest vehicles-mask frames to show (red tint)"
     )
     parser.add_argument("--per-sheet", type=int, default=20, help="Tiles per sheet")
     parser.add_argument("--seed", type=int, default=0, help="Sampling seed")
@@ -128,6 +134,22 @@ def main() -> None:
         workers=args.workers,
         prefix="fallback_",
     )
+    vehicles_csv = layout.log("vehicles")
+    if vehicles_csv.exists():
+        with vehicles_csv.open(encoding="utf-8") as f:
+            vehicle_rows = list(csv.DictReader(f))
+        fractions = {r["image_id"]: float(r["vehicles_fraction"]) for r in vehicle_rows}
+        densest = sorted(fractions.items(), key=lambda kv: (-kv[1], kv[0]))[: args.dense]
+        over = sum(r["dense"] == "1" for r in vehicle_rows)  # the flag as logged, not re-derived
+        sheet = audit.save_vehicle_sheet(
+            layout,
+            densest,
+            out_dir / "vehicles_dense_01.jpg",
+            f"the {len(densest)} densest vehicles masks ({over} of {len(fractions)} frames over "
+            f"{100 * float(cfg['masks']['vehicles']['max_frame_fraction']):.0f}%); mask in red",
+            workers=args.workers,
+        )
+        logger.info(f"Dense-frame sheet: {sheet}")
     hist = out_dir / "fit_histograms.png"
     audit.plot_fit_histograms(rows, acfg, hist)
     logger.info(f"Histograms: {hist}")

@@ -40,11 +40,9 @@ day_filter:
   # The distribution has a bright day mode and a continuum of dusk and night below it with no
   # clean gap, so this is a human decision. Checkpoint 1 (2026-10-06) chose 0.20 (log10 -0.70):
   # at 0.10 the band just above the cutoff is street-lit night; at 0.20 none of it is. The
-  # maintainer then lowered it to 0.18 (log10 -0.745) for more training data, knowingly: the
-  # 800 pairs that adds (0.18 <= L < 0.20) are about 85% daylight, the rest dusk or night
-  # (orange sodium-lit roads, blue-lit parking lots), and one frame of the folder named
-  # `310_80m45night1` (train_13143) now passes.
-  min_lum_median: 0.18    # 6310 train / 557 val / 2467 test day pairs
+  # maintainer lowered it to 0.18 for more data, saw that the 0.18-0.20 slice is about 15%
+  # dusk or night (orange sodium-lit roads, blue-lit parking lots) and put it back to 0.20.
+  min_lum_median: 0.20    # 5818 train / 532 val / 2184 test day pairs
   histogram_bin_log10: 0.05   # histogram bin width in log10(luminance)
   sheet_count: 100        # thumbnails on the random / band contact sheets
   band_log10: 0.15        # the "just above / just below the cutoff" bands: cutoff +/- this, in log10
@@ -112,6 +110,35 @@ dedup:
   max_hamming: 6          # STARTING VALUE; `dedup` reports the counts at 4 / 6 / 8 / 10
   report_hamming: [4, 6, 8, 10]
   sheet_count: 24         # example cross-split pairs on the sheet just under / over the threshold
+
+masks:
+  # The vehicles mask (`<id>_vehicles.png`): every vehicle, wherever it may be, with a margin that
+  # is chosen PER VEHICLE (dawn/data/align.py: vehicle_mask). Built for every pair; the loss code
+  # uses `moving` for box-aligned pairs and `vehicles` for fallback pairs (which have no moving
+  # mask); eval uses it for vehicle-crop metrics.
+  #   1. the vehicle has a thermal box of its own (a matched box): both positions are known, so the
+  #      oriented RGB polygon and the warped thermal polygon get only `dilate_px`;
+  #   2. no thermal box of its own (copied labels, unmatched): a local shift search around the RGB
+  #      box (`static_test`) that agrees with the pair's warp and has a clear peak means it did not
+  #      move: `dilate_px` only;
+  #   3. the test says it moved, or cannot tell (weak peak, tiny box): the polygon is stretched
+  #      `extend_px` each way along its LONG axis (vehicles move along their heading), plus
+  #      `dilate_px` all round.
+  vehicles:
+    dilate_px: 3          # the fallback's alignment error, added round every polygon
+    # Sized from the data (`prepare_dronevehicle.py vehicle-dilation`, 2026-10-06, 3,013 box-aligned
+    # pairs): the 5,896 vehicles that moved between the two exposures were displaced by a median
+    # 6.5 px, p90 13.3, p95 17.4, p99 28.4 (max 57; vehicles beyond the 40 px match gate are not
+    # matched and so not counted). extend_px is that p95.
+    extend_px: 17.4
+    static_test:
+      window_margin_px: 12    # the window is the box plus this on every side
+      search_px: 6            # residual shifts within +/- this are tried
+      max_residual_px: 2      # the best shift must be within this of "none" to call it static
+      min_prominence: 0.02    # the correlation peak must beat the best shift >= 2 px away by this
+      min_window_px: 32       # a shorter window (a tiny box) is too small to trust: unsure
+    max_frame_fraction: 0.30  # frames masked over this much are flagged (dense parking lots) in
+                          # data/manifests/logs/vehicles.csv, to be checked, not silently dropped
 
 augment:
   # Training only (dawn/data/pairs.py). Validation and test are never augmented.

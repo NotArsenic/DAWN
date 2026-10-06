@@ -38,7 +38,15 @@ def _write_pair(layout, image_id, seed=0, thermal=None):
     valid[:10, :40] = 0  # an invalid corner (top-left)
     moving = np.zeros((H, W), np.uint8)
     moving[100:130, 200:260] = 255  # a block, off-centre
-    for kind, array in (("rgb", rgb), ("thermal", thermal), ("valid", valid), ("moving", moving)):
+    vehicles = np.zeros((H, W), np.uint8)
+    vehicles[300:340, 50:130] = 255  # another block, so a flip of it is visible too
+    for kind, array in (
+        ("rgb", rgb),
+        ("thermal", thermal),
+        ("valid", valid),
+        ("moving", moving),
+        ("vehicles", vehicles),
+    ):
         path = layout.aligned_path(image_id, kind)
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(array).save(path)
@@ -92,7 +100,8 @@ def test_items_have_the_documented_shapes_dtypes_and_ranges(made):
     ds = pairs.AlignedPairs(layout, "train_pairs")
     assert len(ds) == 3
     item = ds[0]
-    assert set(item) == {"thermal", "rgb", "valid", "moving", "image_id", "fallback"}
+    assert set(item) == {"thermal", "rgb", "valid", "moving", "vehicles", "image_id", "fallback"}
+    assert item["vehicles"].shape == (1, H, W) and item["vehicles"].dtype == torch.bool
     assert item["fallback"] is False
     assert item["thermal"].shape == (1, H, W) and item["thermal"].dtype == torch.float32
     assert item["rgb"].shape == (3, H, W) and item["rgb"].dtype == torch.float32
@@ -416,7 +425,7 @@ def test_only_accepted_pairs_can_be_written(raw):
         pairs.write_aligned_pair(layout, acfg, row)
 
 
-def test_a_written_pair_loads_through_the_dataset(raw, written):
+def test_a_written_pair_loads_through_the_dataset(raw, written, vehicles_written):
     layout, _, _ = raw
     pairs.write_manifest(layout.manifest("train_pairs"), list(written))
     item = pairs.AlignedPairs(layout, "train_pairs")[0]
@@ -471,3 +480,120 @@ def test_a_fallback_pair_is_written_as_an_exact_shift_with_an_empty_moving_mask(
     np.testing.assert_array_equal(
         got[r0:r1, c0:c1], raw_thermal[r0 - dy : r1 - dy, c0 - dx : c1 - dx]
     )
+
+
+# --- the vehicles mask --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def vmasks():
+    return pairs.VehicleMaskConfig()  # the defaults: dilate 3 px, extend 17.4 px
+
+
+@pytest.fixture(scope="module")
+def vehicles_written(raw, written, vmasks):
+    layout, acfg, _ = raw
+    return {
+        image_id: pairs.write_vehicles(layout, acfg, vmasks, row)
+        for image_id, row in written.items()
+    }
+
+
+def test_the_dataset_serves_the_vehicles_png_and_flips_it_with_the_other_tensors(made):
+    layout, _ = made
+    plain = pairs.AlignedPairs(layout, "train_pairs")[0]["vehicles"][0]
+    assert plain[300:340, 50:130].all() and int(plain.sum()) == 40 * 80
+    aug = pairs.AugmentConfig(hflip=1.0, vflip=1.0, contrast_prob=0.0)
+    flipped = _items(layout, aug)[0]["vehicles"][
+        0
+    ]  # 180 degrees: the block moves to the far corner
+    assert flipped[H - 340 : H - 300, W - 130 : W - 50].all() and int(flipped.sum()) == 40 * 80
+
+
+def test_vehicle_mask_config_reads_data_yaml():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "configs" / "data.yaml"
+    cfg = omegaconf.OmegaConf.to_container(omegaconf.OmegaConf.load(path))
+    masks = pairs.VehicleMaskConfig.from_config(cfg["masks"]["vehicles"])
+    assert masks.dilate_px == 3  # the fallback's alignment error, not a motion margin
+    assert masks.extend_px == pytest.approx(17.4)  # the p95 of moving-vehicle displacement
+    assert masks.max_frame_fraction == 0.30
+    p = masks.params
+    assert (p.window_margin_px, p.search_px, p.max_residual_px) == (12, 6, 2)
+    assert p.min_prominence == 0.02 and p.min_window_px == 32
+
+
+def _box_polygons(layout, split, stem):
+    ann = dv.parse_annotation(layout.rgb_label(split, stem), layout.class_map)
+    return [b.vertices for b in ann.boxes]
+
+
+def test_every_rgb_polygon_is_covered_in_the_written_vehicles_png(raw, vehicles_written):
+    layout, _, _ = raw
+    for image_id in vehicles_written:
+        split, stem = dv.parse_image_id(image_id)
+        mask = np.asarray(Image.open(layout.aligned_path(image_id, "vehicles"))) > 127
+        inside = align.rasterize(_box_polygons(layout, split, stem), (512, 640))
+        assert mask[inside].all(), image_id  # every pixel of every box is masked
+        assert mask.sum() > inside.sum()  # grown by the margin
+
+
+def test_a_box_pair_without_movers_is_masked_tightly(raw, vehicles_written):
+    from scipy import ndimage
+
+    layout, _, _ = raw
+    mask = np.asarray(Image.open(layout.aligned_path("train_00010", "vehicles"))) > 127
+    inside = align.rasterize(_box_polygons(layout, "train", "00010"), (512, 640))
+    distance = ndimage.distance_transform_edt(~inside)
+    assert distance[mask].max() <= 3 + 2.0  # the 3 px margin plus the rounding of the labels
+    branches = vehicles_written["train_00010"].branches
+    assert branches.matched == 9 and branches.moved == branches.unsure == 0
+
+
+def test_the_branches_are_counted_per_vehicle(raw, vehicles_written):
+    first = vehicles_written["train_00001"].branches
+    # 10 vehicles: 9 matched (one of them the 14 px mover), 1 whose thermal label is a copy
+    assert first.matched == 9 and first.matched + first.static + first.moved + first.unsure == 10
+    assert first.thermal_only == 0
+
+
+def test_a_moving_vehicle_is_masked_where_rgb_and_thermal_see_it(raw, vehicles_written):
+    layout, _, tree = raw
+    from tests.fake_dronevehicle import _box, _vehicles
+
+    spec = next(s for s in tree.specs if s.image_id == "train_00001")
+    mover = _vehicles(spec)[9]  # displaced 14 px in the thermal labels
+    (x0, y0), _, (x1, y1), _ = _box(mover)
+    mask = np.asarray(Image.open(layout.aligned_path("train_00001", "vehicles"))) > 127
+    assert mask[(y0 + y1) // 2, (x0 + x1) // 2]  # its RGB position
+    assert mask[(y0 + y1) // 2, (x0 + x1) // 2 + 14]  # and the position its thermal pixels moved to
+
+
+def test_a_fallback_pair_with_copied_labels_is_masked_per_vehicle_from_the_rgb_boxes(raw, vmasks):
+    layout, acfg, _ = raw
+    row = align.align_pair(layout, acfg, "train", "00002")  # labels_copied, aligned by the fallback
+    assert row.model == "edge_translation" and row.labels_identical
+    result = pairs.write_vehicles(layout, acfg, vmasks, row)
+    b = result.branches
+    assert b.matched == 0 and b.thermal_only == 0  # the thermal boxes are copies: nothing matches
+    assert b.static + b.moved + b.unsure == 10  # every RGB vehicle took the local test
+    mask = np.asarray(Image.open(layout.aligned_path("train_00002", "vehicles"))) > 127
+    assert mask[align.rasterize(_box_polygons(layout, "train", "00002"), (512, 640))].all()
+
+
+def test_the_result_carries_the_masked_fraction(raw, vehicles_written):
+    layout, _, _ = raw
+    result = vehicles_written["train_00001"]
+    mask = np.asarray(Image.open(layout.aligned_path("train_00001", "vehicles"))) > 127
+    assert result.fraction == pytest.approx(mask.mean())
+    assert 0.0 < result.fraction < 0.3
+
+
+def test_the_vehicles_mask_is_recomputed_on_every_call_so_its_branches_are_always_known(
+    raw, vmasks
+):
+    layout, acfg, _ = raw
+    row = align.align_pair(layout, acfg, "train", "00010")
+    first = pairs.write_vehicles(layout, acfg, vmasks, row)
+    assert pairs.write_vehicles(layout, acfg, vmasks, row) == first  # deterministic

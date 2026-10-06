@@ -1,6 +1,19 @@
 # Stage 1: Flow model training configuration.
 # Layouts and conventions: docs/conventions.md
 
+# How the loss code treats the two kinds of aligned pairs (docs/conventions.md section 10.2).
+# NOTHING READS THESE KEYS YET: the trainer is parked old-regime code, and the rest of this file is
+# rewritten in the flow phase. They record the decided policy so the rewrite starts from it.
+#   box-aligned pairs   aligned from the vehicle boxes; they have a `moving` mask.
+#   fallback pairs      aligned by edge correlation only (data/manifests/fallback_pairs.txt); no
+#                       `moving` mask, so the `vehicles` mask (every vehicle, dilated) stands in.
+pairs:
+  fallback_pixel_mask: vehicles     # fallback pairs: mask vehicles in L_flow targets and L_render
+  box_pixel_mask: moving            # box-aligned pairs: mask only vehicles that moved
+  fallback_render_weight: 0.5       # fallback pairs count half in L_render
+  eval_subset: box_aligned          # model selection and headline test metrics on box-aligned only
+  report_fallback_separately: true  # fallback val/test reported as a separate robustness number
+
 # Grid specification.
 grid:
   spatial_size: 16       # 16x16 spatial cells

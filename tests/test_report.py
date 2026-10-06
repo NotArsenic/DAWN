@@ -207,3 +207,72 @@ def test_fewer_slots_than_groups_keeps_the_largest_groups():
     groups = {"a": list(range(10)), "b": list(range(30)), "c": list(range(20))}
     picked = report.stratified_sample(groups, 2, 0)
     assert sorted(g for g, _ in picked) == ["b", "c"]
+
+
+# --- the vehicles-mask log -----------------------------------------------------------------------
+
+
+def _branches(**kw):
+    from dawn.data.align import VehicleBranches
+
+    return VehicleBranches(**kw)
+
+
+def test_vehicle_log_has_the_fraction_the_branches_and_flags_dense_frames(tmp_path):
+    fractions = {"train_2": 0.31, "train_1": 0.05, "val_1": 0.30}
+    branches = {
+        "train_1": _branches(matched=4, static=2),
+        "train_2": _branches(thermal_only=1, moved=3, unsure=2),
+        "val_1": _branches(),
+    }
+    path = tmp_path / "logs" / "vehicles.csv"
+    flagged = report.write_vehicle_log(path, fractions, 0.30, branches)
+    assert flagged == ["train_2"]  # "over 30%": exactly 30% is not flagged
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == (
+        "image_id,vehicles_fraction,dense,n_matched,n_thermal_only,n_static,n_moved,n_unsure"
+    )
+    assert lines[1:] == [
+        "train_1,0.050,0,4,0,2,0,0",
+        "train_2,0.310,1,0,1,0,3,2",
+        "val_1,0.300,0,0,0,0,0,0",
+    ]  # sorted by ID
+    assert "\r" not in path.read_text(encoding="utf-8")
+
+
+def test_vehicle_log_without_branches_leaves_the_counts_blank(tmp_path):
+    path = tmp_path / "v.csv"
+    report.write_vehicle_log(path, {"train_1": 0.1}, 0.30)
+    assert path.read_text(encoding="utf-8").splitlines()[1] == "train_1,0.100,0,,,,,"
+
+
+def test_summary_reports_the_vehicles_mask_by_branch_and_pair_kind(world):
+    stats, day_log, aligned, dedups = world
+    aligned["val_2"] = _align(
+        "val_2", "ok", model="edge_translation", fb_tried=True
+    )  # a fallback pair
+    cfg = {"masks": {"vehicles": {"dilate_px": 3, "extend_px": 17.4}}}
+    fractions = {"train_1": 0.1, "val_2": 0.4, "test_1": 0.2}
+    branches = {
+        "train_1": _branches(matched=8, static=2),
+        "val_2": _branches(static=3, moved=1, unsure=1, thermal_only=1),
+        "test_1": _branches(matched=5),
+    }
+    text = report.build_summary(
+        stats,
+        day_log,
+        aligned,
+        dedups,
+        cfg,
+        vehicle_fractions=fractions,
+        max_vehicle_fraction=0.30,
+        vehicle_branches=branches,
+    )
+    assert "## Vehicles mask" in text
+    assert "margin 3 px" in text and "extended 17.4 px" in text
+    assert "frames masked over 30%: 1 of 3" in text and "mean masked fraction 23.3%" in text
+    # vehicles per branch over all pairs: matched 13, static 5, moved 1, unsure 1, thermal-only 1
+    assert "matched 13, static 5, moved 1, unsure 1, thermal-only 1" in text
+    # the fallback pair alone (val_2): 1 frame, 40% masked, over 30%
+    assert "fallback pairs (1): mean masked fraction 40.0%, over 30%: 1" in text
+    assert "box-aligned pairs (2): mean masked fraction 15.0%, over 30%: 0" in text

@@ -126,6 +126,29 @@ def test_accepted_transforms_are_close_to_the_ground_truth(pipe):
         assert np.abs(fit - align.apply_transform(truth, pts)).max() < 0.7, image_id
 
 
+def test_the_vehicles_mask_is_written_for_every_final_pair_and_logged(pipe):
+    import csv
+
+    rows = list(csv.DictReader(pipe.layout.log("vehicles").open(encoding="utf-8")))
+    final = {i for ids in EXPECTED_MANIFESTS.values() for i in ids}
+    assert {r["image_id"] for r in rows} == final
+    for r in rows:
+        assert 0.0 < float(r["vehicles_fraction"]) < 0.3 and r["dense"] == "0", r
+        assert pipe.layout.aligned_path(r["image_id"], "vehicles").exists()
+        n = {k: int(r[f"n_{k}"]) for k in ("matched", "static", "moved", "unsure")}
+        assert sum(n.values()) >= 3, r  # every RGB vehicle took exactly one branch
+    by_id = {r["image_id"]: r for r in rows}
+    assert (
+        int(by_id["train_00010"]["n_matched"]) == 9
+    )  # a box pair: its vehicles have thermal boxes
+    assert int(by_id["train_00002"]["n_matched"]) == 0  # labels_copied: none do
+    text = (pipe.layout.manifest_dir / "logs" / "summary.md").read_text(encoding="utf-8")
+    assert "## Vehicles mask" in text and "margin 3 px" in text and "extended 17.4 px" in text
+    assert "frames masked over 30%: 0 of 6" in text
+    assert "vehicles per branch (all pairs): matched" in text
+    assert "fallback pairs (2): mean masked fraction" in text
+
+
 def test_the_fallback_aligned_exactly_the_planted_pairs(pipe):
     log = align.read_align_log(pipe.layout.log("align"))
     by_fallback = sorted(i for i, r in log.items() if r.model == "edge_translation")
@@ -312,6 +335,8 @@ def test_the_audit_script_writes_sheets_histograms_and_the_sample_list(pipe):
         "4",
         "--fallback",
         "3",
+        "--dense",
+        "3",
         "--per-sheet",
         "2",
         "--seed",
@@ -325,6 +350,7 @@ def test_the_audit_script_writes_sheets_histograms_and_the_sample_list(pipe):
     assert (out / "fallback_accepted_01.jpg").stat().st_size > 1000
     assert (out / "fallback_rejected_01.jpg").stat().st_size > 1000
     assert not list(out.glob("fallback_accepted_02.jpg"))
+    assert (out / "vehicles_dense_01.jpg").stat().st_size > 1000
     for name in ("usable_luminance.png", "usable_darkest.jpg", "usable_random.jpg"):
         assert (out / name).stat().st_size > 1000, name
     assert sorted(p.name for p in out.glob("accepted_*.jpg")) == [

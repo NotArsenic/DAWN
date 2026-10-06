@@ -38,7 +38,7 @@ from PIL import Image
 SPLITS = ("train", "val", "test")
 BORDER = 100  # px of white border on every side of a raw frame
 FRAME_SIZE = (712, 840)  # raw (height, width)
-ASSET_KINDS = ("rgb", "thermal", "valid", "moving")  # the four PNGs written per aligned pair
+ASSET_KINDS = ("rgb", "thermal", "valid", "moving", "vehicles")  # PNGs written per pair
 _WHITE = 250  # an 8-bit value this high counts as white in the ring check
 
 

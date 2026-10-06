@@ -6,9 +6,14 @@ pair once, under `dronevehicle.aligned_dir/<split>/`, so training never warps on
     <id>_rgb.png      8-bit sRGB, the lossless crop of the decoded RGB JPEG (never resampled)
     <id>_thermal.png  8-bit L, the thermal warped onto the RGB frame (dawn.data.align.warp_thermal)
     <id>_valid.png    L, 0 / 255: 255 where the warped thermal is real data
-    <id>_moving.png   L, 0 / 255: 255 on vehicles that moved between the two exposures
+    <id>_moving.png   L, 0 / 255: 255 on vehicles that moved between the two exposures (box
+                      pairs only; empty and unknown for pairs aligned by edge correlation)
+    <id>_vehicles.png L, 0 / 255: 255 on every vehicle, at every position it may be at, dilated
+                      (`masks.vehicles` in data.yaml). The loss code uses `moving` for box pairs
+                      and `vehicles` for edge-correlation (fallback) pairs; eval uses it for
+                      vehicle-crop metrics.
 
-All four are 640x512 (`DroneVehicleLayout.crop_size`). The 8-bit thermal is deliberate: the
+All five are 640x512 (`DroneVehicleLayout.crop_size`). The 8-bit thermal is deliberate: the
 requantization noise (about 59 dB) is far below the JPEG noise already in the source.
 
 `AlignedPairs` serves them as tensors. Conventions (docs/conventions.md sections 1 and 10):
@@ -16,7 +21,8 @@ requantization noise (about 59 dB) is far below the JPEG noise already in the so
 - `thermal` is `code / 255`, float32 in [0, 1], `(1, H, W)`. Thermal values are codes, not sRGB:
   they never go through `srgb_to_linear`.
 - `rgb` is decoded with `srgb8_to_linear`: linear float32 in [0, 1], `(3, H, W)`.
-- `valid` is excluded from **every** loss, `moving` from the **pixel** losses.
+- `valid` is excluded from **every** loss, `moving` from the **pixel** losses (box pairs); for
+  `fallback` pairs, which have no moving mask, `vehicles` takes its place.
 """
 
 from __future__ import annotations
@@ -69,15 +75,68 @@ def _save_png(array: np.ndarray, path: Path) -> None:
     os.replace(partial, path)
 
 
+@dataclass(frozen=True)
+class VehicleMaskConfig:
+    """The `masks.vehicles` section of data.yaml (`params` is what `align.vehicle_mask` takes)."""
+
+    dilate_px: float = 3.0
+    extend_px: float = 17.4
+    window_margin_px: int = 12
+    search_px: int = 6
+    max_residual_px: int = 2
+    min_prominence: float = 0.02
+    min_window_px: int = 32
+    max_frame_fraction: float = 0.30  # a frame masked over this much is flagged (dense lots)
+
+    @classmethod
+    def from_config(cls, cfg: Mapping) -> VehicleMaskConfig:
+        static = cfg.get("static_test") or {}
+        flat = {
+            "dilate_px": cfg.get("dilate_px"),
+            "extend_px": cfg.get("extend_px"),
+            "max_frame_fraction": cfg.get("max_frame_fraction"),
+            **{k: static.get(k) for k in ("window_margin_px", "search_px", "max_residual_px")},
+            **{k: static.get(k) for k in ("min_prominence", "min_window_px")},
+        }
+        return cls(**{k: v for k, v in flat.items() if v is not None})
+
+    @property
+    def params(self) -> align.VehicleMaskParams:
+        return align.VehicleMaskParams(
+            dilate_px=self.dilate_px,
+            extend_px=self.extend_px,
+            window_margin_px=self.window_margin_px,
+            search_px=self.search_px,
+            max_residual_px=self.max_residual_px,
+            min_prominence=self.min_prominence,
+            min_window_px=self.min_window_px,
+        )
+
+
+@dataclass(frozen=True)
+class VehicleResult:
+    """What `write_vehicles` found: the share of the frame masked and the branch counts."""
+
+    fraction: float
+    branches: align.VehicleBranches
+
+
+_BASE_KINDS = ("rgb", "thermal", "valid", "moving")  # `write_aligned_pair`; vehicles is separate
+
+
 def write_aligned_pair(
-    layout: dv.DroneVehicleLayout, cfg: align.AlignConfig, row: align.AlignRow, force: bool = False
+    layout: dv.DroneVehicleLayout,
+    cfg: align.AlignConfig,
+    row: align.AlignRow,
+    force: bool = False,
 ) -> bool:
     """Write the four PNGs of one accepted pair, using the logged transform (no refit).
 
     The thermal is warped onto the RGB frame with `align.warp_thermal` (bilinear inverse mapping;
     not a downsample, so the area-averaging rule does not apply) and requantized to 8 bits. The
     moving-vehicle mask is rebuilt from the boxes (matching is deterministic) and the logged
-    transform. An existing set is kept unless `force`.
+    transform. An existing set is kept unless `force`. The vehicles mask is separate
+    (`write_vehicles`): it is recomputed on every run so that its branch counts are always known.
 
     Returns:
         True when files were written, False when the pair was already complete.
@@ -87,7 +146,7 @@ def write_aligned_pair(
     """
     if not row.accepted:
         raise ValueError(f"only accepted pairs can be written: {row.image_id} is {row.reason}")
-    paths = {kind: layout.aligned_path(row.image_id, kind) for kind in dv.ASSET_KINDS}
+    paths = {kind: layout.aligned_path(row.image_id, kind) for kind in _BASE_KINDS}
     if not force and all(path.exists() for path in paths.values()):
         return False
     split, stem = dv.parse_image_id(row.image_id)
@@ -101,27 +160,63 @@ def write_aligned_pair(
     warped, valid = align.warp_thermal(thermal8.float() / 255, transform, layout.crop_size)
     thermal_codes = (warped[0].clamp(0, 1) * 255).round().to(torch.uint8)
 
+    thermal_ann = dv.parse_annotation(
+        layout.thermal_label(split, stem), layout.class_map, layout.border
+    )
+    rgb_ann = dv.parse_annotation(layout.rgb_label(split, stem), layout.class_map, layout.border)
     if row.model == "edge_translation":
         # Aligned by edge correlation, not boxes: a translation cannot tell which matched
         # vehicles moved, so there is no moving mask (the pair is listed in fallback_pairs).
         moving = torch.zeros(1, *layout.crop_size, dtype=torch.bool)
     else:
-        thermal_ann = dv.parse_annotation(
-            layout.thermal_label(split, stem), layout.class_map, layout.border
-        )
-        rgb_ann = dv.parse_annotation(
-            layout.rgb_label(split, stem), layout.class_map, layout.border
-        )
         matches = align.match_boxes(thermal_ann.boxes, rgb_ann.boxes, cfg)
         moving, _ = align.moving_mask(
             thermal_ann.boxes, rgb_ann.boxes, matches, transform, layout.crop_size, cfg
         )
-
     _save_png(rgb8.permute(1, 2, 0).numpy(), paths["rgb"])
     _save_png(thermal_codes.numpy(), paths["thermal"])
     _save_png(valid[0].numpy().astype(np.uint8) * 255, paths["valid"])
     _save_png(moving[0].numpy().astype(np.uint8) * 255, paths["moving"])
     return True
+
+
+def write_vehicles(
+    layout: dv.DroneVehicleLayout,
+    cfg: align.AlignConfig,
+    masks: VehicleMaskConfig,
+    row: align.AlignRow,
+) -> VehicleResult:
+    """Build and write `<id>_vehicles.png` for one pair (`align.vehicle_mask`, per vehicle).
+
+    Needs the pair's images for the local static test: the RGB luma and the thermal after the
+    warp, as blurred gradient magnitudes (the same ones `edge_check` uses), and the warp's
+    validity mask. Every run recomputes it (it is deterministic), so the branch counts it returns
+    are known even for pairs whose other PNGs were already written. A `run_parallel` job.
+    """
+    split, stem = dv.parse_image_id(row.image_id)
+    thermal8 = dv.crop_border(
+        dv.read_thermal8(layout.thermal_image(split, stem)), layout.border, layout.frame_size
+    )
+    rgb8 = dv.crop_border(
+        dv.read_rgb8(layout.rgb_image(split, stem)), layout.border, layout.frame_size
+    )
+    transform = align.transform_of(row)
+    warped, valid = align.warp_thermal(thermal8.float() / 255, transform, layout.crop_size)
+    sigma = cfg.grad_blur_sigma
+    images = (
+        align.gradient_magnitude(align.rgb_edge_luma(srgb8_to_linear(rgb8)), sigma),
+        align.gradient_magnitude(warped[0].numpy(), sigma),
+        valid[0].numpy(),
+    )
+    thermal_ann = dv.parse_annotation(
+        layout.thermal_label(split, stem), layout.class_map, layout.border
+    )
+    rgb_ann = dv.parse_annotation(layout.rgb_label(split, stem), layout.class_map, layout.border)
+    mask, branches = align.vehicle_mask(
+        rgb_ann.boxes, thermal_ann.boxes, transform, layout.crop_size, masks.params, cfg, images
+    )
+    _save_png(mask[0].numpy().astype(np.uint8) * 255, layout.aligned_path(row.image_id, "vehicles"))
+    return VehicleResult(fraction=align.vehicle_fraction(mask), branches=branches)
 
 
 # --- augmentation --------------------------------------------------------------------------------
@@ -208,6 +303,8 @@ class AlignedPairs(Dataset):
         rgb       (3, 512, 640) float32  linear RGB (`srgb8_to_linear` of the stored 8-bit sRGB)
         valid     (1, 512, 640) bool     True where the warped thermal is real data
         moving    (1, 512, 640) bool     True on vehicles that moved between the two exposures
+        vehicles  (1, 512, 640) bool     True on every vehicle, at every position it may be at,
+                                         dilated: use it instead of `moving` for `fallback` pairs
         image_id  str                    `<split>_<stem>`
         fallback  bool                   aligned by edge correlation, not boxes: the `moving` mask
                                          is empty and unknown, so keep the pair out of the pixel
@@ -277,11 +374,13 @@ class AlignedPairs(Dataset):
         thermal = torch.from_numpy(_load_png(path("thermal"), image_id)).unsqueeze(0)
         valid = torch.from_numpy(_load_png(path("valid"), image_id) > 127).unsqueeze(0)
         moving = torch.from_numpy(_load_png(path("moving"), image_id) > 127).unsqueeze(0)
+        vehicles = torch.from_numpy(_load_png(path("vehicles"), image_id) > 127).unsqueeze(0)
         item = {
             "thermal": thermal.float() / 255,
             "rgb": srgb8_to_linear(rgb.contiguous()),
             "valid": valid,
             "moving": moving,
+            "vehicles": vehicles,
             "image_id": image_id,
             "fallback": image_id in self.fallback_ids,
         }
@@ -295,7 +394,7 @@ class AlignedPairs(Dataset):
         if aug.vflip > 0 and torch.rand(1, generator=generator).item() < aug.vflip:
             dims.append(-2)
         if dims:
-            for key in ("thermal", "rgb", "valid", "moving"):
+            for key in ("thermal", "rgb", "valid", "moving", "vehicles"):
                 item[key] = torch.flip(item[key], dims)
         curve = sample_contrast_curve(aug, generator)
         if curve is not None:

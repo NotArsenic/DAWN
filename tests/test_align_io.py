@@ -274,3 +274,29 @@ def test_config_fingerprint_changes_with_any_threshold_and_is_stable(setup):
     ):
         other = align.AlignConfig(**{**cfg.__dict__, **change})
         assert align.config_fingerprint(other) != align.config_fingerprint(cfg)
+
+
+# --- sizing the vehicles-mask dilation ----------------------------------------------------------
+
+
+def test_pair_moving_displacements_finds_the_planted_mover(setup, rows):
+    layout, cfg, _ = setup
+    moved = align.pair_moving_displacements(layout, cfg, rows["train_00001"])
+    assert len(moved) == 1 and moved[0] == pytest.approx(14.0, abs=1.5)  # displaced 14 px
+    assert align.pair_moving_displacements(layout, cfg, rows["train_00010"]) == []
+
+
+def test_fallback_and_rejected_pairs_have_no_moving_displacements(setup, rows):
+    layout, cfg, _ = setup
+    assert rows["train_00002"].model == "edge_translation"
+    assert align.pair_moving_displacements(layout, cfg, rows["train_00002"]) == []
+    assert align.pair_moving_displacements(layout, cfg, rows["train_00006"]) == []  # rejected
+
+
+def test_displacement_summary_suggests_the_p95_as_the_extension_length():
+    values = list(np.linspace(5, 25, 101))  # p95 = 24
+    summary = align.summarize_displacements(values)
+    assert summary["n"] == 101
+    assert summary["p95"] == pytest.approx(24.0)
+    assert summary["suggested_extend_px"] == pytest.approx(24.0)
+    assert align.summarize_displacements([])["suggested_extend_px"] is None

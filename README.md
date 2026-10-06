@@ -15,7 +15,7 @@ It treats thermal as a one-channel image and splits the job in two. Brightness i
 | Model (DINO encoder with LoRA, velocity transformer, brightness path, color path, losses) | **Not trained yet.** The code under `dawn/grid`, `dawn/models`, `dawn/flow`, `dawn/uncertainty` and `dawn/eval` is parked old-regime code (see below) and is rebuilt in the next phase |
 | Results | None yet. No numbers are claimed here |
 
-Few pairs survive the filter: of the 28,411 DroneVehicle pairs, about 9,300 are daytime and 5,921 pass alignment and dedup (3,990 train, 363 val, 1,568 test; `data/manifests/logs/summary.md`). 2,581 of them were aligned by the edge-correlation fallback instead of by boxes, so they are less trustworthy and have no moving mask (`data/manifests/fallback_pairs.txt`). Without the fallback it is 3,340, and with the plan's original edge check 1,569. A small training set is the largest risk the plan names, and the audit exists to decide what else to loosen.
+Few pairs survive the filter: of the 28,411 DroneVehicle pairs, about 8,500 are daytime and 5,385 pass alignment and dedup (3,662 train, 345 val, 1,378 test; `data/manifests/logs/summary.md`). 2,374 of them were aligned by the edge-correlation fallback instead of by boxes, so they are less trustworthy and have no moving mask (`data/manifests/fallback_pairs.txt`); for those a per-vehicle `vehicles` mask (every vehicle, stretched along its heading where it may have moved) stands in for it. Without the fallback it is 3,011. A small training set is the largest risk the plan names, and the audit exists to decide what else to loosen.
 
 ## Installation
 
@@ -54,12 +54,12 @@ What the pipeline does to the 28,411 pairs (840×712 frames with a 100-px white 
 3. **Match** each thermal box to the nearest RGB box of the same class (mutual nearest neighbours); boxes that are exact copies across the two label files are not evidence and are left out.
 4. **Fit** a similarity transform by RANSAC (a homography only if the similarity's residual alone fails), and **accept** only with enough matches, inlier ratio, a small median residual, and sane scale, rotation and shift.
 5. **Edge check**: gradient-magnitude correlation between thermal and RGB, independent of the boxes. It only rejects pairs that are more than about 3 px off or clearly worse after the warp.
-6. **Edge-correlation fallback** for the pairs the boxes cannot judge (copied labels, too few vehicles): a global translation estimated from the same edge correlation, accepted only with a clear single peak and agreeing image quadrants. These pairs are listed separately and carry no moving mask.
+6. **Edge-correlation fallback** for the pairs the boxes cannot judge (copied labels, too few vehicles): a global translation estimated from the same edge correlation, accepted only with a clear single peak and agreeing image quadrants. These pairs are listed separately and carry no moving mask; a `vehicles` mask (every vehicle, dilated) covers for it.
 7. **Warp** the thermal onto the RGB frame (the RGB is never resampled), with a validity mask and a moving-vehicle mask, and write everything once as PNG under `data/dronevehicle_aligned/`.
 
 Outputs that are committed: `data/manifests/{train,val,test}_pairs.txt` (the final lists) and `data/manifests/logs/{day,align,dedup}.csv` plus `summary.md` (every decision, with the fitted transform of every pair). Everything bulky stays in `data/` and `outputs/`, which are ignored. Re-running is idempotent; `--force` redoes finished work.
 
-The aligned pairs are served by `dawn.data.pairs.AlignedPairs` (thermal `(1, 512, 640)` = code / 255, linear RGB `(3, 512, 640)`, a `valid` and a `moving` mask, a `fallback` flag; flips and a random thermal contrast curve in training). Conventions, coordinate systems and every definition are in [`docs/conventions.md`](docs/conventions.md).
+The aligned pairs are served by `dawn.data.pairs.AlignedPairs` (thermal `(1, 512, 640)` = code / 255, linear RGB `(3, 512, 640)`, a `valid`, a `moving` and a `vehicles` mask, a `fallback` flag; flips and a random thermal contrast curve in training). Conventions, coordinate systems and every definition are in [`docs/conventions.md`](docs/conventions.md).
 
 ## Project structure
 
@@ -103,7 +103,7 @@ dawn/
 ## Known limitations
 
 1. **Invented detail.** Anything without a heat signature (paint, text, lane markings, a car's color) is guessed. Read the uncertainty maps next to the output.
-2. **A small training set.** Only the pairs that pass a strict alignment filter are used, and the filter currently keeps about 63% of the day pairs (36% by boxes alone, the rest through the edge fallback). The thresholds are under review.
+2. **A small training set.** Only the pairs that pass a strict alignment filter are used, and the filter currently keeps about 63% of the day pairs (35% by boxes alone, the rest through the edge fallback). The thresholds are under review.
 3. **Residual misalignment.** The cameras are not co-registered; pairs are aligned to roughly a pixel or two, and vehicles that moved between the exposures are masked, not fixed.
 4. **Day only.** Night pairs and other thermal cameras are out of scope.
 5. **Nothing is trained or measured yet.** Speed and quality numbers will come from the model phase.

@@ -707,6 +707,176 @@ def moving_mask(
     return torch.from_numpy(mask)[None], int(flags.sum())
 
 
+def moving_displacements(
+    matches: Matches, T: np.ndarray | None, min_residual_px: float
+) -> np.ndarray:
+    """`(k,)` residuals in px (the distance between where `T` puts the thermal box centre and
+    where the RGB box centre is) of the matched boxes that moved, i.e. `moving_flags`. Their
+    spread, measured on the box-aligned pairs, sizes the dilation of the vehicles mask."""
+    if T is None or not matches.n:
+        return np.zeros(0)
+    residual = _residuals(T, matches.thermal_xy, matches.rgb_xy)
+    return residual[residual > min_residual_px]
+
+
+@dataclass(frozen=True)
+class VehicleMaskParams:
+    """The `masks.vehicles` section of data.yaml, as `vehicle_mask` uses it."""
+
+    dilate_px: float = 3.0  # margin round every polygon (the fallback's alignment error)
+    extend_px: float = 17.4  # moved / unsure vehicles: stretch along the long axis, both ways
+    window_margin_px: int = 12  # static test: window = the box plus this on every side
+    search_px: int = 6  # static test: residual shifts within +- this are searched
+    max_residual_px: int = 2  # static test: the best shift must be within this of "none"
+    min_prominence: float = 0.02  # static test: the correlation peak must be this clear
+    min_window_px: int = 32  # static test: a shorter window than this is too small to trust
+
+
+@dataclass(frozen=True)
+class VehicleBranches:
+    """How many vehicles of a frame took each branch of `vehicle_mask`: `matched` (a thermal box
+    of its own: both positions masked), `static`, `moved` and `unsure` (the local test passed,
+    found a clear shift, or could not decide), and `thermal_only` (thermal boxes with no RGB
+    counterpart)."""
+
+    matched: int = 0
+    thermal_only: int = 0
+    static: int = 0
+    moved: int = 0
+    unsure: int = 0
+
+
+def extend_polygon(vertices: np.ndarray, length: float) -> list[np.ndarray]:
+    """The region swept by an oriented box moved up to `length` px each way along its **long**
+    axis (vehicles move along their heading): the convex hull of the box shifted by `+length` and
+    `-length`. Returns polygons to rasterize (one, or three if the hull is degenerate)."""
+    v = np.asarray(vertices, dtype=np.float64)
+    first, second = v[1] - v[0], v[2] - v[1]
+    axis = first if np.linalg.norm(first) >= np.linalg.norm(second) else second
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-9 or length <= 0:
+        return [v]
+    shift = axis / norm * length
+    points = np.vstack([v + shift, v - shift])
+    try:
+        from scipy.spatial import ConvexHull, QhullError
+
+        return [points[ConvexHull(points).vertices]]
+    except (ImportError, QhullError):
+        return [v, v + shift, v - shift]
+
+
+def _classify_static(
+    box: dv.Box, g_rgb: np.ndarray, g_thermal: np.ndarray, valid: np.ndarray, p: VehicleMaskParams
+) -> str:
+    """`static`, `moved` or `unsure` for a vehicle with no thermal box of its own.
+
+    After the pair's warp, the gradient maps of RGB and thermal are correlated inside a window
+    around the box over every residual shift within `+-search_px` (the same FFT search as
+    `edge_translation`, here local). A clear peak (`min_prominence`) within `max_residual_px` of
+    no shift means the thermal shows the vehicle where RGB does: `static`. A clear peak further
+    away means it `moved`. No clear peak, a window shorter than `min_window_px` (a tiny box), or a
+    window that touches pixels the warp could not fill is `unsure`.
+    """
+    height, width = g_rgb.shape
+    s, margin = p.search_px, p.window_margin_px
+    v = box.vertices
+    x0 = max(int(math.floor(v[:, 0].min())) - margin, s)
+    x1 = min(int(math.ceil(v[:, 0].max())) + 1 + margin, width - s)
+    y0 = max(int(math.floor(v[:, 1].min())) - margin, s)
+    y1 = min(int(math.ceil(v[:, 1].max())) + 1 + margin, height - s)
+    if min(x1 - x0, y1 - y0) < p.min_window_px:
+        return "unsure"
+    if not valid[y0 - s : y1 + s, x0 - s : x1 + s].all():
+        return "unsure"
+    grid = _ncc_grid(
+        torch.from_numpy(g_rgb[y0:y1, x0:x1]).double(),
+        torch.from_numpy(g_thermal[y0 - s : y1 + s, x0 - s : x1 + s]).double(),
+        s,
+    )
+    dx, dy, _, prominence = _grid_peak(grid, s)
+    if not prominence >= p.min_prominence:
+        return "unsure"
+    return "static" if max(abs(dx), abs(dy)) <= p.max_residual_px else "moved"
+
+
+def vehicle_mask(
+    rgb_boxes: Sequence[dv.Box],
+    thermal_boxes: Sequence[dv.Box],
+    T: np.ndarray | None,
+    size: tuple[int, int],
+    params: VehicleMaskParams,
+    cfg: AlignConfig,
+    images: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> tuple[torch.Tensor, VehicleBranches]:
+    """Every vehicle, wherever it may be, dilated: `(1, H, W)` bool, and how each took its branch.
+
+    For pairs aligned by edge correlation there is no `moving` mask, so the pixel losses stay away
+    from the vehicles instead. The margin is chosen per vehicle:
+
+    1. **Matched** (the vehicle has a thermal box of its own, see `match_boxes`): both positions
+       are known, the oriented RGB polygon and the thermal polygon pushed through `T`, so only
+       `dilate_px` is added.
+    2. **Static**: no thermal box of its own (copied labels, or unmatched), but a local shift
+       search around the RGB box (`_classify_static`) agrees with the pair's warp and has a clear
+       peak: the vehicle did not move, `dilate_px` only.
+    3. **Moved or unsure** (a clear shift, no clear peak, a tiny box, or no `images`): the
+       polygon is stretched `extend_px` each way along its **long** axis (`extend_polygon`; a
+       vehicle moves along its heading, so an isotropic margin would waste most of its area),
+       plus `dilate_px` all round.
+
+    Thermal boxes with no RGB counterpart add their warped polygon (`thermal_only`); a thermal
+    box that is a copy of an RGB box adds nothing, since warping it would put it in the wrong
+    place. No boxes means an empty mask.
+
+    Args:
+        rgb_boxes, thermal_boxes: boxes in the cropped frame.
+        T: 3x3 thermal -> RGB, or None to ignore the thermal boxes.
+        cfg: Matching settings (gate, copy tolerance, copy exclusion).
+        images: `(g_rgb, g_thermal_warped, valid)`, the blurred gradient magnitudes of the RGB
+            luma and of the thermal after the warp, and the warp's validity mask, all `(H, W)`.
+            Without them the static test cannot run.
+    """
+    have_both = bool(rgb_boxes) and bool(thermal_boxes)
+    matches = match_boxes(thermal_boxes, rgb_boxes, cfg) if have_both else None
+    partner = dict(zip(matches.rgb_idx.tolist(), matches.thermal_idx.tolist())) if matches else {}
+    copied = copied_flags(thermal_boxes, rgb_boxes, cfg.copy_tol_px)[0] if have_both else []
+    polygons: list[np.ndarray] = []
+    counts = {"matched": 0, "static": 0, "moved": 0, "unsure": 0, "thermal_only": 0}
+    for index, box in enumerate(rgb_boxes):
+        if T is not None and index in partner:
+            polygons += [box.vertices, apply_transform(T, thermal_boxes[partner[index]].vertices)]
+            counts["matched"] += 1
+            continue
+        kind = _classify_static(box, *images, params) if images is not None else "unsure"
+        counts[kind] += 1
+        if kind == "static":
+            polygons.append(box.vertices)
+        else:
+            polygons += extend_polygon(box.vertices, params.extend_px)
+    if T is not None:
+        taken = set(partner.values())
+        for index, box in enumerate(thermal_boxes):
+            if index not in taken and not (have_both and copied[index]):
+                polygons.append(apply_transform(T, box.vertices))
+                counts["thermal_only"] += 1
+    mask = rasterize(polygons, size)
+    if mask.any() and params.dilate_px > 0:
+        mask = ndimage.distance_transform_edt(~mask) <= params.dilate_px
+    return torch.from_numpy(mask)[None], VehicleBranches(**counts)
+
+
+def vehicle_fraction(mask: torch.Tensor) -> float:
+    """Share of the frame a vehicles mask covers, in `[0, 1]`."""
+    return float(mask.float().mean())
+
+
+def is_dense(fraction: float, max_fraction: float) -> bool:
+    """True when a vehicles mask covers more than `max_fraction` of the frame (dense parking
+    lots): those frames are flagged to be looked at, not silently dropped."""
+    return fraction > max_fraction
+
+
 # --- independent edge check ----------------------------------------------------------------------
 
 
@@ -1224,6 +1394,49 @@ def align_pair(layout: dv.DroneVehicleLayout, cfg: AlignConfig, split: str, stem
         logger.warning(f"{image_id}: images: {exc}")
         return _failed_row(image_id, "read_error")
     return row
+
+
+def pair_moving_displacements(
+    layout: dv.DroneVehicleLayout, cfg: AlignConfig, row: AlignRow
+) -> list[float]:
+    """The displacement (px) of each vehicle that moved between the exposures in one accepted,
+    box-aligned pair (`moving_displacements` on its re-matched boxes and logged transform).
+
+    Pairs rejected or aligned by edge correlation have no box-based transform and give `[]`.
+    A `run_parallel` job; the displacements of all box pairs size how far the vehicles mask
+    extends a vehicle that may have moved.
+    """
+    if not row.accepted or row.model not in ("similarity", "homography"):
+        return []
+    split, stem = dv.parse_image_id(row.image_id)
+    thermal = dv.parse_annotation(
+        layout.thermal_label(split, stem), layout.class_map, layout.border
+    )
+    rgb = dv.parse_annotation(layout.rgb_label(split, stem), layout.class_map, layout.border)
+    matches = match_boxes(thermal.boxes, rgb.boxes, cfg)
+    return [
+        float(d)
+        for d in moving_displacements(matches, transform_of(row), cfg.moving_min_residual_px)
+    ]
+
+
+def summarize_displacements(values: Sequence[float]) -> dict:
+    """`n`, `p50`, `p90`, `p95`, `p99`, `max` of moving-vehicle displacements and the suggested
+    `masks.vehicles.extend_px`: the p95, rounded to 0.1 px (how far a vehicle that moved may be
+    from where RGB has it; `suggested_extend_px` is None without data)."""
+    if not len(values):
+        return {"n": 0, "suggested_extend_px": None}
+    v = np.asarray(values, dtype=float)
+    p50, p90, p95, p99 = np.percentile(v, [50, 90, 95, 99])
+    return {
+        "n": len(v),
+        "p50": float(p50),
+        "p90": float(p90),
+        "p95": float(p95),
+        "p99": float(p99),
+        "max": float(v.max()),
+        "suggested_extend_px": round(float(p95), 1),
+    }
 
 
 _TYPES = {

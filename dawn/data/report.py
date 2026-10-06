@@ -7,16 +7,19 @@ each stage, as the committed `summary.md`.
 
 from __future__ import annotations
 
+import csv
 import math
 import random
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
-from dawn.data.align import AlignRow
+from dawn.data.align import AlignRow, VehicleBranches
 from dawn.data.day_filter import PairStats
 from dawn.data.dedup import DedupRow
 
 SPLITS = ("train", "val", "test")
+_BRANCH_NAMES = ("matched", "thermal_only", "static", "moved", "unsure")
 _UNPAIRED = ("missing_thermal", "missing_rgb")
 _UNREADABLE = (
     *_UNPAIRED,
@@ -134,15 +137,54 @@ def _flat(prefix: str, section: Mapping) -> list[str]:
     return lines
 
 
+def write_vehicle_log(
+    path: str | Path,
+    fractions: Mapping[str, float],
+    max_fraction: float,
+    branches: Mapping[str, VehicleBranches] | None = None,
+) -> list[str]:
+    """Write the committed vehicles-mask log: per final pair, the share of the frame its vehicles
+    mask covers (3 decimals), `dense` = 1 when that is over `max_fraction` (dense parking lots:
+    to be looked at, not silently dropped) and how many of its vehicles took each branch of
+    `align.vehicle_mask` (blank when `branches` is not given). Sorted by ID.
+
+    Returns:
+        The IDs flagged dense.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flagged = []
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        writer.writerow(
+            ["image_id", "vehicles_fraction", "dense"] + [f"n_{name}" for name in _BRANCH_NAMES]
+        )
+        for image_id in sorted(fractions):
+            dense = fractions[image_id] > max_fraction
+            counts = (
+                [getattr(branches[image_id], name) for name in _BRANCH_NAMES]
+                if branches is not None
+                else [""] * len(_BRANCH_NAMES)
+            )
+            writer.writerow([image_id, f"{fractions[image_id]:.3f}", int(dense), *counts])
+            if dense:
+                flagged.append(image_id)
+    return flagged
+
+
 def build_summary(
     stats: Sequence[PairStats],
     day_log: Mapping[str, tuple[bool, str]],
     align_rows: Mapping[str, AlignRow],
     dedup_rows: Mapping[str, DedupRow],
     cfg: Mapping,
+    vehicle_fractions: Mapping[str, float] | None = None,
+    max_vehicle_fraction: float = 0.30,
+    vehicle_branches: Mapping[str, VehicleBranches] | None = None,
 ) -> str:
     """The text of `summary.md`: counts per stage and split, each reason code's count, the
-    alignment diagnostics and the thresholds in force (day, align, dedup sections of `cfg`)."""
+    alignment diagnostics, the vehicles mask (when `vehicle_fractions` is given) and the
+    thresholds in force (day, align, dedup, masks sections of `cfg`)."""
     splits = _splits_in(stats)
     counts = stage_counts(stats, day_log, align_rows, dedup_rows)
     final = final_reasons(stats, day_log, align_rows, dedup_rows)
@@ -184,15 +226,64 @@ def build_summary(
         "",
         *diagnostics,
         "",
+        *_vehicles_section(
+            cfg, align_rows, vehicle_fractions, max_vehicle_fraction, vehicle_branches
+        ),
         "## Thresholds in force",
         "",
     ]
     thresholds = []
-    for section in ("day_filter", "align", "dedup"):
+    for section in ("day_filter", "align", "dedup", "masks"):
         if cfg.get(section):
             thresholds += _flat(f"{section}.", cfg[section])
     out += thresholds or ["- (no configuration given)"]
     return "\n".join(out) + "\n"
+
+
+def _vehicles_section(
+    cfg: Mapping,
+    align_rows: Mapping[str, AlignRow],
+    fractions: Mapping[str, float] | None,
+    max_fraction: float,
+    branches: Mapping[str, VehicleBranches] | None,
+) -> list[str]:
+    if not fractions:
+        return []
+    section = (cfg.get("masks") or {}).get("vehicles") or {}
+    dilate, extend = section.get("dilate_px", "?"), section.get("extend_px", "?")
+    dense = sum(f > max_fraction for f in fractions.values())
+    mean = 100 * sum(fractions.values()) / len(fractions)
+    lines = [
+        "## Vehicles mask",
+        "",
+        f"- margin {dilate} px round every vehicle; vehicles that moved or may have are extended "
+        f"{extend} px each way along their long axis (the p95 of moving-vehicle displacement)",
+        f"- mean masked fraction {mean:.1f}% of a frame",
+        f"- frames masked over {100 * max_fraction:.0f}%: {dense} of {len(fractions)} "
+        "(flagged in `vehicles.csv`)",
+    ]
+    if branches:
+        order = ("matched", "static", "moved", "unsure", "thermal_only")
+        totals = {n: sum(getattr(b, n) for b in branches.values()) for n in order}
+        lines.append(
+            "- vehicles per branch (all pairs): "
+            + ", ".join(f"{n.replace('_', '-')} {totals[n]}" for n in order)
+        )
+    fallback = {
+        i for i in fractions if i in align_rows and align_rows[i].model == "edge_translation"
+    }
+    for label, ids in (
+        ("fallback pairs", sorted(fallback)),
+        ("box-aligned pairs", sorted(set(fractions) - fallback)),
+    ):
+        if ids:
+            share = 100 * sum(fractions[i] for i in ids) / len(ids)
+            over = sum(fractions[i] > max_fraction for i in ids)
+            lines.append(
+                f"- {label} ({len(ids)}): mean masked fraction {share:.1f}%, over "
+                f"{100 * max_fraction:.0f}%: {over}"
+            )
+    return [*lines, ""]
 
 
 # --- stratified sample ---------------------------------------------------------------------------

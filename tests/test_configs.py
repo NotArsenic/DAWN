@@ -60,6 +60,17 @@ def test_flow_config_has_the_decided_keys():
         assert _has(cfg, path), ".".join(path)
 
 
+def test_flow_config_records_the_pair_policy():
+    pairs = _load("flow.yaml")["pairs"]
+    assert pairs == {
+        "fallback_pixel_mask": "vehicles",
+        "box_pixel_mask": "moving",
+        "fallback_render_weight": 0.5,
+        "eval_subset": "box_aligned",
+        "report_fallback_separately": True,
+    }
+
+
 def test_data_config_has_the_decided_keys():
     cfg = _load("data.yaml")
     for path in [
@@ -92,6 +103,10 @@ def test_data_config_has_the_decided_keys():
         ("align", "moving", "min_residual_px"),
         ("align", "moving", "dilate_px"),
         ("dedup", "max_hamming"),
+        ("masks", "vehicles", "dilate_px"),
+        ("masks", "vehicles", "extend_px"),
+        ("masks", "vehicles", "static_test", "min_prominence"),
+        ("masks", "vehicles", "max_frame_fraction"),
         ("augment", "hflip"),
         ("augment", "vflip"),
         ("augment", "rot90"),

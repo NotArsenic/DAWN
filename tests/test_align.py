@@ -885,3 +885,183 @@ def test_config_reads_the_fallback_section_of_data_yaml():
     assert cfg.fallback_enabled is True
     assert (cfg.fallback_search_px, cfg.fallback_min_prominence) == (10, 0.02)
     assert cfg.fallback_max_quadrant_dev_px == 2
+
+
+# --- the vehicles mask --------------------------------------------------------------------------
+
+
+def rotated(cx, cy, w, h, deg, cat="car") -> Box:
+    """An oriented rectangle: the polygon is rotated, its bounding box is not the vehicle."""
+    a = math.radians(deg)
+    corners = np.array([[-w / 2, -h / 2], [w / 2, -h / 2], [w / 2, h / 2], [-w / 2, h / 2]])
+    rot = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+    pts = corners @ rot.T + [cx, cy]
+    return Box(cat, tuple(map(tuple, pts)), "polygon")
+
+
+VM = align.VehicleMaskParams(
+    dilate_px=3.0,
+    extend_px=17.4,
+    window_margin_px=12,
+    search_px=6,
+    max_residual_px=2,
+    min_prominence=0.02,
+    min_window_px=32,
+)
+NO_IMAGES = None  # without images the static test cannot run
+
+
+def _scene(seed=0, cars=()):
+    """RGB-like luma with a few bright car rectangles `(cx, cy, w, h)` on a textured road."""
+    luma = _luma(seed).copy()
+    for cx, cy, w, h in cars:
+        luma[cy - h // 2 : cy + h // 2 + 1, cx - w // 2 : cx + w // 2 + 1] = 1.0
+    return luma
+
+
+def _images(rgb_luma, thermal_luma, sigma=1.0):
+    """What `vehicle_mask` needs for the static test: gradient maps and the validity mask."""
+    return (
+        align.gradient_magnitude(rgb_luma, sigma),
+        align.gradient_magnitude(thermal_luma, sigma),
+        np.ones(rgb_luma.shape, bool),
+    )
+
+
+def vmask(rgb, thermal, T, images=None, params=VM):
+    return align.vehicle_mask(rgb, thermal, T, SIZE, params, CFG, images)
+
+
+def test_every_rgb_polygon_is_covered_after_dilation():
+    boxes = [rotated(100, 100, 40, 14, 30), rotated(300, 200, 30, 12, -60), rect(500, 400)]
+    mask, _ = vmask(boxes, [], None)
+    assert mask.dtype == torch.bool and mask.shape == (1, H, W)
+    inside = align.rasterize([b.vertices for b in boxes], SIZE)
+    assert mask[0].numpy()[inside].all()  # every pixel of every polygon is masked
+    assert mask.sum() > inside.sum()  # and the dilation added a margin
+
+
+def test_the_mask_is_empty_on_a_frame_with_no_boxes():
+    mask, counts = vmask([], [], None)
+    assert not mask.any() and counts == align.VehicleBranches()
+    assert not vmask([], [], np.eye(3))[0].any()  # with a transform too
+
+
+def test_oriented_polygons_are_rasterized_not_their_bounding_boxes():
+    box = rotated(200, 200, 60, 10, 45)  # a thin diagonal vehicle: its bbox is mostly empty road
+    params = align.VehicleMaskParams(dilate_px=0.0, extend_px=0.0)
+    mask = vmask([box], [], None, params=params)[0][0].numpy()
+    xs, ys = box.vertices[:, 0], box.vertices[:, 1]
+    assert not mask[int(ys.min()) + 2, int(xs.min()) + 2]  # a bounding-box corner is not covered
+    assert mask[200, 200]
+    assert mask.sum() < 0.5 * (xs.max() - xs.min()) * (ys.max() - ys.min())
+
+
+def test_a_matched_vehicle_is_masked_at_both_positions_with_the_small_margin_only():
+    T = similarity(1.0, 0.0, 0.0, 0.0)
+    rgb, thermal = [rect(300, 200)], [rect(318, 200)]  # in thermal the same vehicle is 18 px away
+    mask, counts = vmask(rgb, thermal, T)
+    m = mask[0].numpy()
+    assert counts.matched == 1 and counts.static == counts.moved == counts.unsure == 0
+    assert m[200, 300] and m[200, 318]  # where RGB has it and where the thermal pixels are
+    # rect(300, 200) spans columns 289..311, its thermal twin 307..329; only 3 px is added
+    assert m[200, 289 - 3] and not m[200, 289 - 3 - 1]
+    assert (
+        m[200, 329 + 3] and not m[200, 329 + 3 + 1]
+    )  # no 17 px motion margin: both positions known
+
+
+def test_thermal_only_boxes_are_masked_where_their_pixels_land():
+    T = similarity(1.0, 0.0, 25.0, 0.0)  # thermal pixel (c, r) lands on (c + 25, r)
+    mask, counts = vmask([], [rect(100, 100)], T)
+    assert counts.thermal_only == 1 and counts.matched == 0
+    m = mask[0].numpy()
+    assert m[100, 125] and not m[100, 100]
+
+
+def test_thermal_boxes_that_are_copies_of_rgb_boxes_add_nothing():
+    T = similarity(1.0, 0.0, 25.0, 0.0)
+    rgb = [rect(100, 100), rect(300, 200)]
+    copies = [rect(100, 100), rect(300, 200)]  # labels_copied: the thermal boxes are the RGB ones
+    with_copies, counts = vmask(rgb, copies, T)
+    rgb_only, _ = vmask(rgb, [], None)
+    assert torch.equal(with_copies, rgb_only)  # warping a copy would put a spurious box 25 px away
+    assert counts.thermal_only == 0 and counts.matched == 0
+
+
+def test_a_static_vehicle_gets_the_small_margin():
+    cars = [(300, 250, 44, 20)]
+    luma = _scene(1, cars)
+    mask, counts = vmask([rect(300, 250, 44, 20)], [], similarity(1, 0, 0, 0), _images(luma, luma))
+    assert counts.static == 1 and counts.moved == counts.unsure == 0
+    m = mask[0].numpy()
+    assert m[250, 300 + 22 + 3] and not m[250, 300 + 22 + 3 + 2]  # the 3 px margin and no more
+
+
+def test_a_vehicle_that_shows_up_elsewhere_in_thermal_is_extended_along_its_long_axis():
+    car = (300, 250, 44, 20)
+    rgb_luma = _scene(2, [car])
+    thermal_luma = _scene(2, [(304, 250, 44, 20)])  # in thermal the car sits 4 px further right
+    box = rect(300, 250, 44, 20)  # long axis horizontal
+    mask, counts = vmask([box], [], similarity(1, 0, 0, 0), _images(rgb_luma, thermal_luma))
+    assert counts.moved == 1 and counts.static == 0
+    m = mask[0].numpy()
+    assert m[250, 300 + 22 + 17] and m[250, 300 - 22 - 17]  # 17.4 px past each end of the long axis
+    assert not m[250, 300 + 22 + 17 + 5]
+    assert not m[250 - 10 - 8, 300] and m[250 - 10 - 3, 300]  # sideways: only the 3 px margin
+
+
+def test_a_weak_peak_or_a_tiny_box_is_unsure_and_treated_like_moved():
+    flat = np.full((H, W), 0.5, np.float32)  # no texture: no clear correlation peak
+    box = rect(300, 250, 44, 20)
+    mask, counts = vmask([box], [], similarity(1, 0, 0, 0), _images(flat, flat))
+    assert counts.unsure == 1 and counts.static == 0
+    assert mask[0].numpy()[250, 300 + 22 + 17]  # extended all the same
+    luma = _scene(3, [(300, 250, 6, 5)])  # a 6x5 px "box": its window is under min_window_px
+    tiny = align.VehicleMaskParams(**{**VM.__dict__, "window_margin_px": 4})
+    _, counts = vmask([rect(300, 250, 6, 5)], [], similarity(1, 0, 0, 0), _images(luma, luma), tiny)
+    assert counts.unsure == 1
+
+
+def test_without_images_every_unmatched_vehicle_is_unsure():
+    _, counts = vmask([rect(300, 250), rect(100, 100)], [], similarity(1, 0, 0, 0), NO_IMAGES)
+    assert counts.unsure == 2
+
+
+def test_extension_follows_an_oriented_long_axis():
+    box = rotated(300, 250, 44, 18, 40)
+    u = np.array([math.cos(math.radians(40)), math.sin(math.radians(40))])
+    mask, _ = vmask([box], [], None)  # no images: unsure -> extended
+    m = mask[0].numpy()
+    tip = np.array([300.0, 250.0]) + u * (22 + 17)
+    assert m[int(round(tip[1])), int(round(tip[0]))]
+    side = np.array([300.0, 250.0]) + np.array([-u[1], u[0]]) * (9 + 17)
+    assert not m[int(round(side[1])), int(round(side[0]))]  # not isotropic
+
+
+def test_every_rgb_box_lands_in_exactly_one_branch():
+    car = (300, 250, 44, 20)
+    luma = _scene(4, [car])
+    rgb = [rect(300, 250, 44, 20), rect(100, 100), rect(450, 400)]
+    thermal = [rect(103, 101), rect(451, 399)]  # two matched, one copied-free unmatched RGB box
+    _, counts = vmask(rgb, thermal, similarity(1, 0, 0, 0), _images(luma, luma))
+    assert counts.matched == 2
+    assert counts.matched + counts.static + counts.moved + counts.unsure == len(rgb)
+
+
+def test_vehicle_fraction_and_the_dense_flag():
+    mask = torch.zeros(1, 10, 10, dtype=torch.bool)
+    mask[:, :3, :] = True
+    assert align.vehicle_fraction(mask) == pytest.approx(0.3)
+    assert not align.is_dense(0.30, 0.30)  # "over" 30%, so exactly 30% is not flagged
+    assert align.is_dense(0.3001, 0.30)
+
+
+def test_moving_displacements_are_the_residuals_of_the_moving_boxes_only():
+    T = similarity(1.0, 0.0, 0.0, 0.0)
+    rgb = [rect(100, 100), rect(300, 200), rect(500, 300)]
+    thermal = [rect(101, 100), rect(318, 200), rect(499, 300)]  # box 1 moved 18 px
+    matches = align.match_boxes(thermal, rgb, CFG)
+    moved = align.moving_displacements(matches, T, CFG.moving_min_residual_px)
+    assert moved.tolist() == pytest.approx([18.0])
+    assert align.moving_displacements(matches, None, 4.0).size == 0

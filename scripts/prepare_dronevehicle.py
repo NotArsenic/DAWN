@@ -23,7 +23,14 @@
             example sheet just under / over the threshold.
     write   Warp, mask and write the PNGs of the surviving pairs under `aligned_dir`, the three
             manifests <manifest_dir>/{train,val,test}_pairs.txt, <manifest_dir>/fallback_pairs.txt
-            (the ones aligned by edge correlation instead of boxes) and logs/summary.md.
+            (the ones aligned by edge correlation instead of boxes), logs/vehicles.csv (the share
+            of each frame its vehicles mask covers, dense frames flagged, and how many vehicles
+            took each branch of the per-vehicle rule) and logs/summary.md. The vehicles masks
+            are recomputed on every run (they are deterministic), the other PNGs only when missing.
+    vehicle-dilation   Read-only. The displacement of the vehicles that moved between the two
+            exposures, over the box-aligned pairs, and its 95th percentile: how far the vehicles
+            mask extends a vehicle that may have moved. Run after `align`; put the result in
+            `masks.vehicles.extend_px`.
     all     stats, day, align, dedup, write, with no pause. Look at `day` first on a new dataset.
 
 Paths and thresholds come from configs/data.yaml. Every stage skips work already on disk unless
@@ -282,6 +289,7 @@ def run_write(cfg: dict, args: argparse.Namespace) -> None:
     final = report.final_reasons(stats, day_log, aligned, dedups)
     keep = sorted((i for i, reason in final.items() if reason == "ok"), key=_sort_key)
     logger.info(f"Writing {len(keep)} pairs to {layout.aligned_dir}")
+    masks = pairs.VehicleMaskConfig.from_config(cfg["masks"]["vehicles"])
     jobs = [(layout, acfg, aligned[i], args.force) for i in keep]
     written = run_parallel(pairs.write_aligned_pair, jobs, args.workers, desc="write")
     logger.info(f"  {sum(written)} written, {len(written) - sum(written)} already complete")
@@ -289,6 +297,31 @@ def run_write(cfg: dict, args: argparse.Namespace) -> None:
         ids = [i for i in keep if _split_of(i) == split]
         pairs.write_manifest(layout.manifest(f"{split}_pairs"), ids)
         logger.info(f"  {layout.manifest(f'{split}_pairs')}: {len(ids)} pairs")
+    logger.info(
+        f"Vehicles mask: margin {masks.dilate_px:g} px, extended {masks.extend_px:g} px along the "
+        "long axis where a vehicle may have moved"
+    )
+    results = run_parallel(
+        pairs.write_vehicles,
+        [(layout, acfg, masks, aligned[i]) for i in keep],
+        args.workers,
+        desc="vehicles",
+    )
+    fractions = {i: r.fraction for i, r in zip(keep, results)}
+    branches = {i: r.branches for i, r in zip(keep, results)}
+    dense = report.write_vehicle_log(
+        layout.log("vehicles"), fractions, masks.max_frame_fraction, branches
+    )
+    mean = 100 * sum(fractions.values()) / max(len(fractions), 1)
+    logger.info(
+        f"  vehicles mask covers {mean:.1f}% of a frame on average; {len(dense)} of {len(keep)} "
+        f"frames over {100 * masks.max_frame_fraction:.0f}% flagged in {layout.log('vehicles')}"
+    )
+    totals = {
+        n: sum(getattr(b, n) for b in branches.values())
+        for n in ("matched", "static", "moved", "unsure", "thermal_only")
+    }
+    logger.info(f"  vehicles per branch: {totals}")
     fallback = report.fallback_ids(final, aligned)
     pairs.write_manifest(layout.manifest("fallback_pairs"), fallback)
     logger.info(
@@ -297,8 +330,41 @@ def run_write(cfg: dict, args: argparse.Namespace) -> None:
     )
     summary = layout.log("summary").with_suffix(".md")
     summary.parent.mkdir(parents=True, exist_ok=True)
-    summary.write_text(report.build_summary(stats, day_log, aligned, dedups, cfg), encoding="utf-8")
+    summary.write_text(
+        report.build_summary(
+            stats, day_log, aligned, dedups, cfg, fractions, masks.max_frame_fraction, branches
+        ),
+        encoding="utf-8",
+    )
     logger.info(f"Summary: {summary}")
+
+
+def run_vehicle_dilation(cfg: dict, args: argparse.Namespace) -> None:
+    from dawn.data import align
+    from dawn.data.sheets import run_parallel
+
+    layout, acfg = _setup(cfg, args)
+    rows = [r for r in align.read_align_log(layout.log("align")).values() if r.accepted]
+    box_rows = [r for r in rows if r.model in ("similarity", "homography")]
+    jobs = [(layout, acfg, row) for row in box_rows]
+    per_pair = run_parallel(
+        align.pair_moving_displacements, jobs, args.workers, desc="displacement"
+    )
+    values = [d for ds in per_pair for d in ds]
+    summary = align.summarize_displacements(values)
+    logger.info(
+        f"Moving vehicles in {len(box_rows)} box-aligned pairs: {summary['n']} vehicles in "
+        f"{sum(1 for ds in per_pair if ds)} pairs"
+    )
+    if summary["n"]:
+        logger.info(
+            "  displacement px: median %.1f, p90 %.1f, p95 %.1f, p99 %.1f, max %.1f"
+            % tuple(summary[k] for k in ("p50", "p90", "p95", "p99", "max"))
+        )
+    logger.info(
+        f"  suggested masks.vehicles.extend_px = {summary['suggested_extend_px']} (the p95); "
+        f"configured: {cfg['masks']['vehicles']['extend_px']}"
+    )
 
 
 def run_all(cfg: dict, args: argparse.Namespace) -> None:
@@ -345,6 +411,11 @@ def main() -> None:
     stages.add_parser(
         "dedup", parents=[common], help="Drop val/test pairs that near-duplicate a train pair"
     ).set_defaults(run=run_dedup)
+    stages.add_parser(
+        "vehicle-dilation",
+        parents=[common],
+        help="Measure moving-vehicle displacement; suggest the vehicles-mask extension",
+    ).set_defaults(run=run_vehicle_dilation)
     stages.add_parser(
         "write", parents=[common], help="Aligned PNGs, the three manifests, summary.md"
     ).set_defaults(run=run_write)

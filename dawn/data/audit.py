@@ -440,3 +440,38 @@ def save_usable_sheet(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tile_sheet(tiles, labels, title, columns=4, box=(192, 240)).save(out_path, quality=90)
     return out_path
+
+
+def vehicles_tile(
+    layout: dv.DroneVehicleLayout, image_id: str, box: tuple[int, int] = TILE_BOX
+) -> torch.Tensor:
+    """`(3, h, w)` uint8 thumbnail of a written pair's RGB with its vehicles mask tinted red
+    (display only), to check what a dense frame masks out."""
+    from PIL import Image
+
+    with Image.open(layout.aligned_path(image_id, "rgb")) as img:
+        rgb = torch.from_numpy(np.asarray(img.convert("RGB")).copy()).permute(2, 0, 1).float()
+    with Image.open(layout.aligned_path(image_id, "vehicles")) as img:
+        mask = torch.from_numpy(np.asarray(img.convert("L")) > 127)
+    tint = torch.tensor([255.0, 40.0, 40.0]).view(3, 1, 1)
+    rgb = torch.where(mask[None], 0.55 * rgb + 0.45 * tint, rgb)
+    return _thumb8(rgb.round().clamp(0, 255).to(torch.uint8), box)
+
+
+def save_vehicle_sheet(
+    layout: dv.DroneVehicleLayout,
+    frames: Sequence[tuple[str, float]],
+    out_path: str | Path,
+    title: str,
+    workers: int = 1,
+) -> Path | None:
+    """A sheet of `(image_id, vehicles_fraction)` frames with their masks tinted red, 4 per row,
+    captioned with the masked share. Returns None when `frames` is empty."""
+    if not frames:
+        return None
+    tiles = run_parallel(vehicles_tile, [(layout, i) for i, _ in frames], workers)
+    labels = [f"{i} masked {100 * f:.0f}%" for i, f in frames]
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tile_sheet(tiles, labels, title, columns=4, box=TILE_BOX).save(out_path, quality=90)
+    return out_path

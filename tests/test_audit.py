@@ -261,3 +261,37 @@ def test_sheet_names_can_carry_a_prefix(rows, tmp_path):
         layout, aligned[:1], aligned[3:4], tmp_path, per_sheet=2, workers=1, prefix="fallback_"
     )
     assert [p.name for p in written] == ["fallback_accepted_01.jpg", "fallback_rejected_01.jpg"]
+
+
+def test_vehicle_tile_tints_the_masked_pixels(aligned_layout):
+    import numpy as np
+    from PIL import Image
+
+    iid = "train_00001"
+    mask = np.zeros((512, 640), np.uint8)
+    mask[100:300, 100:300] = 255
+    Image.fromarray(mask).save(aligned_layout.aligned_path(iid, "vehicles"))
+    tile = audit.vehicles_tile(aligned_layout, iid, box=(256, 320))
+    assert tile.dtype == torch.uint8 and tile.shape == (3, 256, 320)
+    # inside the mask the red channel dominates the (random) RGB; outside it is untouched noise
+    inside = tile[:, 70:130, 60:100].float().mean(dim=(1, 2))
+    assert inside[0] > inside[1] and inside[0] > inside[2]
+
+
+def test_vehicle_sheet_is_written_with_the_fractions_in_the_captions(aligned_layout, tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    ids = [f"train_{i:05d}" for i in range(3)]
+    for i in ids:
+        Image.fromarray(np.zeros((512, 640), np.uint8)).save(
+            aligned_layout.aligned_path(i, "vehicles")
+        )
+    out = audit.save_vehicle_sheet(
+        aligned_layout,
+        [(ids[0], 0.41), (ids[1], 0.33)],
+        tmp_path / "dense.jpg",
+        title="dense frames",
+    )
+    assert out is not None and out.stat().st_size > 1000
+    assert audit.save_vehicle_sheet(aligned_layout, [], tmp_path / "none.jpg", title="t") is None
