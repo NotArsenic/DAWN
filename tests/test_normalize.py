@@ -65,3 +65,18 @@ def test_weighted_moments_match_torch_and_ignore_zero_weight_values():
 def test_weighted_moments_without_data_is_an_error():
     with pytest.raises(ValueError, match="no weight"):
         WeightedMoments(2).finalize()
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an Apple GPU (MPS)")
+def test_weighted_moments_of_mps_tensors_match_the_cpu():
+    """Moving an MPS tensor to the CPU AND casting it in one `.to(cpu, float64)` call returned wrong
+    values on torch 2.14 (the token stats came out as garbage on a Mac): move first, then cast."""
+    g = torch.Generator().manual_seed(0)
+    values = torch.randn(300, 16, generator=g).reshape(10, 30, 16).permute(0, 2, 1).reshape(-1, 30)
+    weights = torch.rand(values.shape[0], generator=g)
+    cpu = WeightedMoments(30)
+    cpu.add(values, weights)
+    mps = WeightedMoments(30)
+    mps.add(values.to("mps"), weights.to("mps"))
+    for want, got in zip(cpu.finalize(), mps.finalize()):
+        assert torch.allclose(want, got, atol=1e-5)

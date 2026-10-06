@@ -76,11 +76,12 @@ class WeightedMoments:
     @torch.no_grad()
     def add(self, values: torch.Tensor, weights: torch.Tensor | None) -> None:
         """Add `values` (M, dim) with per-row `weights` (M,), or all ones when None."""
-        values = values.detach().to("cpu", torch.float64)
+        # Move first, then cast: one `.to("cpu", float64)` on an MPS tensor returns wrong values.
+        values = values.detach().cpu().to(torch.float64)
         w = (
             torch.ones(values.shape[0], dtype=torch.float64)
             if weights is None
-            else (weights.detach().to("cpu", torch.float64))
+            else (weights.detach().cpu().to(torch.float64))
         )
         self.total += w.sum()
         self.sum += (values * w[:, None]).sum(dim=0)
