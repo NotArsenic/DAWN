@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from dawn.data import dronevehicle as dv
@@ -21,6 +22,14 @@ from dawn.data.pairs import AlignedPairs, AugmentConfig
 from dawn.flow.targets import prepare_batch
 
 SUBSETS = ("box_aligned", "fallback")
+
+
+def load_config(config: str, data_config: str, overrides: Iterable[str] = ()) -> dict:
+    """flow.yaml + data.yaml + every override file, later files winning, as a plain dict."""
+    cfg = OmegaConf.merge(OmegaConf.load(config), OmegaConf.load(data_config))
+    for path in overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.load(path))
+    return OmegaConf.to_container(cfg, resolve=True)
 
 
 @dataclass

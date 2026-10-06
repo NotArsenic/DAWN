@@ -29,27 +29,18 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dawn.flow.loaders import build_loaders, cycle, stats_batches  # noqa: E402
+from dawn.flow.loaders import build_loaders, cycle, load_config, stats_batches  # noqa: E402
 from dawn.flow.targets import FitSettings, compute_token_stats, load_or_compute_stats  # noqa: E402
 from dawn.flow.tokens import TokenLayout  # noqa: E402
 from dawn.flow.trainer import FlowTrainer  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
-
-
-def load_config(config: str, data_config: str, overrides: list[str]) -> dict:
-    """flow.yaml + data.yaml + every --override, later files winning."""
-    cfg = OmegaConf.merge(OmegaConf.load(config), OmegaConf.load(data_config))
-    for path in overrides:
-        cfg = OmegaConf.merge(cfg, OmegaConf.load(path))
-    return OmegaConf.to_container(cfg, resolve=True)
 
 
 class WandbRun:
