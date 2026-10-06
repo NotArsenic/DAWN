@@ -23,10 +23,9 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data (large files -- download separately). Hand labels and manifests are small and committed.
+# Data (large files -- download separately). The manifests are small and committed.
 data/*
 !data/manifests/
-!data/labels/
 *.pt
 *.pth
 *.ckpt
@@ -37,6 +36,8 @@ outputs/
 logs/
 wandb/
 runs/
+# ...except the committed data-filter logs (a later rule wins over `logs/` above)
+!data/manifests/logs/
 
 # OS
 .DS_Store
@@ -49,5 +50,5 @@ Thumbs.db
 # graphify knowledge-graph output
 graphify-out/
 
-# VisDrone dataset files
-data/VisDrone_dataset/*
+# DroneVehicle dataset files
+data/DroneVehicle/*

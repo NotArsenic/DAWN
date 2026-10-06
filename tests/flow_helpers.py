@@ -64,7 +64,11 @@ def wake_up(module, std: float = 0.05, seed: int = 0):
 
 
 def load_configs(*overrides: str) -> tuple[dict, dict]:
-    """`(cfg, calib)`: flow.yaml + data.yaml + the named overrides, and camera_calib.yaml."""
+    """`(cfg, calib)`: flow.yaml + data.yaml + the named overrides, and camera_calib.yaml.
+
+    PARKED: `configs/camera_calib.yaml` was deleted with the old night-regime data code, so this
+    only works again once the flow phase replaces it. Only the parked `test_flow_train.py` calls it.
+    """
     omegaconf = pytest.importorskip("omegaconf")
     cfg = omegaconf.OmegaConf.merge(
         omegaconf.OmegaConf.load(CONFIGS / "flow.yaml"),
@@ -87,7 +91,11 @@ def unit_stats(num_coeffs: int = 12, num_bins: int = 8) -> dict:
 
 
 def night_batch(num_images: int, cfg: dict, calib: dict, level: str | None = "medium") -> dict:
-    """A collated `NightPairs` batch of `num_images` synthetic images."""
+    """A collated `NightPairs` batch of `num_images` synthetic images.
+
+    PARKED: `dawn.flow.dataset` was deleted with the old night-regime data code, so this raises
+    ImportError until the flow phase supplies a replacement. Only `test_flow_train.py` calls it.
+    """
     from dawn.flow.dataset import NightPairs, SyntheticDay, collate_night_pairs
 
     source = SyntheticDay(num_images=num_images, size=256)

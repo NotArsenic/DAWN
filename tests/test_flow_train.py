@@ -1,5 +1,9 @@
 """Stage 1 end to end: shapes through the whole chain, determinism, resume, and an overfit.
 
+PARKED: this tests the old night-regime trainer, which imported the deleted degradation glue
+(`dawn.flow.dataset`) and `configs/camera_calib.yaml`. It is skipped until the flow phase
+rebuilds the trainer on `AlignedPairs`; keep it as the reference for what to cover again.
+
 Everything runs on the CPU with `configs/debug.yaml`. The encoder is a two-block randomly
 initialized DINOv3 (`tests/flow_helpers.py`), so nothing is downloaded; the velocity net, the
 loss, the grid fitting and the samplers are the real ones.
@@ -8,6 +12,10 @@ loss, the grid fitting and the samplers are the real ones.
 import os
 
 import pytest
+
+pytest.skip(
+    "parked: old night-regime trainer, rebuilt in the flow phase", allow_module_level=True
+)
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("omegaconf")

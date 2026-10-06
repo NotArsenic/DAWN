@@ -6,8 +6,8 @@
 # Every key here must already exist in flow.yaml or data.yaml (tests/test_configs.py checks it),
 # so a typo cannot silently do nothing.
 
-visdrone:
-  max_images: 16
+dronevehicle:
+  max_pairs: 16
 
 encoder:
   pretrained: false        # no HF token, no gated download: random weights are enough here

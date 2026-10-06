@@ -60,9 +60,55 @@ def test_flow_config_has_the_decided_keys():
         assert _has(cfg, path), ".".join(path)
 
 
-def test_moonlight_color_temperature_is_not_daylight():
-    lighting = _load("data.yaml")["degradation"]["lighting"]
-    assert lighting["moonlight_temp_range"] == [3800, 4300]
+def test_data_config_has_the_decided_keys():
+    cfg = _load("data.yaml")
+    for path in [
+        ("dronevehicle", "root"),
+        ("dronevehicle", "splits"),
+        ("dronevehicle", "aligned_dir"),
+        ("dronevehicle", "stats_csv"),
+        ("dronevehicle", "manifest_dir"),
+        ("dronevehicle", "outputs_dir"),
+        ("dronevehicle", "frame_size"),
+        ("dronevehicle", "border"),
+        ("dronevehicle", "border_check", "min_value"),
+        ("dronevehicle", "class_map"),
+        ("dronevehicle", "max_pairs"),
+        ("day_filter", "min_lum_median"),
+        ("align", "max_match_dist_px"),
+        ("align", "copy_tol_px"),
+        ("align", "exclude_copied_boxes"),
+        ("align", "ransac_inlier_px"),
+        ("align", "min_matches"),
+        ("align", "min_inlier_ratio"),
+        ("align", "max_median_residual_px"),
+        ("align", "max_scale_deviation"),
+        ("align", "max_rotation_deg"),
+        ("align", "max_shift_px"),
+        ("align", "homography", "min_matches"),
+        ("align", "grad_check", "min_gain"),
+        ("align", "grad_check", "search_px"),
+        ("align", "grad_check", "max_best_shift_px"),
+        ("align", "moving", "min_residual_px"),
+        ("align", "moving", "dilate_px"),
+        ("dedup", "max_hamming"),
+        ("augment", "hflip"),
+        ("augment", "vflip"),
+        ("augment", "rot90"),
+        ("augment", "thermal_contrast", "prob"),
+        ("augment", "thermal_contrast", "gamma"),
+    ]:
+        assert _has(cfg, path), ".".join(path)
+
+
+def test_data_config_decisions_hold():
+    cfg = _load("data.yaml")
+    assert cfg["dronevehicle"]["frame_size"] == [712, 840] and cfg["dronevehicle"]["border"] == 100
+    assert cfg["augment"]["rot90"] is False  # 90 degree turns would break 640x512 batching
+    classes = cfg["dronevehicle"]["class_map"]
+    assert classes["truvk"] == "truck" and classes["*"] is None
+    assert {classes[k] for k in ("feright_car", "feright car", "feright")} == {"freight_car"}
+    assert cfg["align"]["exclude_copied_boxes"] is True
 
 
 def test_debug_overlay_only_overrides_existing_keys():

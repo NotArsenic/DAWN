@@ -2,33 +2,42 @@
 
 The single source of truth for every layout, coordinate system, color space and definition that more than one module relies on. **If code and this file disagree, this file wins**: fix the code, or change this file in the same commit. Read it before touching `dawn/grid/`, `dawn/models/velocity.py`, `dawn/flow/`, `dawn/data/` or `dawn/uncertainty/`.
 
+> **Status, 2026-10-06.** The project moved from synthetic night RGB (VisDrone) to real **day thermal → RGB** (DroneVehicle). Current: §1 (RGB, thermal and CIELAB conventions), the image rows of "At a glance", the data rows of §7, §4a, §8 rules 7 and 8, and **all of §10**. §2, §3, §4 (log-luminance guidance), §5, §6 and the model rows of §7 describe the **parked** old-regime grid, noise and model code (`dawn/grid/`, `dawn/models/`, `dawn/flow/`, `dawn/uncertainty/`) until the flow/model phase rewrites them. They do not apply to new data code, and the plan (`docs/Dawn Night-Vision to Day Colorization for Drone Imagery.md`) wins over them where the two disagree.
+
 Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx` grid cell rows/columns (16, 16). Sizes come from `configs/flow.yaml: grid.*`; the coefficient constants and token reshapes live in `dawn/grid/layout.py`.
 
 ## At a glance
 
 | Topic | Convention |
 |---|---|
-| Images | `(B, 3, H, W)`, RGB, float32, **linear**, `[0, 1]`. sRGB only at the boundaries in §1 |
-| Grid (raw *and* standardized) | `(B, 12, K, gy, gx)` = `(coefficient, bin, cell row, cell col)` |
-| 12 coefficients | `c = 3i + j` is `M[i, j]`, `c = 9 + i` is `t[i]`; `out_i = Σ_j M[i,j]·x_j + t_i` |
-| Velocity tokens | `(B, 256, 96)`; token `n = y·gx + x`, value `v = k·12 + c` |
-| Grid coordinates | node values sit at cell **centers**; coordinates outside the outer centers clamp |
-| Guidance | `compute_guidance`: luminance → 5×5 box blur (replicate pad) → clamp ≥ 1e-4 → log10 → `(· + 4) / 4` |
-| Raw vs standardized | stats `(12, K)`; pixels see raw, flow sees standardized; convert only via `normalize.py` |
+| RGB images | `(B, 3, H, W)`, RGB, float32, **linear**, `[0, 1]`. sRGB only at the boundaries in §1 |
+| Thermal images | `(B, 1, H, W)`, float32, `code / 255` in `[0, 1]`. **Not sRGB**: never through `srgb_to_linear` (§1) |
+| Frames | raw 840×712 with a 100-px white border; content crop `[100:612, 100:740]` = **640×512** (§10.1) |
+| Pixel coordinates | pixel-index: x = column, y = row, pixel `(r, c)` has its centre at `(c, r)`; boxes and warps share them (§10.2) |
+| Warp | thermal onto RGB, bilinear inverse mapping, `T: thermal → RGB`; RGB is only cropped, never resampled (§10.2) |
+| Masks | `valid` excluded from **every** loss, `moving` from the **pixel** losses (§10.2) |
+| Image IDs | `f"{split}_{stem}"`, e.g. `train_00001`; the three manifests are `{train,val,test}_pairs` (§10.1) |
+| Grid (raw *and* standardized, parked) | `(B, 12, K, gy, gx)` = `(coefficient, bin, cell row, cell col)` |
+| 12 coefficients (parked) | `c = 3i + j` is `M[i, j]`, `c = 9 + i` is `t[i]`; `out_i = Σ_j M[i,j]·x_j + t_i` |
+| Velocity tokens (parked) | `(B, 256, 96)`; token `n = y·gx + x`, value `v = k·12 + c` |
+| Grid coordinates (parked) | node values sit at cell **centers**; coordinates outside the outer centers clamp |
+| Guidance (parked) | `compute_guidance`: luminance → 5×5 box blur (replicate pad) → clamp ≥ 1e-4 → log10 → `(· + 4) / 4` |
+| Raw vs standardized (parked) | stats `(12, K)`; pixels see raw, flow sees standardized; convert only via `normalize.py` |
 | Downsampling | always area averaging of **linear** values, only through `area_downsample` (§4a) |
-| Noise | `Var[y \| x] = a·x + b`; `b` is a **variance**; `(a, b)` at native resolution, `(a/n, b/n)` after averaging `n` native pixels |
+| Noise (parked) | `Var[y \| x] = a·x + b`; `b` is a **variance**; `(a, b)` at native resolution, `(a/n, b/n)` after averaging `n` native pixels |
 | Flow time | `t = 0` noise, `t = 1` data |
 
 ## 1. Color space
 
-- Inside the pipeline every image is **linear RGB, float32, `[0, 1]`**, channel order R, G, B, layout `(B, 3, H, W)` (`(3, H, W)` for one sample). That covers `day`, `night_clean`, `night`, the output of `apply_affine`, and the denoiser's input and output. Clamp to `[0, 1]` after anything that can leave the range (noise, `apply_affine`, the denoiser).
+- **RGB** inside the pipeline is **linear RGB, float32, `[0, 1]`**, channel order R, G, B, layout `(B, 3, H, W)` (`(3, H, W)` for one sample). That covers the aligned `rgb` target and anything rendered from it. Clamp to `[0, 1]` after anything that can leave the range (an affine render, CIELAB back to RGB).
+- **Thermal is not sRGB.** Thermal values are the camera's 8-bit codes: `thermal = code / 255`, float32 in `[0, 1]`, one channel, `(1, H, W)`. Thermal **never** goes through `srgb_to_linear` or `linear_to_srgb`, and no gamma is applied to it anywhere. Its random contrast curves in training act on these code values. The encoder copies it to three channels itself (DINO input, parked).
 - sRGB exists only at these boundaries. Nothing else calls `srgb_to_linear` / `linear_to_srgb`:
-  1. File input: decode, then `srgb_to_linear` (dataset, `prepare.py`, `infer.py`). 8-bit files use `srgb8_to_linear`, bit-identical to `srgb_to_linear(code / 255)`.
-  2. File or display output: `linear_to_srgb`, then save (`infer.py`, `visualize.py`, scripts). 8-bit files use `linear_to_srgb8` (the 512-px copies from `prepare.py`).
-  3. `camera.py`: it simulates a camera ISP (gamma → 8-bit → JPEG) and ends by decoding back to linear, so `night` is exactly what a linearized real night JPEG looks like.
-  4. `DINOEncoder.forward`: DINO is pretrained on sRGB, so the encoder takes **linear** RGB and converts to sRGB plus ImageNet mean/std itself. Callers never pre-convert.
-  5. Display-unit uncertainty (`srgb_gamma_slope`).
-- All image tensors and grids are float32. bf16 autocast is for network forward passes only; grid fitting, slicing, `apply_affine` and variance propagation run in float32 (`torch.linalg.solve` in `fit_grid` needs it).
+  1. File input: decode, then `srgb8_to_linear` (`AlignedPairs`; the raw readers `dronevehicle.read_rgb8` return the codes untouched). 8-bit files use `srgb8_to_linear`, bit-identical to `srgb_to_linear(code / 255)`.
+  2. File or display output: `linear_to_srgb`, then save (`infer.py`, `visualize.py`, scripts, contact sheets). 8-bit files use `linear_to_srgb8`. The aligned RGB PNG is the lossless 8-bit crop of the decoded JPEG, so it is written without any conversion.
+  3. `DINOEncoder.forward` (parked): DINO is pretrained on sRGB, so the encoder takes **linear** RGB and converts to sRGB plus ImageNet mean/std itself. Callers never pre-convert.
+  4. Display-unit uncertainty (`srgb_gamma_slope`).
+- **CIELAB** (`dawn.data.color.linear_to_lab`, `lab_to_linear`): from **linear** sRGB primaries, D65 white, `(..., 3, H, W)` float32, channels L\*, a\*, b\*. L\* is in `[0, 100]`; white is exactly `(100, 0, 0)` and black `(0, 0, 0)`. The CIE linear segment below `(6/29)^3` keeps gradients finite at 0. Neither direction clamps: clamp RGB to `[0, 1]` before `linear_to_lab` if it can leave the range, and after `lab_to_linear` (out-of-gamut a\*b\* give channels outside `[0, 1]`).
+- All image tensors are float32. bf16 autocast is for network forward passes only; grid fitting, slicing and variance propagation (parked) run in float32.
 
 ## 2. Grid layout
 
@@ -173,8 +182,13 @@ where `S[i, j] = Σ_tap W[i, j, tap]²` and `M[i, j] = Σ_tap W[i, j, tap]` for 
 | `propagate_variance(coeffs, sigma_sq_in)` | `(B,12,H,W)`, `(B,3,H,W)` → `(B,3,H,W)` |
 | `BoundedDenoiser(enhanced, log_variance)` | `(B,3,H,W)` linear, `(B,1,H,W)` → `(B,3,H,W)` linear |
 | `area_downsample(img, (h, w))` | `(..., H, W)` float → `(..., h, w)`, same dtype and device |
-| `VisDroneDataset[i]` | dict: `day` `(3,h,w)` linear, `image_id`, `native_size` `(2,)` int64 `(W, H)`, `scale`; in `eval` mode also `boxes` `(N,4)` xyxy and `categories` `(N,)`. No degradation: that is a separate transform in the dataloader workers, which ends with fixed 256×256 `night`, `night_clean`, `day` and `noise_params` |
-| `NightPairs[i]` | that transform (`dawn/flow/dataset.py`): dict with `night`, `night_clean`, `day` `(3,256,256)` linear, `noise_params`, `image_id`, `native_size` |
+| `read_rgb8(path)` / `read_thermal8(path)` | JPEG path → `(3, 712, 840)` / `(1, 712, 840)` uint8 raw codes (thermal: one channel, after checking that a 3-channel file's channels are identical) |
+| `crop_border(img)` | `(..., 712, 840)` → `(..., 512, 640)` |
+| `parse_annotation(path, class_map)` | XML → boxes (class, `(4, 2)` polygon in **cropped** pixel-index coordinates, source kind), folder, filename |
+| `warp_thermal(thermal, T, (512, 640))` | `(1, H_t, W_t)` float, `T (3, 3)` thermal → RGB → `(1, 512, 640)` float32 warped, `(1, 512, 640)` bool valid |
+| `moving_mask(...)` | boxes, matches, `T` → `(1, 512, 640)` bool, count |
+| `linear_to_lab` / `lab_to_linear` | `(..., 3, H, W)` ↔ `(..., 3, H, W)` float32 |
+| `AlignedPairs[i]` | dict: `thermal (1, 512, 640)` float32 = code / 255, `rgb (3, 512, 640)` linear float32, `valid` and `moving` `(1, 512, 640)` bool, `image_id` str. Training adds flips (all four tensors alike) and a thermal-only monotone contrast curve; validation and test are deterministic |
 
 ## 8. Rules
 
@@ -184,6 +198,8 @@ where `S[i, j] = Σ_tap W[i, j, tap]²` and `M[i, j] = Σ_tap W[i, j, tap]` for 
 4. **One conversion point for standardization** (§5).
 5. **One downsampling function.** `area_downsample` on linear images (§4a); no `F.interpolate`, PIL `resize` or `thumbnail` to shrink an image anywhere else.
 6. **Conventions change here first.** If one has to change, edit this file in the same commit as the code and update the affected docstrings.
+7. **One thermal resample.** `align.warp_thermal` is the only place thermal is resampled: bilinear inverse mapping onto the RGB frame. It interpolates at arbitrary positions rather than shrinking an image, so it is the one sanctioned resample that is not an area average (§4a is about downsampling). The RGB image is never resampled.
+8. **Thermal is never sRGB** (§1), and the RGB target is never touched beyond the crop.
 
 ## 9. Known limitations
 
@@ -191,35 +207,36 @@ where `S[i, j] = Σ_tap W[i, j, tap]²` and `M[i, j] = Σ_tap W[i, j, tap]` for 
 - The 16×16 grid, 256-token layout and DINO patch correspondence in §2.3 are coupled; changing the grid size means changing the conditioning.
 - **Splat-and-solve is biased.** `fit_grid` solves each node against the pixels that touch it, as if that node alone applied to them; the renderer then blends 8 nodes per pixel. The two disagree wherever the grid changes quickly from node to node, so a fitted grid does not re-render its own target exactly even with no noise anywhere. The error is small on smooth grids and is what `refine_steps` buys down, by fitting the render residual and adding the correction. Judge a fit on the **rendered** image, never on coefficient error against a reference grid.
 
-## 10. Data: manifests, degradation, determinism
+## 10. Data: DroneVehicle pairs, alignment, determinism
 
-### 10.1 The five manifests
+Code: `dawn/data/{dronevehicle,day_filter,align,dedup,pairs,report,audit}.py`, `scripts/prepare_dronevehicle.py`, `scripts/audit_alignment.py`. Every threshold lives in `configs/data.yaml` and is commented there with its meaning and unit; this section says what they mean for the data, not their values.
 
-`scripts/prepare_visdrone.py split` ends by writing exactly five files, `<manifest_dir>/<name>.txt`, one image ID per line, sorted (`dawn/data/splitting.py: FINAL_SUBSETS`). Training, evaluation and the oracle check read these and nothing else.
+### 10.1 The data, the day filter and the three manifests
 
-| manifest | what is in it |
-|---|---|
-| `train_day` | daytime sources for the degradation, drawn from `train` + `val` |
-| `val_day` | about 10% of the train+val **groups**, held out whole |
-| `test_day` | the daytime images of `test-dev`, left exactly as the dataset ships them |
-| `hard_test` | real near-black night frames (`lum_median <= hard_test_max_lum`): the only images that are never synthesized |
-| `night_normal` | real ordinary night frames (`lum_median > hard_test_max_lum`): qualitative comparison only, never synthesized |
+- **Source.** DroneVehicle (McCheng/DroneVehicle on Hugging Face): `<root>/<split>/{<split>img, <split>imgr, <split>label, <split>labelr}/<stem>.*` = RGB JPEG, thermal JPEG, RGB XML, thermal XML. The file stem pairs the modalities. Stems repeat across splits, so the global **image ID** is `f"{split}_{stem}"` (`train_00001`), used in every manifest, log, file name and seed.
+- **Frames.** Every raw frame is 840×712 with a 100-px white border on both modalities. The content is `[100:612, 100:740]`, **640×512**. The border is checked on every image (`dronevehicle.check_border`: a dark border pixel is `dark`, white leaking into the content's outer ring is `wide`) and failures are logged, not dropped silently. Thermal JPEGs are stored as one channel or as three identical channels; one channel is taken after checking they match.
+- **Labels.** VOC-like XML. Objects carry a `<polygon>` (oriented quad), a `<bndbox>` (read as a rectangle), or only a `<point>` (skipped and counted). Coordinates are in the 840×712 frame; `parse_annotation` subtracts the border. Class names go through `dronevehicle.class_map` (typos mapped, `*` dropped). `<size><depth>` is wrong in this dataset and ignored.
+- **Stats** (`prepare_dronevehicle.py stats`): per stem, the existence, frame, border and thermal-channel checks, RGB luminance percentiles on the cropped frame, folder and file names, and a 64-bit perceptual hash of each modality. Pairs missing a modality or with an unreadable (e.g. truncated) JPEG get a status and drop out at the day stage.
+- **Day filter.** A pair is day when the **median linear luminance of the cropped RGB frame** is at least `day_filter.min_lum_median` (log10 of it is what the histogram and sheets show). The distribution has a bright day mode and a continuum of dusk and night below it with no clean gap, so the cutoff is a human decision made from the histogram and contact sheets, and errs high (the plan excludes dusk and anything borderline). Median luminance alone does not separate day from night perfectly: night frames auto-exposed bright reach about log10 -0.73.
+- **The three manifests** are `data/manifests/{train,val,test}_pairs.txt`, one image ID per line, sorted, committed. They hold the pairs that survive every stage below. The official splits are kept (they are not flight-disjoint; see Dedup). Alongside them, `data/manifests/logs/{day,align,dedup}.csv` and `summary.md` record every decision (floats to 3 decimals).
+- **Storage.** Aligned pairs are written once, as PNG, under `dronevehicle.aligned_dir/<split>/` (gitignored), so training never warps on the fly: `<id>_rgb.png` (8-bit sRGB, the lossless crop of the decoded JPEG), `<id>_thermal.png` (8-bit L, the warped thermal; the 8-bit requantization noise sits around 59 dB, far below the JPEG noise), `<id>_valid.png` and `<id>_moving.png` (L, 0/255).
+- **Dedup.** Consecutive frames of a flight are near-duplicates and the official splits share flights, so a val or test pair is **dropped when it near-duplicates a train pair**: its RGB hash **and** its thermal hash are both within `dedup.max_hamming` bits of the same train pair. The reference set is the train pairs that passed the *day filter* (not the aligned ones), so loosening alignment later cannot let leakage back in. Train keeps everything. The hash is the DCT perceptual hash of luma (RGB: sRGB-coded luma; thermal: the codes), computed on the crop after area averaging to 32×32 (§4a); it always has 32 set bits, so distances are even.
 
-- A **group** is a video sequence ID, or the collection ID for a `99999xx` still collection (`splitting.group_id`). Consecutive frames of a VisDrone video are near-duplicates, so an image-level split puts almost the same picture on both sides and validation stops measuring anything. Whole groups move together, and `train_day`, `val_day` and `test_day` are checked to share no group ID on every build (both `hard_test` and `night_normal` are excluded from the disjointness check).
-- The hand labels in `data/labels/visdrone_labels.csv` are **never written by code**. Their vocabulary (day / night / dusk / exclude) becomes this project's through `split.label_map` in data.yaml, which is also the only place to change it.
-- Frames labelled `night` are split into `hard_test` and `night_normal` by the cutoff `split.night.hard_test_max_lum` in data.yaml (default 0.005). Empirically, 20 night-labelled frames are genuinely near-black (`lum_median <= 0.005`) while the other 100 are ordinary usable night (`lum_median >= 0.0086`, a clean gap).
-- A label on a sequence applies to every frame of that sequence; a label on a single image overrides its sequence.
-- The `99999xx` still collections carry no hand label. They are auto-accepted as day by cutoffs on median luminance and highlight ratio, fitted to make **zero** errors on the hand-labelled frames, and 200 random accepted stills are written to a contact sheet so a person can check what the cutoffs let through.
+### 10.2 Alignment and masks
 
-### 10.2 The degradation contract
+The thermal and RGB cameras sit a few centimetres apart and expose at slightly different times, so a pair is a similarity warp (plus moving vehicles) from aligned. Each vehicle is boxed separately in both modalities, and the box centres give correspondences without any cross-modal feature matching.
 
-`dawn/data/degrade.py` turns one daytime image into a matched pair, by composing `lighting.py` (reflectance × night illumination → scene radiance, ambient white = 1) and `camera.py` (sensor, auto exposure, ISP → night). It returns `night`, `night_clean`, `day`, `noise_a`, `noise_b`, `quant_var`, `n` and every sampled parameter.
-
-- **`night_clean` is the same camera pipeline with the noise draws replaced by their means and the JPEG skipped**, so `night_clean = E[night]` up to clipping. It is *not* the scene radiance: it already carries the exposure gain, the white balance and the ISP filters. Grid fitting is always `night_clean → day`, at the same resolution.
-- With the noise switched off, `night == night_clean` exactly.
-- The flow path returns a fixed 256×256. The daytime frame is area-downsampled **first** (§4a) and the sensor then simulates pixels `n` times bigger, rather than adding native-strength noise to a small image. The native path (denoiser crops) uses `n = 1` and is the only path that applies the in-camera denoise and sharpening.
-- Lighting modes are `moonlit`, `streetlit` (~65-75% of renders) and `starlight`. `streetlit` always has 1-8 lamp pools (20-400× ambient) and together with `starlight` scales with source overcast score (low p95/p05 luminance ratio); `moonlit` takes any. Small emissive points (lit window clusters, headlight and taillight pairs, saturated signs) are added directly to scene radiance (`radiance = reflectance * illumination + emission`) and are deliberately absent from the day target. Emitters use area-coverage rendering so integrated energy is resolution-independent.
-- Training takes a fresh random draw on every call, which is what makes the degradation an augmentation. Validation and test use fixed seeded sets at three darkness levels, `easy` / `medium` / `hard`, which are quantile bands of the target brightness distribution: `hard` is darker because the auto-exposure target is sampled from the darkest 33% of real night frames. The photon count is drawn to hit the target; if it hits the bounds of its range, the frame stays dark and the gain caps out.
+- **Coordinates.** Pixel-index: x is the column, y the row, and pixel `(r, c)` has its centre at `(c, r)`. XML boxes (after the crop) and every transform use them, so an integer shift `(dx, dy)` moves pixel `(c, r)` to `(c + dx, r + dy)` exactly. A box centre is the mean of its four vertices.
+- **Transforms** are 3×3 matrices acting on `(x, y, 1)` that map **thermal onto RGB**. The thermal is warped onto the RGB frame; the RGB is only cropped. A similarity is logged as 6 numbers (its first two rows), a homography as 9, so `write` never refits.
+- **Copied boxes are not evidence.** About 17% of pairs have identical RGB and thermal label sets and, in the rest, a median of 25% of RGB boxes are exact copies of a thermal box. A copy has zero residual by construction. A box counts as copied when its normalized class matches and all four vertices are equal within `align.copy_tol_px`. Copied boxes are excluded from matching and fitting (`align.exclude_copied_boxes`, a flag the maintainer may reverse; the dry run `align --include-copied` shows what it costs). A pair with identical label sets gets the reason `labels_copied`.
+- **Matching.** Boxes of the same class, **mutual** nearest neighbours by centre distance, within `align.max_match_dist_px` (a gate the plan does not state).
+- **Fit.** A similarity (scale, rotation, translation) by RANSAC with 2-match minimal sets: every pair is tried when there are at most `ransac_enumerate_max` matches (deterministic, no RNG), otherwise sets are drawn from `generator_for(image_id, "ransac")` (§10.3). It is refit on the inliers (residual within `ransac_inlier_px`). A homography is tried only when the similarity fails on the residual alone and there are at least `align.homography.min_matches` matches, with the same thresholds; the model used is logged.
+- **Transform parameters.** scale; rotation in degrees; and **shift = the displacement of the frame centre (W/2, H/2) = (320, 256) under `T`**, not the raw translation, which depends on the origin. For a homography, scale and rotation are those of the local Jacobian at the frame centre.
+- **Acceptance**, in this order, each failure with its own reason code: `few_matches` (or `labels_copied` when the label sets are identical), `inlier_ratio`, `residual` (the **median inlier residual**; the median over all matches is logged too), `scale`, `rotation`, `shift`; then the independent edge check, `edge_check`. Boundaries: matches, inlier ratio, residual and scale deviation are inclusive; rotation and shift are strict "under".
+- **Edge check.** Normalized correlation of gradient magnitudes (light blur, then Sobel) between the thermal and the sRGB-coded RGB luma, over the pixels where the warp is valid, before (identity) and after the warp. With near-identity warps "must improve" is noisy, so the gain `after - before` is logged together with the best integer shift of the warped pair within `±search_px`. A pair passes when `gain >= grad_check.min_gain` and that best shift is at most `grad_check.max_best_shift_px` on each axis.
+- **Warp.** `align.warp_thermal` resamples thermal onto the 640×512 RGB grid by bilinear inverse mapping (§8 rule 7). The validity mask is false wherever the source falls outside the thermal frame (beyond the pixel extent, `[-0.5, W_t - 0.5]` and likewise in y), eroded by one pixel for the bilinear edge. Outside the RGB frame counts as valid, so an identity warp is valid everywhere.
+- **Masks.** `valid` is excluded from **every** loss: its pixels are not real thermal data. `moving` is excluded from the **pixel** losses (render, brightness fit): a matched box whose own residual under `T` exceeds `align.moving.min_residual_px` moved between the exposures, and its mask is the union of its RGB polygon and its thermal polygon pushed through `T`, dilated by `align.moving.dilate_px` as a Euclidean disk. Unmatched and copied boxes are only counted, never masked.
+- **Thresholds are starting values until the audit.** The ones marked in `data.yaml` came from the plan and are revisited after looking at `scripts/audit_alignment.py` (sheets of accepted and rejected pairs with the thermal edges drawn over the RGB, and histograms of the fit metrics). Do not tune them in code.
 
 ### 10.3 Determinism: the seed comes from the image ID
 
