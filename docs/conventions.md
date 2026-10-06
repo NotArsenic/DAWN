@@ -1,10 +1,10 @@
 # Dawn conventions
 
-The single source of truth for every layout, coordinate system, color space and definition that more than one module relies on. **If code and this file disagree, this file wins**: fix the code, or change this file in the same commit. Read it before touching `dawn/grid/`, `dawn/models/velocity.py`, `dawn/flow/`, `dawn/data/` or `dawn/uncertainty/`.
+The single source of truth for every layout, coordinate system, color space and definition that more than one module relies on. **If code and this file disagree, this file wins**: fix the code, or change this file in the same commit. Read it before touching `dawn/grid/`, `dawn/models/`, `dawn/flow/`, `dawn/data/` or `dawn/eval/`.
 
-> **Status, 2026-10-06.** The project moved from synthetic night RGB (VisDrone) to real **day thermal → RGB** (DroneVehicle). Current: §1 (RGB, thermal and CIELAB conventions), the image rows of "At a glance", the data rows of §7, §4a, §8 rules 7 and 8, and **all of §10**. §2, §3, §4 (log-luminance guidance), §5, §6 and the model rows of §7 describe the **parked** old-regime grid, noise and model code (`dawn/grid/`, `dawn/models/`, `dawn/flow/`, `dawn/uncertainty/`) until the flow/model phase rewrites them. They do not apply to new data code, and the plan (`docs/Dawn Night-Vision to Day Colorization for Drone Imagery.md`) wins over them where the two disagree.
+> **Status, 2026-10-06.** The project moved from synthetic night RGB (VisDrone) to real **day thermal → RGB** (DroneVehicle), and the flow phase rebuilt the grid, token, model, flow and metric code for it. Everything here is current. The plan (`docs/Dawn Night-Vision to Day Colorization for Drone Imagery.md`) is the spec this file implements; where this file is more specific than the plan (the 261 a\*b\* bins instead of its 313, `L = L*/100` coefficients, a switchable brightness correction, the resolution as one knob) this file wins.
 
-Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx` grid cell rows/columns (16, 16). Sizes come from `configs/flow.yaml: grid.*`; the coefficient constants and token reshapes live in `dawn/grid/layout.py`.
+Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx` token-grid rows/columns (32, 40 at the full 512×640 encoder input), `N = gy·gx` tokens, `D` values per token, `Q` a\*b\* bins (261). Sizes come from `configs/flow.yaml` (`encoder.input_size`, `grid.*`, `color.*`, `brightness_correction.enabled`); the token layout lives in `dawn/flow/tokens.py` and the coefficient constants in `dawn/grid/layout.py`. Nothing else hard-codes 40, 32, 1,280, 160, 128, 16, 32, 48 or 64: code and tests ask the layout. The one exception is `tests/test_tokens.py: test_layout_matches_the_plan`, which pins the plan's numbers as the spec.
 
 ## At a glance
 
@@ -15,71 +15,75 @@ Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx
 | Frames | raw 840×712 with a 100-px white border; content crop `[100:612, 100:740]` = **640×512** (§10.1) |
 | Pixel coordinates | pixel-index: x = column, y = row, pixel `(r, c)` has its centre at `(c, r)`; boxes and warps share them (§10.2) |
 | Warp | thermal onto RGB, bilinear inverse mapping, `T: thermal → RGB`; RGB is only cropped, never resampled (§10.2) |
-| Masks | `valid` excluded from **every** loss, `moving` from the **pixel** losses (§10.2) |
+| Masks | `valid` excluded from **every** loss, `moving` (box pairs) or `vehicles` (fallback pairs) from the **pixel** losses (§10.2, §5.3) |
 | Image IDs | `f"{split}_{stem}"`, e.g. `train_00001`; the three manifests are `{train,val,test}_pairs` (§10.1) |
-| Grid (raw *and* standardized, parked) | `(B, 12, K, gy, gx)` = `(coefficient, bin, cell row, cell col)` |
-| 12 coefficients (parked) | `c = 3i + j` is `M[i, j]`, `c = 9 + i` is `t[i]`; `out_i = Σ_j M[i,j]·x_j + t_i` |
-| Velocity tokens (parked) | `(B, 256, 96)`; token `n = y·gx + x`, value `v = k·12 + c` |
-| Grid coordinates (parked) | node values sit at cell **centers**; coordinates outside the outer centers clamp |
-| Guidance (parked) | `compute_guidance`: luminance → 5×5 box blur (replicate pad) → clamp ≥ 1e-4 → log10 → `(· + 4) / 4` |
-| Raw vs standardized (parked) | stats `(12, K)`; pixels see raw, flow sees standardized; convert only via `normalize.py` |
-| Downsampling | always area averaging of **linear** values, only through `area_downsample` (§4a) |
-| Noise (parked) | `Var[y \| x] = a·x + b`; `b` is a **variance**; `(a, b)` at native resolution, `(a/n, b/n)` after averaging `n` native pixels |
+| Resolution | one knob: `encoder.input_size = (H, W)`, default `(512, 640)`. Token grid = input / 16; colour map = 4 × token grid; render size = `flow.render_size` (§3) |
+| Brightness grid | raw `(B, 2, K, gy, gx)` = (coefficient, bin, cell row, cell col); coefficient 0 = gain, 1 = offset; `L = gain · thermal + offset`, **`L = L*/100`** (§2) |
+| Colour map | raw `(B, 2, 4gy, 4gx)` a\*, b\* in CIELAB units, one value per colour pixel; optional correction `(B, 1, 4gy, 4gx)` in `L` units (§2.3) |
+| Token | `n = y·gx + x`, values `[brightness 2K \| colour 32 \| correction 16 (if enabled)]` = 48 or 64 (§2.3) |
+| Grid coordinates | node values sit at cell **centers**; coordinates outside the outer centers clamp (§3) |
+| Guidance | `compute_guidance(thermal)`: 5×5 replicate box blur, clamp to `[0, 1]`. No log, no stretch (§4) |
+| Raw vs standardized | per-segment stats, flattened to a `(D,)` mean and std by the layout; pixels see raw, flow sees standardized; convert only via `normalize.py` (§5) |
+| Downsampling | always area averaging, only through `area_downsample` (§4a); masks become fractions, targets masked means |
+| Colour bins | the 261 occupied cells of a 10-unit a\*b\* grid over the 8-bit sRGB gamut, sorted by a\* then b\* (§6) |
+| Render | `flow.render.render`: the one path from raw parts to L\*a\*b\* and linear RGB (§6) |
 | Flow time | `t = 0` noise, `t = 1` data |
 
 ## 1. Color space
 
 - **RGB** inside the pipeline is **linear RGB, float32, `[0, 1]`**, channel order R, G, B, layout `(B, 3, H, W)` (`(3, H, W)` for one sample). That covers the aligned `rgb` target and anything rendered from it. Clamp to `[0, 1]` after anything that can leave the range (an affine render, CIELAB back to RGB).
-- **Thermal is not sRGB.** Thermal values are the camera's 8-bit codes: `thermal = code / 255`, float32 in `[0, 1]`, one channel, `(1, H, W)`. Thermal **never** goes through `srgb_to_linear` or `linear_to_srgb`, and no gamma is applied to it anywhere. Its random contrast curves in training act on these code values. The encoder copies it to three channels itself (DINO input, parked).
+- **Thermal is not sRGB.** Thermal values are the camera's 8-bit codes: `thermal = code / 255`, float32 in `[0, 1]`, one channel, `(1, H, W)`. Thermal **never** goes through `srgb_to_linear` or `linear_to_srgb`, and no gamma is applied to it anywhere. Its random contrast curves in training act on these code values. `DINOEncoder.forward` copies it to three channels and applies ImageNet mean/std itself; it never converts it to sRGB.
 - sRGB exists only at these boundaries. Nothing else calls `srgb_to_linear` / `linear_to_srgb`:
   1. File input: decode, then `srgb8_to_linear` (`AlignedPairs`; the raw readers `dronevehicle.read_rgb8` return the codes untouched). 8-bit files use `srgb8_to_linear`, bit-identical to `srgb_to_linear(code / 255)`.
   2. File or display output: `linear_to_srgb`, then save (`infer.py`, `visualize.py`, scripts, contact sheets). 8-bit files use `linear_to_srgb8`. The aligned RGB PNG is the lossless 8-bit crop of the decoded JPEG, so it is written without any conversion.
-  3. `DINOEncoder.forward` (parked): DINO is pretrained on sRGB, so the encoder takes **linear** RGB and converts to sRGB plus ImageNet mean/std itself. Callers never pre-convert.
+  3. `DINOEncoder.forward_frozen`: DINO is pretrained on sRGB, so for the L_align target the encoder takes the paired **linear** RGB and converts to sRGB plus ImageNet mean/std itself. Callers never pre-convert. (The thermal input of `forward` is not sRGB and takes no conversion, §1 thermal bullet.)
   4. Display-unit uncertainty (`srgb_gamma_slope`).
 - **CIELAB** (`dawn.data.color.linear_to_lab`, `lab_to_linear`): from **linear** sRGB primaries, D65 white, `(..., 3, H, W)` float32, channels L\*, a\*, b\*. L\* is in `[0, 100]`; white is exactly `(100, 0, 0)` and black `(0, 0, 0)`. The CIE linear segment below `(6/29)^3` keeps gradients finite at 0. Neither direction clamps: clamp RGB to `[0, 1]` before `linear_to_lab` if it can leave the range, and after `lab_to_linear` (out-of-gamut a\*b\* give channels outside `[0, 1]`).
-- All image tensors are float32. bf16 autocast is for network forward passes only; grid fitting, slicing and variance propagation (parked) run in float32.
+- All image tensors are float32. bf16 autocast is for network forward passes only; target building, grid fitting, slicing, rendering and the losses run in float32. bf16 is for CUDA only: MPS and CPU runs use fp32 (`optim.precision`).
 
-## 2. Grid layout
+## 2. Brightness grid and tokens
 
-### 2.1 Canonical shape: `(B, 12, K, gy, gx)`
+### 2.1 Canonical shape: `(B, 2, K, gy, gx)`
 
 | axis | name | size | meaning |
 |---|---|---|---|
 | 0 | `b` | | batch |
-| 1 | `c` | 12 | affine coefficient (§2.2) |
-| 2 | `k` | K = 8 | brightness bin; 0 is the darkest (lowest guidance) |
-| 3 | `y` | gy = 16 | cell row; 0 is the top |
-| 4 | `x` | gx = 16 | cell column; 0 is the left |
+| 1 | `c` | 2 | coefficient: 0 = gain, 1 = offset (§2.2) |
+| 2 | `k` | K = 8 | thermal-intensity bin; 0 is the darkest (lowest guidance) |
+| 3 | `y` | gy | cell row; 0 is the top |
+| 4 | `x` | gx | cell column; 0 is the left |
 
-This is PyTorch's 5-D `(N, C, D, H, W)` order (`K` is the depth axis), so `F.grid_sample` slices it directly (§3). Raw and standardized grids use the same layout. Per-pixel coefficient maps (output of `slice_grid`) are `(B, 12, H, W)` with the same channel order.
+This is PyTorch's 5-D `(N, C, D, H, W)` order (`K` is the depth axis), so `F.grid_sample` slices it directly (§3). The cells are the DINO patches: `(gy, gx) = input_size / 16`. A general one-input affine grid with `C` outputs (the bilateral guided upsampling of §6.3) has `2C` coefficient channels, output `c` at channels `2c` (gain) and `2c + 1` (offset): `out_c = coeffs[2c] · x + coeffs[2c + 1]`. Per-pixel coefficient maps (output of `slice_grid`) are `(B, 2C, H, W)` with the same channel order.
 
-### 2.2 Coefficient order
+### 2.2 Coefficients and units
 
-| `c` | 0 1 2 | 3 4 5 | 6 7 8 | 9 10 11 |
-|---|---|---|---|---|
-| meaning | `M[0,0] M[0,1] M[0,2]` | `M[1,0] M[1,1] M[1,2]` | `M[2,0] M[2,1] M[2,2]` | `t[0] t[1] t[2]` |
+`L = gain · thermal + offset`, then clamped to `[0, 1]`. **`L` is `L*/100`**, not linear luminance: the grid maps thermal straight to CIELAB lightness divided by 100, so the rendered `L*` is `100 · L`. This measured slightly better than fitting linear luminance (24.72 vs 24.52 dB on the oracle) and optimizes the quantity the plan evaluates. a\* and b\* stay in CIELAB units.
 
-`out_i = Σ_j M[i,j]·x_j + t_i`, `i` = output channel (R, G, B = 0, 1, 2), `j` = input channel. So `M = coeffs[:9].reshape(3, 3)` (row = output channel) and `t = coeffs[9:12]`: nine matrix entries row by row, then the three offsets. This is **not** the row-major flattening of the 3×4 matrix `[M | t]`. Identity is `[1,0,0, 0,1,0, 0,0,1, 0,0,0]` (`layout.IDENTITY_COEFFS`).
+### 2.3 Tokens for the velocity transformer: `(B, N, D)`
 
-Least-squares trap: with `Φ = [x, 1]` (N×4) and `Y` (N×3), `X = (ΦᵀWΦ + λI)⁻¹ ΦᵀWY` is 4×3, so `M = X[:3].T` and `t = X[3]`. Transpose before flattening.
+One layout, defined only in `dawn/flow/tokens.py` (`TokenLayout`). The velocity net's input and output width, the stats vector, the loss weights and the render path all derive from it.
 
-### 2.3 Tokens for the velocity transformer: `(B, 256, 96)`
+- **Token `n = y·gx + x`**, row-major. It is DINO patch `n`, brightness cell `n`, the thermal thumbnail pixel `n` and the 4×4 block of the colour map that those pixels cover.
+- **Values, in this order:**
 
-```python
-tokens = rearrange(grid,   "b c k y x -> b (y x) (k c)")                        # (B, 256, 96)
-grid   = rearrange(tokens, "b (y x) (k c) -> b c k y x", y=gy, x=gx, k=K, c=12)
-```
+| segment | count | value index `v` |
+|---|---|---|
+| brightness | `2K` = 16 | `v = k·2 + c`, bin-major, `c` ∈ {gain, offset} |
+| colour | 32 | `v = 2K + ch·16 + py·4 + px`: the token's 4×4 block covers colour pixels `(4y + py, 4x + px)`; `ch` = a\* then b\* |
+| correction (only when `brightness_correction.enabled`) | 16 | `v = 2K + 32 + py·4 + px`, the same 4×4 block, in `L` units |
 
-- Token index `n = y·gx + x` (row-major). This is also the order of DINO's 16×16 patch tokens and of the 16×16 thumbnail, so token `n`, patch `n` and cell `n` cover the same image region.
-- Value index inside a token `v = k·12 + c` (bin-major, coefficient-minor).
-- Implemented once, in `dawn/grid/layout.py` (`grid_to_tokens`, `tokens_to_grid`). Only `VelocityTransformer` works in tokens; `z_0`, `z_1`, `z_t`, `v`, the samplers and the losses all stay in the 5-D layout.
-- The one-to-one match of DINO patches and grid cells holds for a 16×16 grid and a 256×256 encoder input. A 32×32 grid (the oracle-check fallback) means 1,024 tokens, so revisit the conditioning before switching.
+  The correction is appended, so the base layout is identical in both modes. This is the plan's "16 brightness values, then 32 color values". `D` is 48 with the correction off and 64 with it on.
+- **Parts** (raw, what the pixel side sees): `grid (B, 2, K, gy, gx)`, `ab (B, 2, 4gy, 4gx)` and, only with the correction, `corr (B, 1, 4gy, 4gx)`. `TokenLayout.pack(parts)` gives `(B, N, D)`, `unpack` inverts it.
+- Only `VelocityTransformer` works on tokens, and the flow side (`z_0`, `z_1`, `z_t`, `v`, samplers, losses) stays in token tensors; parts exist at the boundaries (targets in, render out).
+- The layout is part of every checkpoint (`TokenLayout.descriptor()`); loading checks it.
 
 ### 2.4 Node weights ("pixel counts"): `(B, K, gy, gx)`
 
-For each node, the sum of the trilinear weights of every pixel that contributes to it. Returned by `fit_grid`, used by the flow loss's bin-count weighting (broadcast over the coefficient axis with `.unsqueeze(1)`).
+For each node, the sum of the trilinear weights of every pixel that contributes to it, each pixel counted by its fit weight (the mask). Returned by `fit_affine_grid`, used by the flow loss's brightness weighting (broadcast over the gain/offset values).
 
-## 3. Coordinates: cell centers
+## 3. Resolution and coordinates: cell centers
+
+**Resolution is one knob.** `encoder.input_size = (H, W)` (default `(512, 640)`) fixes everything: the token grid is `(H/16, W/16)` = `(32, 40)`, the colour map is 4× that, `(128, 160)`, and `flow.render_size` (default `(256, 320)`) is where L_render is computed. Nothing hard-codes these. Below the stored 512×640 the trainer area-downsamples thermal, rgb and the masks (as fractions) first (§4a). A checkpoint is tied to its resolution and loading checks it. The render size must be at least the colour-map size, and the colour map at most the input size.
 
 Grid values sit at cell **centers** (PyTorch's `align_corners=False`). For pixel `(r, c)` of an `H×W` image (integer indices) with guidance `g ∈ [0, 1]`:
 
@@ -92,95 +96,117 @@ zf = g * K - 0.5
 Clamp each coordinate to `[0, N-1]` (`N` = `gy`, `gx`, `K`), then `i0 = floor(f)`, `i1 = min(i0 + 1, N-1)`, `w1 = f - i0`, `w0 = 1 - w1`. A pixel's 8 corner nodes get the weights `w_y · w_x · w_z`, which sum to 1. Outside the outer cell centers the edge node wins entirely (replicate).
 
 - Bin `k` represents guidance `(k + 0.5) / K`. Never bin with `floor(g·K)` or `g·(K-1)`.
-- The grid spans whichever image tensor it was fit on or sliced on (fractions of `H` and `W`), so a grid fit at 256² slices at 2000×1500. A training crop is its own image.
+- The grid spans whichever image tensor it was fit on or sliced on (fractions of `H` and `W`), so a grid fit at 256×320 slices at 512×640. A training crop is its own image.
 - The equivalent `F.grid_sample(grid, coords, mode="bilinear", padding_mode="border", align_corners=False)` (`"bilinear"` is trilinear for 5-D input) takes `coords = (x_norm, y_norm, z_norm) = ((2c+1)/W - 1, (2r+1)/H - 1, 2g - 1)`: the image's own normalized pixel centers, and `2g - 1` for guidance.
-- **Single implementation:** `dawn.grid.slice.trilinear_weights(guidance, (K, gy, gx)) -> (node_index, weight)`, both `(B, 8, H, W)`. `node_index` is int64, flat over `(K, gy, gx)` as `k·gy·gx + y·gx + x`; `weight` is float32 and sums to 1 over dim 1; corner `n = 4·dz + 2·dy + dx`. `slice_grid` may use `F.grid_sample` for speed at full resolution, as long as `tests/test_grid_rules.py` (agreement with `trilinear_weights`) passes.
+- **Single implementation:** `dawn.grid.slice.trilinear_weights(guidance, (K, gy, gx)) -> (node_index, weight)`, both `(B, 8, H, W)`. `node_index` is int64, flat over `(K, gy, gx)` as `k·gy·gx + y·gx + x`; `weight` is float32 and sums to 1 over dim 1; corner `n = 4·dz + 2·dy + dx`. `slice_grid` uses `F.grid_sample` for speed, as long as `tests/test_grid_rules.py` (agreement with `trilinear_weights`) passes. `fit_affine_grid` and `bilateral_guided_upsample` take their weights from `trilinear_weights` only.
 
 ## 4. Guidance
 
-`dawn.grid.guidance.compute_guidance(image_linear) -> (B, 1, H, W)` in `[0, 1]`:
+`dawn.grid.guidance.compute_guidance(thermal) -> (B, 1, H, W)` in `[0, 1]`:
 
-1. `Y = 0.2126 R + 0.7152 G + 0.0722 B` (Rec. 709 weights, on **linear** RGB).
-2. 5×5 box blur (mean filter, stride 1, same size) with **replicate** padding. Zero padding darkens the borders and puts border pixels in the wrong bin.
-3. `Y = clamp(Y, 1e-4, 1)`.
-4. `log10(Y)`.
-5. Map `[-4, 0]` to `[0, 1]`: `g = (log10(Y) + 4) / 4`.
+1. 5×5 box blur (mean filter, stride 1, same size) with **replicate** padding of the one-channel thermal (`code / 255`). Zero padding darkens the borders and puts border pixels in the wrong bin.
+2. Clamp to `[0, 1]`.
 
-Guidance is computed from the image that is being indexed. Fitting, rendering in the flow loss, and `check_oracle.py` use `compute_guidance(night_clean)`; inference and stage-2 training use `compute_guidance(night)`.
+That is all: no log (thermal is not photon-starved like a dark photo) and no per-frame stretch (a p1–p99 stretch measured +0.06 dB because thermal already spans most of `[0, 1]`). Guidance is computed from the thermal that is being indexed, at the resolution it is being indexed at; the blur is a fixed 5×5 **pixels** (§9). It is the only guidance implementation; the bilateral guided upsampling of §6.3 passes `L` as its own guide and calls nothing else.
 
 ## 4a. Downsampling: area averaging
 
 Every downsample in the project is area averaging, in training, inference, grid fitting and data preparation alike, and it goes through one function: `dawn.data.resample.area_downsample(img, (h, w))`.
 
 - Each output pixel is the mean of the input over its footprint, `[i·s, (i+1)·s)` with `s = H_in / h_out` (likewise for width). Input pixels that straddle a footprint edge count by their overlap. For an integer factor this is the plain block mean; for any factor it preserves the image mean. (PIL's `BOX` filter is not this: it weights pixels 0 or 1 by where their center falls.)
-- Downsample **linear** images. Averaging sRGB values makes bright lights come out too dim.
+- Downsample **linear** RGB images. Averaging sRGB values makes bright lights come out too dim. Thermal codes are averaged as they are (§1).
+- **Lab channels are averaged as values.** The a\*b\* colour target, the correction target and the BGU's low-resolution guide are area averages of L\* / a\* / b\* values, not of linear RGB, because the model predicts in Lab and the target must be the quantity it predicts. §4a's linear-RGB rule is about images; the Lab maps are targets, and the RGB image that L_render compares against is area-downsampled in linear light first and only then converted to Lab.
+- **Masks are fractions.** A boolean mask is downsampled to the fraction of its footprint that is kept, and used as a **weight**, never thresholded.
+- **A masked low-resolution target is the masked mean** `area(x · m) / area(m)`. Where `area(m) == 0` the target is filled with a neutral value (0) and its weight is 0.
 - Use `fit_long_side(H, W, long_side)` for the output size of an aspect-preserving resize. It never upsamples.
-- Why it matters beyond looks: an area-averaged pixel is exactly what a sensor with `n` times bigger pixels records, so the noise of a downsampled image follows from the native noise (§6). The 2000×1500 → 256×256 DINO input averages about 46 native pixels per input pixel, and training must see the same noise reduction, not noise added after downsampling.
 
-## 5. Raw vs standardized grids
+## 5. Raw vs standardized tokens
 
-One layout (§2.1), two spaces:
+Raw parts (§2.3) are physical numbers; the flow works in standardized tokens.
 
-| | raw | standardized (`_std`) |
+### 5.1 Stats
+
+Per **segment**, so a bin-0 offset and a bin-7 offset never share a mean (they live on different scales), and the colour and correction values pool over pixels:
+
+| segment | stats shape | pooled over |
 |---|---|---|
-| what | physical affine coefficients | `(raw - mean) / std` per (coefficient, bin) |
-| produced by | `fit_grid` | `standardize(raw)` |
-| consumed by | `slice_grid`, `apply_affine`, `propagate_variance`, rendering, the denoiser: anything touching pixels | `z_0`, `z_1`, `z_t`, `v`, `VelocityTransformer`, the samplers, the velocity loss |
-| names | `grid`, `grid_raw`, `coeffs` (per pixel) | `grid_std`, `z_*`, `v` |
+| brightness | `(2, K)`, `[c, k]` | cells, not bins |
+| colour | `(2,)`, a\* then b\* | colour pixels, weighted by the mask fraction |
+| correction | `(1,)` | colour pixels, weighted by the mask fraction |
 
-- Stats `mean` and `std` are float32 `(12, K)` (same `(c, k)` order as the grid) and broadcast as `(1, 12, K, 1, 1)`. They are computed once over raw fitted grids (`compute_grid_stats`) and cached at `grid.stats_cache`. **A checkpoint embeds the stats it was trained with**; inference reads them from the checkpoint, never from the cache file.
-- Conversion happens only through `standardize` / `unstandardize` (`dawn/grid/normalize.py`), and only here:
-  1. Training target: `z_1 = standardize(fit_grid(...)[0])`.
-  2. Render loss: `z1_hat = z_t + (1 - t)·v_pred` is standardized, so `unstandardize`, then `slice_grid`, then `apply_affine`, then compare with `day`. `FlowMatchingLoss` only receives the rendered image (`applied_pred`); it never sees stats.
-  3. Inference: `dawn.flow.sampler.sample_grid` integrates in standardized space and `unstandardize`s once before returning, so what a caller gets back is already raw and goes straight to `slice_grid`.
-  4. Stage 2: fitted grids are already raw; flow-predicted grids go through `unstandardize` first.
-- Nothing else multiplies or divides by stats. A docstring that takes a grid states raw or standardized.
-- Flow time: `t = 0` is noise, `t = 1` is data. `z_t = (1 - t)·z_0 + t·z_1`, `v_target = z_1 - z_0`, samplers integrate 0 → 1.
-- **NFE is velocity evaluations, not steps.** Euler spends one per step, midpoint two, so `nfe = 2` is two Euler steps but a single midpoint step. `flow.num_inference_steps` is an NFE budget; `steps_for_nfe` converts.
+`mean` and `std` for each segment are float32. `TokenLayout.stats_vector(stats)` flattens them into the `(D,)` mean and std that `standardize` and `unstandardize` take: brightness `v = k·2 + c`, each colour channel repeated over its 16 block pixels, the correction repeated likewise. `compute_token_stats` fits the targets (§5.3) of `grid.stats_num_samples` unaugmented train pairs, once; the result is cached at `grid.stats_cache`, keyed by the layout and the fit settings, and recomputed on a mismatch. **A checkpoint embeds the stats and the layout descriptor it was trained with**; inference reads them from the checkpoint, never from the cache file.
 
-## 6. Noise model
+### 5.2 Conversion points
 
-`Var[y | x] = a·x + b` per pixel and channel, in linear `[0, 1]` units. `a` is the shot-noise gain, `b` the read-noise **variance** (σ², not a standard deviation). Both are positive. `NoiseHead` predicts the natural logs `(log a, log b)`; `sensor_variance` takes raw `a`, `b`.
+`dawn.grid.normalize.standardize(tokens, mean, std)` and `unstandardize` are the only places tokens change space (`std` is floored at 1e-6 by both, so they stay exact inverses):
 
-**Per channel.** `(a, b)` are `(3,)` tensors, not scalars. Everything after the sensor is a per-channel linear scale `s_c = gain · wb_c`, and a scale `s` takes `a → s·a` but `b → s²·b`, so the channel the white balance pushes hardest is disproportionately the noisiest. `CameraResult` and `DegradationResult` both carry `(3,)`; a single number is only ever a summary for reporting.
+1. Training target: `z_1 = standardize(pack(targets))`.
+2. Render loss: `ẑ_1 = z_t + (1 - t)·v_pred` is standardized, so `unstandardize`, `unpack`, then `render`, then compare with the RGB. `FlowLoss` only receives the rendered image; it never sees stats.
+3. Sampling: `dawn.flow.sampler.sample_parts` integrates in standardized space and unstandardizes **once** before returning, so what a caller gets back is already raw parts that go straight to `render`.
 
-**Resolution.** `(a, b)` are recorded at **native** resolution (the raw camera frame). A pixel that area-averages `n` native pixels (§4a) has `Var = (a/n)·x + b/n`: a sum of Poisson counts is Poisson and read-noise variances add, so this is exact. The camera model therefore simulates binned pixels: a 512-px training pixel stands for `n = W·H / (w·h)` native pixels, which is why `VisDroneDataset` returns `native_size` with every image.
+Nothing else multiplies or divides by stats. A docstring that takes tokens or parts states raw or standardized.
 
-**Quantization.** The ADC digitizes native pixels, so `quant_var = step²/12` is reported at native resolution like `a` and `b` and divides by `n` with them. A simulated pixel that averages `n` 12-bit samples lands on a lattice `n` times finer. The full budget at the returned resolution is computed by `DegradationResult.variance()`, which uses the ISP matrices. Off the native path (where S and M are identity), it simplifies to:
+### 5.3 Targets and the pixel mask
 
-```
-Var[y_c] = (a_c · y_c + b_c + quant_var) / n
-```
+Targets are built on the device in float32 with no gradient, from the thermal, the RGB and the pixel mask `M` (`flow.targets.build_targets`):
 
-JPEG and the final 8-bit step are nonlinear and are **not** in the budget.
+- **Pixel mask** `M = valid & ~moving` for box-aligned pairs and `valid & ~vehicles` for `fallback` pairs (`configs/flow.yaml: pairs`), as a float fraction at the working resolution. It zeroes the fit weights and every pixel loss.
+- `L = L*/100` of the RGB. Brightness grid and node weights: `fit_affine_grid(thermal, L, compute_guidance(thermal), weights=M, ...)` at `grid.refine_steps` (1). Oracle `L_grid` = that grid rendered.
+- Colour target: the masked area average of a\*b\* to the colour-map size; weight = the area-averaged mask. Correction target (only when enabled): the masked area average of `L - L_grid` (the **fitted target grid**, at the configured `refine_steps`), same weight.
+- **Weights** (`TokenLayout.weights`, normalized to mean 1 per segment per sample, all zero when a segment has no weight): brightness values take the node weights broadcast over gain/offset; colour and correction values take the mask fraction of their pixel.
 
-**The ISP.** On the native path only, the ISP applies a colour-specific denoise blur (on C1, C2) and a composite denoise and unsharp mask. Because these are linear filters that mix channels, the variance of the output `y` involves a mixing matrix `S` and a DC colour matrix `M`:
+### 5.4 Flow time and NFE
 
-```
-x = M⁻¹ y
-Var[y] = S (a · x + b + quant_var) / n
-```
+`t = 0` is noise, `t = 1` is data. `z_t = (1 - t)·z_0 + t·z_1`, `v_target = z_1 - z_0`, samplers integrate 0 → 1. **NFE is velocity evaluations, not steps.** Euler spends one per step, midpoint two, so `nfe = 2` is two Euler steps but a single midpoint step. `flow.num_inference_steps` is an NFE budget; `steps_for_nfe` converts.
 
-where `S[i, j] = Σ_tap W[i, j, tap]²` and `M[i, j] = Σ_tap W[i, j, tap]` for the composite 3×3 channel kernel `W`. `CameraResult` reports `S` and `M` directly, and `DegradationResult.variance()` evaluates this exact formula. Off the native path, `S` and `M` are the identity.
+## 6. Colour map, a\*b\* bins, bilateral guided upsampling and the render path
+
+### 6.1 The 261 a\*b\* bins
+
+`dawn.flow.color_bins` derives them in code, deterministically: map every 8-bit sRGB colour to CIELAB (§1), round a\* and b\* to a 10-unit grid, keep the occupied cells. That gives **261** bins (a\* −90…100, b\* −110…90), sorted by a\* then b\*, identical when only every second code is used. This replaces the plan's 313 (Zhang et al.'s set is for the full Lab gamut, ours is the sRGB gamut we can render). Soft encoding (`soft_encode`) is Zhang's: the `color.soft_k` (5) nearest bins with a Gaussian of `color.soft_sigma` (5) over the distance in a\*b\* units, normalized to sum to 1.
+
+`patch_histograms(ab_map, mask, patch_size)` gives the per-token soft histogram `(B, N, Q)`: the masked mean of the soft encodings of the a\*b\* pixels in each patch. It is built from the a\*b\* at **render size** (8×8 samples per patch at the default 256×320), not at full resolution, to keep the cost down; `patch_mask_fraction` gives the patch's kept fraction, and L_color counts a patch 0 below `color.min_patch_fraction`.
+
+### 6.2 The correction is optional
+
+`brightness_correction.enabled` (default **false**) adds a generated `L` correction at the colour-map size. Its target is `L - L_grid(fitted target grid)` as a masked area average (§5.3); it is applied through the same bilateral guided upsampling as colour, guided by the grid's `L`, so its edges still come from thermal.
+
+### 6.3 Bilateral guided upsampling (Chen et al., 2016)
+
+`dawn.grid.upsample.bilateral_guided_upsample(low, guide_lo, guide_hi, weights_lo=None)`: fit, at low resolution, a per-(cell, bin) affine of `low` on its own guide `guide_lo` (both the regressor and the bin guidance) with `fit_affine_grid`, then slice that grid at `guide_hi` and apply it to `guide_hi`. The guides are `L` in `[0, 1]` and are treated as constants (no gradient through the bin assignment); the result is differentiable with respect to `low`, which is how L_render reaches the colour tokens. Grid size, bins and ridge are `color.bgu`, chosen with `scripts/check_oracle.py` against the bilinear baseline.
+
+### 6.4 The render path
+
+`dawn.flow.render.render(parts, thermal, size, settings) -> {"lab", "rgb", "L_grid"}`, float32, is the only path from raw parts to pixels. L_render (at `flow.render_size`), validation and the oracle (at the input size) and inference all use it.
+
+1. Area-downsample `thermal` to `size` if it is larger.
+2. `g = compute_guidance(thermal_s)`; `L_grid = clamp(gain · thermal_s + offset, 0, 1)` from `slice_grid(grid, g)`.
+3. With the correction: `L = clamp(L_grid + BGU(corr, area(L_grid → colour size), L_grid), 0, 1)`; otherwise `L = L_grid`.
+4. `ab = BGU(ab_lo, area(L → colour size), L)`: colour is guided by the **output** `L`, so colour edges follow brightness edges.
+5. `lab = (100 · L, ab)`; `rgb = clamp(lab_to_linear(lab), 0, 1)` (clipped to the gamut).
 
 ## 7. Shapes at module boundaries
 
 | API | In → out |
 |---|---|
-| `compute_guidance(image_linear)` | `(B,3,H,W)` → `(B,1,H,W)` |
+| `compute_guidance(thermal)` | `(B,1,H,W)` → `(B,1,H,W)` |
 | `trilinear_weights(guidance, (K,gy,gx))` | `(B,1,H,W)` → `node_index`, `weight`: `(B,8,H,W)` |
-| `fit_grid(night_clean, day, guidance)` | `(B,3,H,W)` ×2, `(B,1,H,W)` → raw `grid (B,12,K,gy,gx)`, `node_weights (B,K,gy,gx)` |
-| `slice_grid(grid, guidance)` | raw grid, `(B,1,H,W)` → `coeffs (B,12,H,W)` |
-| `apply_affine(coeffs, image)` | `(B,12,H,W)`, `(B,3,H,W)` → `(B,3,H,W)`, clamped |
-| `standardize` / `unstandardize(grid, mean, std)` | grid `(B,12,K,gy,gx)`, stats `(12,K)` |
-| `DINOEncoder.forward(image_linear)` | `(B,3,256,256)` → `patch_tokens (B,256,384)`, `cls_token (B,384)`, and with `return_attn` also `patch_attn (B,256,256)`: last layer, head-averaged, CLS and the 4 register tokens stripped, rows renormalized to sum to 1, detached |
-| `DINOEncoder.encode(image_linear)` | `(B,3,256,256)` → dict: `patch_tokens (B,256,384)`, `patch_map (B,384,16,16)` (the same tokens, row-major), `cls (B,384)`, `thumb (B,3,16,16)` = `log(area_downsample(linear) + 1e-3)`, and with `return_attn` also `attn_bias (B,1,256,256)` = `log(patch_attn + 1e-6)` |
-| `VelocityTransformer(z_t, t, dino_features, dino_attn, thumb)` | `(B,12,K,gy,gx)`, `(B,)`, `(B,256,384)`, `(B,256,256)`, `(B,3,gy,gx)` → `v (B,12,K,gy,gx)`. `attn_bias (B,1,256,256)` may be passed instead of `dino_attn` |
-| `euler_sample(velocity_fn, z_0, n)` | `(B,12,K,gy,gx)` → same, standardized |
-| `sample_grid(velocity_model, dino_features, mean, std, …)` | `(B,256,384)`, stats `(12,K)` → `(num_samples,B,12,K,gy,gx)` **raw** |
-| `NoiseHead(cls_token)` | `(B,384)`, or `(B,256,384)` patch tokens which are mean-pooled first → `(B,2)` = `(log a, log b)` at native resolution |
-| `propagate_variance(coeffs, sigma_sq_in)` | `(B,12,H,W)`, `(B,3,H,W)` → `(B,3,H,W)` |
-| `BoundedDenoiser(enhanced, log_variance)` | `(B,3,H,W)` linear, `(B,1,H,W)` → `(B,3,H,W)` linear |
+| `fit_affine_grid(x, y, guidance, weights, grid_size, ridge_alpha, refine_steps)` | `x (B,1,H,W)`, `y (B,C,H,W)`, `guidance (B,1,H,W)`, `weights (B,1,H,W)` or None → raw `grid (B,2C,K,gy,gx)`, `node_weights (B,K,gy,gx)` |
+| `slice_grid(grid, guidance)` | raw grid `(B,C',K,gy,gx)`, `(B,1,H,W)` → `coeffs (B,C',H,W)` |
+| `apply_gain_offset(coeffs, x, clamp)` | `(B,2C,H,W)`, `(B,1,H,W)` → `(B,C,H,W)`, clamped to `[0,1]` when `clamp` |
+| `bilateral_guided_upsample(low, guide_lo, guide_hi, weights_lo)` | `(B,C,h,w)`, `(B,1,h,w)`, `(B,1,H,W)`, `(B,1,h,w)` or None → `(B,C,H,W)` |
+| `TokenLayout.pack(parts)` / `unpack(tokens)` | parts `grid (B,2,K,gy,gx)`, `ab (B,2,4gy,4gx)`, `corr (B,1,4gy,4gx)` ↔ `(B,N,D)` |
+| `TokenLayout.stats_vector(stats)` / `weights(node_weights, fraction)` | per-segment stats → `(D,)` mean and std; `(B,K,gy,gx)`, `(B,1,4gy,4gx)` → `(B,N,D)` |
+| `standardize` / `unstandardize(tokens, mean, std)` | tokens `(B,N,D)`, stats `(D,)` |
+| `render(parts, thermal, size, settings)` | raw parts, `(B,1,H,W)`, `(h,w)` → `lab (B,3,h,w)`, `rgb (B,3,h,w)`, `L_grid (B,1,h,w)` |
+| `DINOEncoder.forward(thermal)` | `(B,1,H,W)` → `patch_tokens (B,N,384)`, `cls_token (B,384)`, and with `return_attn` also `patch_attn (B,N,N)`: last layer, head-averaged, CLS and the 4 register tokens stripped, rows renormalized to sum to 1, detached |
+| `DINOEncoder.forward_frozen(rgb_linear)` | `(B,3,H,W)` linear, adapters disabled, no gradient → the same `EncoderOutput`: the L_align target |
+| `DINOEncoder.encode(thermal)` | `(B,1,H,W)` → dict: `patch_tokens (B,N,384)`, `patch_map (B,384,gy,gx)`, `cls (B,384)`, `thumb (B,1,gy,gx)` = `area_downsample(thermal, (gy,gx))`, and with `return_attn` also `attn_bias (B,1,N,N)` = `log(patch_attn + 1e-6)` |
+| `VelocityTransformer(z_t, t, dino_features, dino_attn, thumb)` | `(B,N,D)`, `(B,)`, `(B,N,384)`, `(B,N,N)`, `(B,1,gy,gx)` → `v (B,N,D)`. `attn_bias (B,1,N,N)` may be passed instead of `dino_attn` |
+| `ColorHead(patch_tokens)` | `(B,N,384)` → logits `(B,N,Q)` (training only) |
+| `soft_encode(ab)` / `patch_histograms(ab_map, mask, patch_size)` | `(...,2)` → `(...,Q)`; `(B,2,h,w)`, `(B,1,h,w)` → `(B,N,Q)` |
+| `euler_sample(velocity_fn, z_0, n)` | `(B,N,D)` → same, standardized |
+| `sample_parts(velocity_model, dino_features, layout, mean, std, …)` | `(B,N,384)`, `(D,)` stats → dict of **raw** parts, each with leading `(num_samples, B)` |
 | `area_downsample(img, (h, w))` | `(..., H, W)` float → `(..., h, w)`, same dtype and device |
 | `read_rgb8(path)` / `read_thermal8(path)` | JPEG path → `(3, 712, 840)` / `(1, 712, 840)` uint8 raw codes (thermal: one channel, after checking that a 3-channel file's channels are identical) |
 | `crop_border(img)` | `(..., 712, 840)` → `(..., 512, 640)` |
@@ -188,24 +214,32 @@ where `S[i, j] = Σ_tap W[i, j, tap]²` and `M[i, j] = Σ_tap W[i, j, tap]` for 
 | `warp_thermal(thermal, T, (512, 640))` | `(1, H_t, W_t)` float, `T (3, 3)` thermal → RGB → `(1, 512, 640)` float32 warped, `(1, 512, 640)` bool valid |
 | `moving_mask(...)` | boxes, matches, `T` → `(1, 512, 640)` bool, count |
 | `linear_to_lab` / `lab_to_linear` | `(..., 3, H, W)` ↔ `(..., 3, H, W)` float32 |
+| `masked_psnr(pred, target, mask, peak)` | `(B,C,H,W)` ×2, `(B,1,H,W)` → `(B,)` dB |
+| `ciede2000(lab_1, lab_2)` | `(..., 3, H, W)` ×2 → `(..., H, W)` |
+| `colorfulness(srgb)` | `(B,3,H,W)` in 0–255 → `(B,)` |
 | `AlignedPairs[i]` | dict: `thermal (1, 512, 640)` float32 = code / 255, `rgb (3, 512, 640)` linear float32, `valid`, `moving` and `vehicles` `(1, 512, 640)` bool, `image_id` str, `fallback` bool (aligned by edge correlation, see §10.2). Training adds flips (all four tensors alike) and a thermal-only monotone contrast curve; validation and test are deterministic |
 
 ## 8. Rules
 
-1. **One trilinear implementation.** `fit.py` gets node indices and weights from `slice.trilinear_weights`. It never computes `floor`, corner weights or coordinates itself.
-2. **One guidance function.** Fitting, slicing, rendering, inference, stage 2 and every script call `compute_guidance`. No inline luminance or `log10` code anywhere else.
-3. **One layout module.** Token reshapes and coefficient-order constants come from `dawn/grid/layout.py`; no ad-hoc `permute` / `view` of grids.
-4. **One conversion point for standardization** (§5).
-5. **One downsampling function.** `area_downsample` on linear images (§4a); no `F.interpolate`, PIL `resize` or `thumbnail` to shrink an image anywhere else.
+1. **One trilinear implementation.** `fit.py` and `upsample.py` get node indices and weights from `slice.trilinear_weights`. They never compute `floor`, corner weights or coordinates themselves.
+2. **One guidance function.** Fitting, slicing, rendering, inference and every script call `compute_guidance`. No inline blur or clamp code anywhere else.
+3. **One token layout.** `dawn/flow/tokens.py` is the only place that packs, unpacks, slices or counts token values; the coefficient constants come from `dawn/grid/layout.py`. No ad-hoc `permute` / `view` of parts, no 16 / 32 / 48 / 64 literal outside the one layout test.
+4. **One conversion point for standardization** (§5.2).
+5. **One downsampling function.** `area_downsample` (§4a); no `F.interpolate`, PIL `resize` or `thumbnail` to shrink an image anywhere else. (The bilinear *up*sample inside a baseline in `check_oracle.py` is the one `F.interpolate` use: it is the thing the BGU is compared against.)
 6. **Conventions change here first.** If one has to change, edit this file in the same commit as the code and update the affected docstrings.
 7. **One thermal resample.** `align.warp_thermal` is the only place thermal is resampled: bilinear inverse mapping onto the RGB frame. It interpolates at arbitrary positions rather than shrinking an image, so it is the one sanctioned resample that is not an area average (§4a is about downsampling). The RGB image is never resampled.
 8. **Thermal is never sRGB** (§1), and the RGB target is never touched beyond the crop.
+9. **One render path.** `flow.render.render` (§6.4). L_render, validation, the oracle and inference do not re-implement any step of it.
+10. **`fit.py` and `upsample.py` use `slice.py`'s weights** (rule 1): the fitted grid and the rendered grid cannot drift apart.
+11. **Lab is averaged as values** (§4a): targets are masked area averages in Lab, masks are fractions.
 
 ## 9. Known limitations
 
-- The guidance blur is a fixed 5×5 **pixels**. At 256² training 5 px is 2% of the width; at 2000×1500 inference it is 0.25%, so the effective smoothing differs. If bins flicker at full resolution, scale the kernel with resolution and update §4.
-- The 16×16 grid, 256-token layout and DINO patch correspondence in §2.3 are coupled; changing the grid size means changing the conditioning.
-- **Splat-and-solve is biased.** `fit_grid` solves each node against the pixels that touch it, as if that node alone applied to them; the renderer then blends 8 nodes per pixel. The two disagree wherever the grid changes quickly from node to node, so a fitted grid does not re-render its own target exactly even with no noise anywhere. The error is small on smooth grids and is what `refine_steps` buys down, by fitting the render residual and adding the correction. Judge a fit on the **rendered** image, never on coefficient error against a reference grid.
+- The guidance blur is a fixed 5×5 **pixels**. At render size (256×320) 5 px is 1.6% of the width; at the 640×512 input it is 0.8%, so the effective smoothing differs between L_render and validation. If bins flicker at full resolution, scale the kernel with resolution and update §4.
+- **Splat-and-solve is biased.** `fit_affine_grid` solves each node against the pixels that touch it, as if that node alone applied to them; the renderer then blends 8 nodes per pixel. The two disagree wherever the grid changes quickly from node to node, so a fitted grid does not re-render its own target exactly even with no noise anywhere. The error is small on smooth grids and is what `refine_steps` buys down (about +0.5 dB), by fitting the render residual and adding the correction. Judge a fit on the **rendered** image, never on coefficient error against a reference grid.
+- **BGU sparsity.** The upsampling grid is small and has many empty (cell, bin) nodes; they take their cell's fit through the ridge, so a colour that appears in only one bin of one cell is smoothed toward its neighbours. `check_oracle.py` reports the colour ceiling against plain bilinear upsampling.
+- The token layout, the DINO patch grid and the brightness cells are one grid (§2.3); changing the encoder resolution changes all three together, and a checkpoint cannot be loaded at another resolution.
+- The 261 bins come from the sRGB gamut, so a\*b\* cells the model could generate outside it do not exist as classes; the render clips to the gamut anyway.
 
 ## 10. Data: DroneVehicle pairs, alignment, determinism
 
