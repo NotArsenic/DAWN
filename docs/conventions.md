@@ -137,15 +137,22 @@ One layout (§2.1), two spaces:
 
 **Resolution.** `(a, b)` are recorded at **native** resolution (the raw camera frame). A pixel that area-averages `n` native pixels (§4a) has `Var = (a/n)·x + b/n`: a sum of Poisson counts is Poisson and read-noise variances add, so this is exact. The camera model therefore simulates binned pixels: a 512-px training pixel stands for `n = W·H / (w·h)` native pixels, which is why `VisDroneDataset` returns `native_size` with every image.
 
-**Quantization.** The ADC digitizes native pixels, so `quant_var = step²/12` is reported at native resolution like `a` and `b` and divides by `n` with them. A simulated pixel that averages `n` 12-bit samples lands on a lattice `n` times finer. The full budget at the returned resolution is
+**Quantization.** The ADC digitizes native pixels, so `quant_var = step²/12` is reported at native resolution like `a` and `b` and divides by `n` with them. A simulated pixel that averages `n` 12-bit samples lands on a lattice `n` times finer. The full budget at the returned resolution is computed by `DegradationResult.variance()`, which uses the ISP matrices. Off the native path (where S and M are identity), it simplifies to:
 
 ```
 Var[y_c] = (a_c · y_c + b_c + quant_var) / n
 ```
 
-which is `DegradationResult.variance()`. JPEG and the final 8-bit step are nonlinear and are **not** in it.
+JPEG and the final 8-bit step are nonlinear and are **not** in the budget.
 
-**The ISP.** On the native path only, the denoise blur and the unsharp mask are linear and each multiplies a white-noise variance by the sum of its squared weights, so `a`, `b` and `quant_var` are all scaled by that one factor (`CameraResult.isp_var_scale`). This is the same relation `scripts/calibrate_noise.py` runs backwards to turn a measured effective `(a, b)` into the sensor constants in `configs/camera_calib.yaml`.
+**The ISP.** On the native path only, the ISP applies a colour-specific denoise blur (on C1, C2) and a composite denoise and unsharp mask. Because these are linear filters that mix channels, the variance of the output `y` involves a mixing matrix `S` and a DC colour matrix `M`:
+
+```
+x = M⁻¹ y
+Var[y] = S (a · x + b + quant_var) / n
+```
+
+where `S[i, j] = Σ_tap W[i, j, tap]²` and `M[i, j] = Σ_tap W[i, j, tap]` for the composite 3×3 channel kernel `W`. `CameraResult` reports `S` and `M` directly, and `DegradationResult.variance()` evaluates this exact formula. Off the native path, `S` and `M` are the identity.
 
 ## 7. Shapes at module boundaries
 
@@ -186,19 +193,21 @@ which is `DegradationResult.variance()`. JPEG and the final 8-bit step are nonli
 
 ## 10. Data: manifests, degradation, determinism
 
-### 10.1 The four manifests
+### 10.1 The five manifests
 
-`scripts/prepare_visdrone.py split` ends by writing exactly four files, `<manifest_dir>/<name>.txt`, one image ID per line, sorted (`dawn/data/splitting.py: FINAL_SUBSETS`). Training, evaluation and the oracle check read these and nothing else.
+`scripts/prepare_visdrone.py split` ends by writing exactly five files, `<manifest_dir>/<name>.txt`, one image ID per line, sorted (`dawn/data/splitting.py: FINAL_SUBSETS`). Training, evaluation and the oracle check read these and nothing else.
 
 | manifest | what is in it |
 |---|---|
 | `train_day` | daytime sources for the degradation, drawn from `train` + `val` |
 | `val_day` | about 10% of the train+val **groups**, held out whole |
 | `test_day` | the daytime images of `test-dev`, left exactly as the dataset ships them |
-| `hard_test` | real night frames: the only images that are never synthesized |
+| `hard_test` | real near-black night frames (`lum_median <= hard_test_max_lum`): the only images that are never synthesized |
+| `night_normal` | real ordinary night frames (`lum_median > hard_test_max_lum`): qualitative comparison only, never synthesized |
 
-- A **group** is a video sequence ID, or the collection ID for a `99999xx` still collection (`splitting.group_id`). Consecutive frames of a VisDrone video are near-duplicates, so an image-level split puts almost the same picture on both sides and validation stops measuring anything. Whole groups move together, and `train_day`, `val_day` and `test_day` are checked to share no group ID on every build.
+- A **group** is a video sequence ID, or the collection ID for a `99999xx` still collection (`splitting.group_id`). Consecutive frames of a VisDrone video are near-duplicates, so an image-level split puts almost the same picture on both sides and validation stops measuring anything. Whole groups move together, and `train_day`, `val_day` and `test_day` are checked to share no group ID on every build (both `hard_test` and `night_normal` are excluded from the disjointness check).
 - The hand labels in `data/labels/visdrone_labels.csv` are **never written by code**. Their vocabulary (day / night / dusk / exclude) becomes this project's through `split.label_map` in data.yaml, which is also the only place to change it.
+- Frames labelled `night` are split into `hard_test` and `night_normal` by the cutoff `split.night.hard_test_max_lum` in data.yaml (default 0.005). Empirically, 20 night-labelled frames are genuinely near-black (`lum_median <= 0.005`) while the other 100 are ordinary usable night (`lum_median >= 0.0086`, a clean gap).
 - A label on a sequence applies to every frame of that sequence; a label on a single image overrides its sequence.
 - The `99999xx` still collections carry no hand label. They are auto-accepted as day by cutoffs on median luminance and highlight ratio, fitted to make **zero** errors on the hand-labelled frames, and 200 random accepted stills are written to a contact sheet so a person can check what the cutoffs let through.
 
@@ -209,8 +218,8 @@ which is `DegradationResult.variance()`. JPEG and the final 8-bit step are nonli
 - **`night_clean` is the same camera pipeline with the noise draws replaced by their means and the JPEG skipped**, so `night_clean = E[night]` up to clipping. It is *not* the scene radiance: it already carries the exposure gain, the white balance and the ISP filters. Grid fitting is always `night_clean → day`, at the same resolution.
 - With the noise switched off, `night == night_clean` exactly.
 - The flow path returns a fixed 256×256. The daytime frame is area-downsampled **first** (§4a) and the sensor then simulates pixels `n` times bigger, rather than adding native-strength noise to a small image. The native path (denoiser crops) uses `n = 1` and is the only path that applies the in-camera denoise and sharpening.
-- Lighting modes are `moonlit`, `streetlit` and `starlight`. `streetlit` and `starlight` need an overcast-looking source image (low p95/p05 of linear luminance); `moonlit` takes any.
-- Training takes a fresh random draw on every call, which is what makes the degradation an augmentation. Validation and test use fixed seeded sets at three darkness levels, `easy` / `medium` / `hard`, which are quantile bands of the `n_white` range: `hard` is darker *and* noisier because the auto-exposure gain caps out and the frame stays dark.
+- Lighting modes are `moonlit`, `streetlit` (~65-75% of renders) and `starlight`. `streetlit` always has 1-8 lamp pools (20-400× ambient) and together with `starlight` scales with source overcast score (low p95/p05 luminance ratio); `moonlit` takes any. Small emissive points (lit window clusters, headlight and taillight pairs, saturated signs) are added directly to scene radiance (`radiance = reflectance * illumination + emission`) and are deliberately absent from the day target. Emitters use area-coverage rendering so integrated energy is resolution-independent.
+- Training takes a fresh random draw on every call, which is what makes the degradation an augmentation. Validation and test use fixed seeded sets at three darkness levels, `easy` / `medium` / `hard`, which are quantile bands of the target brightness distribution: `hard` is darker because the auto-exposure target is sampled from the darkest 33% of real night frames. The photon count is drawn to hit the target; if it hits the bounds of its range, the frame stays dark and the gain caps out.
 
 ### 10.3 Determinism: the seed comes from the image ID
 

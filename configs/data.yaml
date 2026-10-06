@@ -17,15 +17,22 @@ visdrone:
     drop_categories: [0, 11]  # 0 ignored regions, 11 "others"
     min_size: 16              # px on either side, at the returned resolution
 
-# Phase 2 of prepare_visdrone.py: hand labels -> train_day / val_day / test_day / hard_test.
+# Phase 2 of prepare_visdrone.py: hand labels -> the five manifests.
 # dawn/data/prepare.py. The hand labels are never edited; `label_map` is how their vocabulary
-# (day / night / dusk / exclude) becomes this project's (day / hard_test / dropped).
+# (day / night / dusk / exclude) becomes this project's (day / night / dropped).
 split:
   label_map:
     day: day
-    night: hard_test
+    night: night
     dusk: null        # neither a clean day source nor a real night test: dropped
     exclude: null
+  # Of the 120 night-labelled frames, 20 are genuinely near-black (lum_median <= 0.005,
+  # highlight ratio 181-6,877, 18-75% of pixels at exactly code 0; sequences 0000109-0000114
+  # plus 0000056_00727_d_0000111 and 0000071_03136_d_0000003), and 100 are ordinary usable
+  # night (lum_median >= 0.0086, empirical gap between 0.0049 and 0.0086). Only the near-black
+  # frames go to hard_test; the rest go to the fifth manifest, night_normal.
+  night:
+    hard_test_max_lum: 0.005
   # 99999xx still collections carry no hand label. They are auto-accepted as day when their
   # median luminance is high enough and their highlight ratio low enough; the two cutoffs are
   # chosen on the hand-labelled video frames to make zero false "day" calls there.
@@ -48,13 +55,14 @@ degradation:
     # Mode weights. streetlit and starlight need a flat, overcast-looking source image; moonlit
     # takes any. `overcast_ratio_range` is on p95/p05 of the linear luminance of the day image:
     # at or below the first number the image counts as fully overcast, at or above the second
-    # it is never used for streetlit / starlight.
+    # it is never used for streetlit / starlight. Loosened to [10.0, 60.0] so streetlit is ~69%
+    # of renders on day frames.
     mode_weights:
-      moonlit: 1.0
-      streetlit: 1.6
-      starlight: 0.6
+      moonlit: 0.5
+      streetlit: 3.0
+      starlight: 0.3
     overcast_only: [streetlit, starlight]
-    overcast_ratio_range: [6.0, 30.0]
+    overcast_ratio_range: [10.0, 60.0]
     # Ambient light: relative level 1, colour 3,800-4,300 K. Starlight sits slightly redder.
     moonlight_temp_range: [3800, 4300]   # Kelvin; also the streetlit ambient
     starlight_temp_range: [3800, 4050]   # Kelvin, slightly redder
@@ -64,31 +72,57 @@ degradation:
     # Streetlit lamps. Illuminance on the ground from a lamp at height h, horizontal distance r,
     # is proportional to h / (h^2 + r^2)^1.5; `light_peak_range` is the value at r = 0, relative
     # to the ambient. Lengths are fractions of the image WIDTH, so aspect ratio is preserved.
-    num_lights_range: [0, 8]
+    num_lights_range: [1, 8]
     light_height_range: [0.04, 0.30]
-    light_peak_range: [10.0, 100.0]      # LogUniform, x ambient
+    light_peak_range: [20.0, 400.0]      # LogUniform, x ambient
     light_margin: 0.15                   # lamps may sit this far outside the frame
     sodium_prob: 0.55
     sodium_temp_range: [2000, 2200]      # Kelvin
     led_temp_range: [3000, 4500]         # Kelvin
+    # Emitters: small additive points in scene radiance (ambient white = 1).
+    # Types: lit windows (facade grids), headlights/taillights (pairs), signs (saturated hues).
+    # Each has a bright core (LogUniform) and a soft glow halo.
+    emitter_brightness_range: [20.0, 1000.0]
+    emitter_halo_ratio_range: [0.02, 0.08]     # halo peak as fraction of core peak
+    emitter_halo_sigma_mult_range: [2.0, 4.0]  # halo sigma as multiple of core radius/half-size
+    emitter_counts:
+      streetlit:
+        windows: [2, 6]      # window clusters (facade grid)
+        headlights: [2, 8]   # headlight pairs (white)
+        taillights: [2, 8]   # taillight pairs (red)
+        signs: [1, 5]        # saturated colored signs
+      moonlit:
+        windows: [0, 2]
+        headlights: [0, 3]
+        taillights: [0, 3]
+        signs: [0, 2]
+      starlight:
+        windows: [0, 0]
+        headlights: [0, 0]
+        taillights: [0, 0]
+        signs: [0, 0]
   # dawn/data/camera.py: sensor + ISP -> night. Noise model: Var[y | x] = a*x + b, docs 6.
   camera:
-    # Electrons from a white pixel (relative radiance 1) at NATIVE resolution, LogUniform.
-    # This, not an exposure multiplier, is what makes a night image dark and noisy.
+    # Outer bound on electrons from a white pixel at NATIVE resolution, LogUniform.
+    # The feasible photon window [T/(gain_max*L1), T/(gain_min*L1)] intersects with this range.
+    # Widened so the target exposure rarely binds against these bounds.
     n_white_range:
-      moonlit: [10.0, 1200.0]
-      streetlit: [20.0, 2500.0]
-      starlight: [4.0, 300.0]
-    # Fixed seeded val/test sets pick a band of the LogUniform range above. The bands are
-    # quantiles, 0 = darkest. Below about 69 electrons the auto-exposure gain caps out
-    # (exposure.gain_max in camera_calib.yaml) and the frame stays dark, which is what makes
-    # `hard` hard: it is both darker and noisier, not just noisier.
+      moonlit: [2.0, 4000.0]
+      streetlit: [5.0, 6000.0]
+      starlight: [1.0, 2000.0]
+    # Fixed seeded val/test sets pick a quantile band of the real hard_test brightness
+    # distribution (target_log10_quantiles in camera_calib.yaml). 0 = darkest real frame,
+    # easy = brightest. Target T = 10**interp(u, linspace(0,1,21), quantiles).
     darkness_levels:
-      easy: [0.60, 1.00]
-      medium: [0.30, 0.60]
-      hard: [0.00, 0.30]
+      easy: [0.667, 1.0]
+      medium: [0.333, 0.667]
+      hard: [0.0, 0.333]
     read_noise_range: [1.0, 4.0]   # sigma_r, electrons per NATIVE pixel
-    gain_min: 0.1   # the AE may also expose DOWN; gain_max is in camera_calib.yaml
+    gain_min: 1.0   # dark-scene AE never attenuates: maxes exposure first, then adds gain
     white_balance_strength: [0.3, 0.8]  # 0 = keep the full colour cast, 1 = fully corrected
     quant_bits: 12
     jpeg_quality_range: [70, 95]
+    chroma:
+      sigma_range: [2.0, 6.0]      # Gaussian blur sigma for C1, C2 in native pixels
+      gain_range: [0.6, 1.0]       # chroma gain for washed-out colour
+
