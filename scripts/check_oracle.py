@@ -48,7 +48,8 @@ logger = logging.getLogger(__name__)
 PROBE_PAIRS, PROBE_SEED = 120, 0
 PROBE_GRID_ONLY_DB = 24.72
 PROBE_TOLERANCE_DB = 0.5
-SWEEP_BINS, SWEEP_CELLS, SWEEP_RIDGE = (4, 8, 16), ((8, 10), (16, 20), (32, 40)), (1e-3, 1e-2)
+SWEEP_BINS, SWEEP_CELLS = (8, 16), ((16, 20), (32, 40), (64, 80))
+SWEEP_RIDGE, SWEEP_REFINE = (1e-3, 1e-1), (0, 2)
 
 
 def probe_ids(dataset) -> set[str]:
@@ -98,7 +99,7 @@ def build_report(args, cfg, rows, train_rows, sweeps, sheets, checks) -> str:
             "",
             table,
             "",
-            f"Best: bins, rows, cols, ridge = {best}" if best else "",
+            f"Best: bins, rows, cols, ridge, refine = {best}" if best else "",
             "",
         ]
     lines += ["## Worst 10% of grid-only scenes", ""]
@@ -140,10 +141,11 @@ def main():
         ()
         if args.no_sweep
         else tuple(
-            (bins, rows, cols, ridge)
+            (bins, rows, cols, ridge, refine)
             for bins in SWEEP_BINS
             for rows, cols in SWEEP_CELLS
             for ridge in SWEEP_RIDGE
+            for refine in SWEEP_REFINE
         )
     )
     rows, sweeps = oracle.run_oracle(
@@ -181,17 +183,23 @@ def main():
     bgu = oracle.summarize(rows, "ab_err_bgu")["mean"]
     bil = oracle.summarize(rows, "ab_err_bilinear")["mean"]
     checks.append(
-        f"colour ceiling at the configured BGU ({cfg['color']['bgu']}): BGU {bgu:.3f} vs bilinear "
-        f"{bil:.3f} mean abs delta a*b* over all pairs: {'OK' if bgu <= bil else 'WORSE'}"
+        f"colour ceiling over all pairs: bilinear {bil:.3f} vs BGU {bgu:.3f} (configured "
+        f"{cfg['color']['bgu']}) mean abs delta a*b*; `color.upsample` is "
+        f"**{cfg['color']['upsample']}** (the maintainer chose bilinear at Checkpoint A)"
+    )
+    de_bil = oracle.summarize(rows, "de_grid_only_bilinear")["mean"]
+    de_bgu = oracle.summarize(rows, "de_grid_only_bgu")["mean"]
+    checks.append(
+        f"assembled oracle CIEDE2000 (grid only): bilinear colour {de_bil:.2f} vs BGU colour "
+        f"{de_bgu:.2f}"
     )
     if sweeps:
         _, best, baseline = oracle.sweep_table(sweeps)
         if best and baseline is not None:
             best_mean = float(np.mean(sweeps[best]))
-            verdict = "OK" if best_mean <= baseline else "STOP AND ASK (BGU is worse than bilinear)"
             checks.append(
-                f"colour ceiling, best swept BGU {best}: {best_mean:.3f} vs bilinear "
-                f"{baseline:.3f} on the sweep pairs: **{verdict}**"
+                f"best swept BGU {best}: {best_mean:.3f} vs bilinear {baseline:.3f} on the sweep "
+                f"pairs ({'BGU ahead' if best_mean <= baseline else 'bilinear ahead'})"
             )
     report = build_report(args, cfg, rows, train_rows, sweeps, sheets, checks)
     (out_dir / "report.md").write_text(report, encoding="utf-8")

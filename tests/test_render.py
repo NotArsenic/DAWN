@@ -10,8 +10,11 @@ from dawn.flow.render import RenderSettings, render  # noqa: E402
 from tests.flow_helpers import TINY_INPUT, TINY_RENDER, load_configs, tiny_layout  # noqa: E402
 
 
-def _settings(correction=False):
-    return RenderSettings(layout=tiny_layout(correction), bgu_grid=(4, 2, 2), bgu_ridge=1e-3)
+def _settings(correction=False, upsample="bgu"):
+    """BGU by default in these tests (the guided-edge ones need it); bilinear is tested below."""
+    return RenderSettings(
+        layout=tiny_layout(correction), bgu_grid=(4, 2, 2), bgu_ridge=1e-3, upsample=upsample
+    )
 
 
 def _constant_parts(layout, gain, offset, a=0.0, b=0.0, corr=None, batch=1):
@@ -145,3 +148,43 @@ def test_settings_come_from_the_config():
     settings = RenderSettings.from_config(cfg)
     assert settings.bgu_grid == (cfg["color"]["bgu"]["bins"], *cfg["color"]["bgu"]["grid"])
     assert settings.layout.dim == 48 and settings.layout.correction is False
+
+
+# --- the upsample switch -------------------------------------------------------------------------
+
+
+def test_the_default_upsample_is_bilinear():
+    assert RenderSettings(layout=tiny_layout()).upsample == "bilinear"
+    assert RenderSettings.from_config(load_configs()).upsample == "bilinear"
+
+
+def test_bilinear_colour_is_the_plain_upsample_of_the_colour_map():
+    import torch.nn.functional as F
+
+    settings = _settings(upsample="bilinear")
+    parts = _constant_parts(settings.layout, 0.4, 0.1)
+    h, w = settings.layout.color_size
+    gen = torch.Generator().manual_seed(2)
+    parts["ab"] = torch.randn(1, 2, h, w, generator=gen) * 10
+    out = render(parts, _thermal(), TINY_INPUT, settings)
+    expected = F.interpolate(parts["ab"], size=TINY_INPUT, mode="bilinear", align_corners=False)
+    assert torch.allclose(out["lab"][:, 1:], expected, atol=1e-5)
+
+
+def test_bilinear_correction_adds_the_upsampled_map_in_l():
+    import torch.nn.functional as F
+
+    settings = _settings(correction=True, upsample="bilinear")
+    parts = _constant_parts(settings.layout, 0.4, 0.1, corr=0.0)
+    h, w = settings.layout.color_size
+    gen = torch.Generator().manual_seed(3)
+    parts["corr"] = torch.randn(1, 1, h, w, generator=gen) * 0.03
+    thermal = _thermal()
+    out = render(parts, thermal, TINY_INPUT, settings)
+    up = F.interpolate(parts["corr"], size=TINY_INPUT, mode="bilinear", align_corners=False)
+    assert torch.allclose(out["lab"][:, :1], 100 * (out["L_grid"] + up).clamp(0, 1), atol=1e-3)
+
+
+def test_an_unknown_upsample_mode_is_refused_when_the_settings_are_built():
+    with pytest.raises(ValueError, match="upsample"):
+        RenderSettings(layout=tiny_layout(), upsample="bicubic")

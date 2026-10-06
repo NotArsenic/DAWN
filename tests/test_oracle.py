@@ -29,7 +29,7 @@ def tiny(tmp_path_factory):
         cfg,
         "cpu",
         batch_size=2,
-        sweep=((4, 4, 5, 1e-3), (8, 8, 10, 1e-3)),
+        sweep=((4, 4, 5, 1e-3, 0), (8, 8, 10, 1e-1, 1)),
         sweep_pairs=3,
     )
     return cfg, dataset, rows, sweeps
@@ -74,7 +74,7 @@ def test_summaries_and_tables(tiny):
     assert "box-aligned mean (n=3)" in table and "fallback mean (n=2)" in table
     assert all(oracle.LABELS[k] in table for k in oracle.METRICS)
     text, best, baseline = oracle.sweep_table(sweeps)
-    assert best in sweeps and len(best) == 4 and baseline > 0
+    assert best in sweeps and len(best) == 5 and baseline > 0
     assert "mean abs delta a*b*" in text and "bilinear (baseline)" in text
     assert all(len(v) == 3 for v in sweeps.values())  # exactly the first sweep_pairs pairs
 

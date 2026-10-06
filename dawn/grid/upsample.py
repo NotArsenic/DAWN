@@ -1,22 +1,66 @@
-"""Bilateral guided upsampling (Chen, Adams, Durand et al., SIGGRAPH Asia 2016).
+"""Upsampling the generated low-resolution maps (a*b*, the optional L correction).
 
-Upsample a low-resolution map `low` to the resolution of a guide image so that its edges follow
-the guide's: at low resolution, fit a bilateral grid of `low ~ gain * guide + offset` (per cell and
-guide-intensity bin), then slice that grid at the high-resolution guide and apply it to it.
+`upsample_map` is the one entry point of the render path (docs/conventions.md section 6.3), with
+two modes (`color.upsample` in flow.yaml):
 
-Used twice by the render path (docs/conventions.md section 6): colour a*b* and the optional L
-correction, both guided by L. It reuses `fit_affine_grid` and `slice_grid`, so its node weights
-come from `slice.trilinear_weights` like everything else (rule 1). The guides are treated as
-constants (no gradient through the bin assignment); the result is differentiable with respect to
-`low`, which is how L_render reaches the colour tokens.
+    bilinear   plain bilinear upsampling (align_corners=False). The default: on the real val pairs
+               its colour ceiling is 0.87 mean |delta a*b*| against the BGU's 1.3 to 2.1 at every
+               grid swept (scripts/check_oracle.py), and the maintainer chose it at Checkpoint A.
+    bgu        bilateral guided upsampling (Chen, Adams, Durand et al., SIGGRAPH Asia 2016): at low
+               resolution, fit a bilateral grid of `low ~ gain * guide + offset` (per cell and
+               guide-intensity bin), then slice that grid at the high-resolution guide and apply
+               it to it, so edges follow the guide's. Kept implemented and tested for the cases
+               where the guide explains the colour.
+
+BGU reuses `fit_affine_grid` and `slice_grid`, so its node weights come from
+`slice.trilinear_weights` like everything else (rule 1). Its guides are treated as constants (no
+gradient through the bin assignment); both modes are differentiable with respect to `low`, which is
+how L_render reaches the colour tokens. `F.interpolate` appears here and nowhere else as an upsample
+(the baseline in `scripts/check_oracle.py` is the same call); the downsampling rule is untouched.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from dawn.grid.fit import fit_affine_grid
 from dawn.grid.slice import apply_gain_offset, slice_grid
+
+UPSAMPLE_MODES = ("bilinear", "bgu")
+
+
+def upsample_map(
+    low: torch.Tensor,
+    guide_lo: torch.Tensor,
+    guide_hi: torch.Tensor,
+    mode: str = "bilinear",
+    weights_lo: torch.Tensor | None = None,
+    *,
+    grid_size: tuple[int, int, int] = (8, 64, 80),
+    ridge_alpha: float = 1e-1,
+    refine_steps: int = 2,
+) -> torch.Tensor:
+    """Upsample `low` `(B, C, h, w)` to the size of `guide_hi` `(B, 1, H, W)`.
+
+    `bilinear` ignores the guides and the BGU settings; `bgu` is `bilateral_guided_upsample`.
+
+    Raises:
+        ValueError: `mode` is not one of `UPSAMPLE_MODES`.
+    """
+    if mode == "bilinear":
+        return F.interpolate(low, size=guide_hi.shape[-2:], mode="bilinear", align_corners=False)
+    if mode == "bgu":
+        return bilateral_guided_upsample(
+            low,
+            guide_lo,
+            guide_hi,
+            weights_lo,
+            grid_size=grid_size,
+            ridge_alpha=ridge_alpha,
+            refine_steps=refine_steps,
+        )
+    raise ValueError(f"upsample mode must be one of {UPSAMPLE_MODES}, got {mode!r}")
 
 
 def bilateral_guided_upsample(

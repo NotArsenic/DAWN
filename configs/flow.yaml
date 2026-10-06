@@ -26,21 +26,26 @@ grid:
   stats_cache: data/token_stats.pt
   stats_num_samples: 2000
 
-# Colour path: a generated a*b* map at `block` x the token grid (4 x (32, 40) = (128, 160)),
-# upsampled by bilateral guided upsampling (BGU) guided by the output L.
+# Colour path: a generated a*b* map at `block` x the token grid (4 x (32, 40) = (128, 160)), brought
+# to full size by `upsample`.
 color:
   block: 4               # colour pixels per token side
   bin_step: 10           # a*b* bins: the occupied cells of a 10-unit grid over the sRGB gamut (261)
   soft_k: 5              # Zhang et al.: the 5 nearest bins ...
   soft_sigma: 5.0        # ... with a Gaussian of this width (a*b* units)
   min_patch_fraction: 0.5  # L_color ignores patches whose kept (unmasked) share is below this
-  # BGU: a bilateral grid of a*b* ~ gain * L + offset fit at the colour size. Chosen with
-  # scripts/check_oracle.py against bilinear upsampling (docs/conventions.md section 6.3).
+  # How the colour map (and the correction) are upsampled: bilinear | bgu. BILINEAR by the
+  # maintainer's decision at Checkpoint A: on the real val pairs its colour ceiling is 0.87 mean
+  # |delta a*b*| against the BGU's 1.3 (best setting) to 2.1 (16 x 20 cells), and the assembled
+  # oracle CIEDE2000 is 3.25 against 3.91 (scripts/check_oracle.py, docs/conventions.md section 6.3).
+  upsample: bilinear
+  # BGU (only read when upsample is bgu): a bilateral grid of a*b* ~ gain * L + offset fit at the
+  # colour size and sliced at the output L. The best setting measured; ridge does not help.
   bgu:
     bins: 8
-    grid: [16, 20]       # (rows, cols) of the BGU grid cells
-    ridge_alpha: 1.0e-3
-    refine_steps: 0
+    grid: [64, 80]       # (rows, cols) of the BGU grid cells: 2 x 2 colour pixels per cell
+    ridge_alpha: 1.0e-1
+    refine_steps: 2
 
 # A generated L correction at the colour-map size, for what the grid cannot express. OFF until the
 # worst-10% oracle sheet and the GPU gate say it is needed (CLAUDE.md, open decisions).

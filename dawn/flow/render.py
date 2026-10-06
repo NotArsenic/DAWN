@@ -6,10 +6,9 @@ call `render`; none re-implements a step of it.
     1. thermal_s = area_downsample(thermal, size) if the thermal is larger.
     2. g = compute_guidance(thermal_s); L_grid = clamp(gain * thermal_s + offset, 0, 1), sliced
        from the brightness grid.
-    3. With the correction: L = clamp(L_grid + BGU(corr, area(L_grid), L_grid), 0, 1);
-       otherwise L = L_grid.
-    4. ab = BGU(ab_lo, area(L), L): colour is guided by the OUTPUT L, so its edges follow
-       brightness edges.
+    3. With the correction: L = clamp(L_grid + upsample(corr), 0, 1); otherwise L = L_grid.
+    4. ab = upsample(ab_lo): bilinear by default; with `color.upsample: bgu` the bilateral guided
+       upsampling guided by the OUTPUT L, so colour edges follow brightness edges.
     5. lab = (100 * L, ab); rgb = clamp(lab_to_linear(lab), 0, 1) (clipped to the gamut).
 
 The grid and colour tokens are in RAW units here (`unstandardize` has already run).
@@ -27,34 +26,42 @@ from dawn.data.resample import area_downsample
 from dawn.flow.tokens import TokenLayout
 from dawn.grid.guidance import compute_guidance
 from dawn.grid.slice import apply_gain_offset, slice_grid
-from dawn.grid.upsample import bilateral_guided_upsample
+from dawn.grid.upsample import UPSAMPLE_MODES, upsample_map
 
 
 @dataclass(frozen=True)
 class RenderSettings:
-    """What `render` needs besides the parts: the token layout and the BGU settings.
+    """What `render` needs besides the parts: the token layout and the upsampling settings.
 
     Args:
         layout: The token layout (colour-map size, whether the correction is on).
+        upsample: How the colour map and the correction are upsampled: `bilinear` (default) or
+            `bgu` (`color.upsample`).
         bgu_grid: `(bins, rows, cols)` of the bilateral grid inside the upsampling.
         bgu_ridge: Ridge strength of the BGU fit.
         bgu_refine: Extra BGU fit passes.
     """
 
     layout: TokenLayout
-    bgu_grid: tuple[int, int, int] = (8, 16, 20)
-    bgu_ridge: float = 1e-3
-    bgu_refine: int = 0
+    bgu_grid: tuple[int, int, int] = (8, 64, 80)
+    bgu_ridge: float = 1e-1
+    bgu_refine: int = 2
+    upsample: str = "bilinear"
+
+    def __post_init__(self) -> None:
+        if self.upsample not in UPSAMPLE_MODES:
+            raise ValueError(f"upsample must be one of {UPSAMPLE_MODES}, got {self.upsample!r}")
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> RenderSettings:
-        """Build from the parsed flow.yaml (`color.bgu`, plus the layout's own sections)."""
+        """Build from the parsed flow.yaml (`color.upsample`, `color.bgu`, the layout's)."""
         bgu = cfg["color"]["bgu"]
         return cls(
             layout=TokenLayout.from_config(cfg),
             bgu_grid=(int(bgu["bins"]), *map(int, bgu["grid"])),
             bgu_ridge=float(bgu["ridge_alpha"]),
             bgu_refine=int(bgu["refine_steps"]),
+            upsample=str(cfg["color"]["upsample"]),
         )
 
 
@@ -106,10 +113,11 @@ def render(
     lightness = l_grid
 
     def upsample(low: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
-        return bilateral_guided_upsample(
+        return upsample_map(
             low.to(torch.float32),
             area_downsample(guide, layout.color_size),
             guide,
+            settings.upsample,
             grid_size=settings.bgu_grid,
             ridge_alpha=settings.bgu_ridge,
             refine_steps=settings.bgu_refine,

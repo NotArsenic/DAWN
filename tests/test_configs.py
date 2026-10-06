@@ -68,6 +68,7 @@ def test_flow_config_has_the_decided_keys():
         ("color", "soft_k"),
         ("color", "soft_sigma"),
         ("color", "min_patch_fraction"),
+        ("color", "upsample"),
         ("color", "bgu", "bins"),
         ("color", "bgu", "grid"),
         ("color", "bgu", "ridge_alpha"),
@@ -95,6 +96,8 @@ def test_the_decided_values_hold():
     assert cfg["brightness_correction"]["enabled"] is False  # off until the oracle sheet + GPU gate
     assert cfg["grid"]["num_bins"] == 8 and cfg["grid"]["refine_steps"] == 1
     assert cfg["color"]["block"] == 4 and cfg["color"]["bin_step"] == 10
+    # The maintainer chose bilinear at Checkpoint A: the BGU ceiling is worse at every grid swept.
+    assert cfg["color"]["upsample"] == "bilinear"
     assert (cfg["color"]["soft_k"], cfg["color"]["soft_sigma"]) == (5, 5.0)
     flow = cfg["flow"]
     assert (flow["velocity_weight"], flow["render_weight"]) == (1.0, 0.1)

@@ -6,7 +6,7 @@ torch = pytest.importorskip("torch")
 F = torch.nn.functional
 
 from dawn.data.resample import area_downsample  # noqa: E402
-from dawn.grid.upsample import bilateral_guided_upsample  # noqa: E402
+from dawn.grid.upsample import UPSAMPLE_MODES, bilateral_guided_upsample, upsample_map  # noqa: E402
 
 GRID = (8, 4, 4)
 
@@ -84,3 +84,42 @@ def test_rejects_bad_shapes():
         bilateral_guided_upsample(low, torch.rand(1, 1, 4, 4), guide_hi, grid_size=GRID)
     with pytest.raises(ValueError, match="guide_hi"):
         bilateral_guided_upsample(low, guide_lo, torch.rand(2, 1, 16, 16), grid_size=GRID)
+
+
+# --- the switch: bilinear (the default) or bilateral guided ----------------------------------
+
+
+def test_the_modes_are_bilinear_and_bgu():
+    assert UPSAMPLE_MODES == ("bilinear", "bgu")
+
+
+def test_bilinear_mode_is_plain_align_corners_false_bilinear_and_ignores_the_guides():
+    low = torch.rand(2, 2, 8, 10)
+    hi = torch.rand(2, 1, 32, 40)
+    out = upsample_map(low, torch.rand(2, 1, 8, 10), hi, "bilinear")
+    assert out.shape == (2, 2, 32, 40)
+    assert torch.equal(out, F.interpolate(low, size=(32, 40), mode="bilinear", align_corners=False))
+    other = upsample_map(low, torch.zeros(2, 1, 8, 10), torch.zeros_like(hi), "bilinear")
+    assert torch.equal(out, other)  # no guidance in this mode
+
+
+def test_bilinear_mode_is_differentiable_in_low():
+    low = torch.rand(1, 2, 4, 5, requires_grad=True)
+    upsample_map(low, torch.rand(1, 1, 4, 5), torch.rand(1, 1, 16, 20), "bilinear").sum().backward()
+    assert low.grad is not None and low.grad.abs().sum() > 0
+
+
+def test_bgu_mode_is_the_bilateral_guided_upsample_with_the_given_grid():
+    guide_hi = _smooth_guide(32, 40)
+    guide_lo = area_downsample(guide_hi, (8, 10))
+    low = torch.cat([0.7 * guide_lo + 0.1, -0.4 * guide_lo + 0.5], dim=1)
+    kwargs = {"grid_size": (4, 2, 2), "ridge_alpha": 1e-3, "refine_steps": 1}
+    via_switch = upsample_map(low, guide_lo, guide_hi, "bgu", **kwargs)
+    direct = bilateral_guided_upsample(low, guide_lo, guide_hi, **kwargs)
+    assert torch.equal(via_switch, direct)
+
+
+def test_an_unknown_mode_is_an_error():
+    low, g = torch.rand(1, 2, 4, 4), torch.rand(1, 1, 8, 8)
+    with pytest.raises(ValueError, match="upsample"):
+        upsample_map(low, torch.rand(1, 1, 4, 4), g, "bicubic")

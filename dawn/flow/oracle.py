@@ -6,12 +6,11 @@ CIELAB):
 
     grid-only    the fitted brightness grid, rendered, at refine 0 and 1: L* PSNR (peak 100)
     + correction the same grid plus the generated-L correction at the colour-map size, upsampled
-                 by the BGU (the render path) and, as the reference the plan's numbers used, by
-                 plain bilinear upsampling
+                 bilinearly and by the BGU (both through `render`)
     colour       the true a*b* area-averaged to the colour-map size and brought back up by the BGU
                  guided by the true L, against bilinear: mean |delta a*b*|
-    assembled    the whole oracle image through `render` (grid-only and with the correction):
-                 CIEDE2000 next to the L* PSNR
+    assembled    the whole oracle image through `render` (grid-only and with the correction, each
+                 upsample mode): CIEDE2000 next to the L* PSNR
 
 Everything goes through the project's own `build_targets` and `render`, so the oracle is exactly
 the ceiling the trainer's validation compares against (docs/conventions.md rules 9 and 10).
@@ -27,7 +26,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, default_collate
 
 from dawn.data.resample import area_downsample
@@ -36,31 +34,39 @@ from dawn.eval.metrics import ciede2000, masked_mean, masked_psnr
 from dawn.flow.render import RenderSettings, render
 from dawn.flow.targets import FitSettings, build_targets, prepare_batch
 from dawn.flow.tokens import TokenLayout
-from dawn.grid.upsample import bilateral_guided_upsample
+from dawn.grid.upsample import upsample_map
 
 logger = logging.getLogger(__name__)
+
+MODES = ("bilinear", "bgu")
 
 METRICS = (
     "psnr_grid_r0",
     "psnr_grid_r1",
+    "psnr_corr_bilinear_r0",
+    "psnr_corr_bilinear_r1",
     "psnr_corr_bgu_r0",
     "psnr_corr_bgu_r1",
-    "psnr_corr_bilinear_r1",
-    "ab_err_bgu",
     "ab_err_bilinear",
-    "de_grid_only",
-    "de_with_correction",
+    "ab_err_bgu",
+    "de_grid_only_bilinear",
+    "de_grid_only_bgu",
+    "de_with_correction_bilinear",
+    "de_with_correction_bgu",
 )
 LABELS = {
     "psnr_grid_r0": "grid only, refine 0 (L* PSNR dB)",
     "psnr_grid_r1": "grid only, refine 1 (L* PSNR dB)",
+    "psnr_corr_bilinear_r0": "grid + correction (bilinear), refine 0 (dB)",
+    "psnr_corr_bilinear_r1": "grid + correction (bilinear), refine 1 (dB)",
     "psnr_corr_bgu_r0": "grid + correction (BGU), refine 0 (dB)",
     "psnr_corr_bgu_r1": "grid + correction (BGU), refine 1 (dB)",
-    "psnr_corr_bilinear_r1": "grid + correction (bilinear), refine 1 (dB)",
-    "ab_err_bgu": "colour ceiling, BGU (mean abs delta a*b*)",
     "ab_err_bilinear": "colour ceiling, bilinear (mean abs delta a*b*)",
-    "de_grid_only": "assembled oracle, grid only (CIEDE2000)",
-    "de_with_correction": "assembled oracle, with correction (CIEDE2000)",
+    "ab_err_bgu": "colour ceiling, BGU (mean abs delta a*b*)",
+    "de_grid_only_bilinear": "assembled oracle, grid only, bilinear colour (CIEDE2000)",
+    "de_grid_only_bgu": "assembled oracle, grid only, BGU colour (CIEDE2000)",
+    "de_with_correction_bilinear": "assembled oracle, with correction, bilinear (CIEDE2000)",
+    "de_with_correction_bgu": "assembled oracle, with correction, BGU (CIEDE2000)",
 }
 
 
@@ -71,15 +77,19 @@ def layouts(cfg: Mapping) -> tuple[TokenLayout, TokenLayout]:
 
 
 def measure_batch(batch: Mapping, cfg: Mapping) -> dict[str, torch.Tensor]:
-    """Every oracle metric for one prepared batch (`prepare_batch`), each `(B,)`."""
+    """Every oracle metric for one prepared batch (`prepare_batch`), each `(B,)`.
+
+    Both upsample modes are always measured (whatever `color.upsample` is), so the report keeps
+    the BGU's cost against bilinear in view.
+    """
     off, on = layouts(cfg)
     ridge = float(cfg["grid"]["ridge_alpha"])
     size = tuple(int(v) for v in cfg["encoder"]["input_size"])
     base = RenderSettings.from_config(cfg)
-    settings = {
-        False: RenderSettings(off, base.bgu_grid, base.bgu_ridge, base.bgu_refine),
-        True: RenderSettings(on, base.bgu_grid, base.bgu_ridge, base.bgu_refine),
-    }
+
+    def settings(layout: TokenLayout, mode: str) -> RenderSettings:
+        return dataclasses.replace(base, layout=layout, upsample=mode)
+
     thermal, rgb, mask = batch["thermal"], batch["rgb"], batch["mask"]
     out: dict[str, torch.Tensor] = {}
     for refine in (0, 1):
@@ -88,15 +98,20 @@ def measure_batch(batch: Mapping, cfg: Mapping) -> dict[str, torch.Tensor]:
         withc = build_targets(thermal, rgb, mask, on, fit)
         true_l = plain.lab[:, :1]
         out[f"psnr_grid_r{refine}"] = masked_psnr(100.0 * plain.L_grid, true_l, mask, 100.0)
-        bgu = render(withc.parts, thermal, size, settings[True])
-        out[f"psnr_corr_bgu_r{refine}"] = masked_psnr(bgu["lab"][:, :1], true_l, mask, 100.0)
+        corrected = {mode: render(withc.parts, thermal, size, settings(on, mode)) for mode in MODES}
+        for mode, rendered in corrected.items():
+            out[f"psnr_corr_{mode}_r{refine}"] = masked_psnr(
+                rendered["lab"][:, :1], true_l, mask, 100.0
+            )
         if refine == 1:
-            up = F.interpolate(withc.parts["corr"], size=size, mode="bilinear", align_corners=False)
-            bilinear_l = 100.0 * (plain.L_grid + up).clamp(0.0, 1.0)
-            out["psnr_corr_bilinear_r1"] = masked_psnr(bilinear_l, true_l, mask, 100.0)
-            grid_only = render(plain.parts, thermal, size, settings[False])
-            out["de_grid_only"] = masked_mean(ciede2000(grid_only["lab"], plain.lab), mask)
-            out["de_with_correction"] = masked_mean(ciede2000(bgu["lab"], plain.lab), mask)
+            for mode in MODES:
+                grid_only = render(plain.parts, thermal, size, settings(off, mode))
+                out[f"de_grid_only_{mode}"] = masked_mean(
+                    ciede2000(grid_only["lab"], plain.lab), mask
+                )
+                out[f"de_with_correction_{mode}"] = masked_mean(
+                    ciede2000(corrected[mode]["lab"], plain.lab), mask
+                )
             ab_up, ab_bil = colour_ceiling(plain, base, size, off)
             true_ab = plain.lab[:, 1:]
             out["ab_err_bgu"] = masked_mean(torch.linalg.vector_norm(ab_up - true_ab, dim=1), mask)
@@ -109,56 +124,52 @@ def measure_batch(batch: Mapping, cfg: Mapping) -> dict[str, torch.Tensor]:
 def colour_ceiling(
     targets, render_settings: RenderSettings, size: tuple[int, int], layout: TokenLayout
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """True a*b* at the colour-map size, brought back to `size` by the BGU (guided by the true L)
-    and by plain bilinear upsampling. The `F.interpolate` baseline is the one sanctioned upsample
-    outside the BGU (docs/conventions.md rule 5): it is what the BGU is measured against."""
+    """True a*b* at the colour-map size, brought back to `size` by the BGU (guided by the true L,
+    at the configured BGU settings) and by plain bilinear upsampling: `(bgu, bilinear)`."""
     low = targets.parts["ab"]
     guide_hi = targets.lab[:, :1] / 100.0
     guide_lo = area_downsample(guide_hi, layout.color_size)
-    up = bilateral_guided_upsample(
-        low,
-        guide_lo,
-        guide_hi,
-        targets.fraction,
-        grid_size=render_settings.bgu_grid,
-        ridge_alpha=render_settings.bgu_ridge,
-        refine_steps=render_settings.bgu_refine,
-    )
-    return up, F.interpolate(low, size=size, mode="bilinear", align_corners=False)
+    kwargs = {
+        "grid_size": render_settings.bgu_grid,
+        "ridge_alpha": render_settings.bgu_ridge,
+        "refine_steps": render_settings.bgu_refine,
+    }
+    up = upsample_map(low, guide_lo, guide_hi, "bgu", targets.fraction, **kwargs)
+    return up, upsample_map(low, guide_lo, guide_hi, "bilinear")
 
 
 def bgu_sweep_batch(
     batch: Mapping,
     cfg: Mapping,
-    settings: Sequence[tuple[int, int, int, float]],
+    settings: Sequence[tuple[int, int, int, float, int]],
 ) -> dict[tuple, torch.Tensor]:
-    """Colour-ceiling error `(B,)` of each BGU setting `(bins, rows, cols, ridge)` on a batch."""
+    """Colour-ceiling error `(B,)` of each BGU setting `(bins, rows, cols, ridge, refine)` on a
+    batch, plus the bilinear baseline under the key `("bilinear",)`."""
     off, _ = layouts(cfg)
     targets = build_targets(
         batch["thermal"], batch["rgb"], batch["mask"], off, FitSettings(1e-3, 0)
     )
-    true_ab = targets.lab[:, 1:]
+    true_ab, mask = targets.lab[:, 1:], batch["mask"]
     guide_hi = targets.lab[:, :1] / 100.0
     guide_lo = area_downsample(guide_hi, off.color_size)
     low = targets.parts["ab"]
-    bilinear = F.interpolate(low, size=true_ab.shape[-2:], mode="bilinear", align_corners=False)
-    out = {
-        ("bilinear",): masked_mean(
-            torch.linalg.vector_norm(bilinear - true_ab, dim=1), batch["mask"]
-        )
-    }
-    for bins, rows, cols, ridge in settings:
-        up = bilateral_guided_upsample(
-            targets.parts["ab"],
+
+    def error(up: torch.Tensor) -> torch.Tensor:
+        return masked_mean(torch.linalg.vector_norm(up - true_ab, dim=1), mask)
+
+    out = {("bilinear",): error(upsample_map(low, guide_lo, guide_hi, "bilinear"))}
+    for bins, rows, cols, ridge, refine in settings:
+        up = upsample_map(
+            low,
             guide_lo,
             guide_hi,
+            "bgu",
             targets.fraction,
             grid_size=(bins, rows, cols),
             ridge_alpha=ridge,
+            refine_steps=refine,
         )
-        out[(bins, rows, cols, ridge)] = masked_mean(
-            torch.linalg.vector_norm(up - true_ab, dim=1), batch["mask"]
-        )
+        out[(bins, rows, cols, ridge, refine)] = error(up)
     return out
 
 
@@ -176,7 +187,7 @@ def run_oracle(
     device: torch.device | str = "cpu",
     batch_size: int = 4,
     workers: int = 0,
-    sweep: Sequence[tuple[int, int, int, float]] = (),
+    sweep: Sequence[tuple[int, int, int, float, int]] = (),
     sweep_pairs: int = 40,
 ) -> tuple[list[dict], dict[tuple, list[float]]]:
     """Per-pair oracle rows (`id`, `fallback`, every metric) and the BGU sweep sums.
@@ -265,17 +276,17 @@ def sweep_table(sweeps: Mapping[tuple, Sequence[float]]) -> tuple[str, tuple | N
     baseline = sweeps.get(("bilinear",))
     base_mean = float(np.mean(baseline)) if baseline else None
     ranked = sorted(
-        ((float(np.mean(v)), k, len(v)) for k, v in sweeps.items() if len(v) and len(k) == 4),
+        ((float(np.mean(v)), k, len(v)) for k, v in sweeps.items() if len(v) and len(k) == 5),
         key=lambda t: t[0],
     )
     lines = [
-        "| bins | grid (rows x cols) | ridge | mean abs delta a*b* | pairs |",
-        "|---|---|---|---|---|",
+        "| bins | grid (rows x cols) | ridge | refine | mean abs delta a*b* | pairs |",
+        "|---|---|---|---|---|---|",
     ]
     if base_mean is not None:
-        lines.append(f"| bilinear (baseline) | - | - | {base_mean:.3f} | {len(baseline)} |")
-    for mean, (bins, rows, cols, ridge), n in ranked:
-        lines.append(f"| {bins} | {rows} x {cols} | {ridge:g} | {mean:.3f} | {n} |")
+        lines.append(f"| bilinear (baseline) | - | - | - | {base_mean:.3f} | {len(baseline)} |")
+    for mean, (bins, rows, cols, ridge, refine), n in ranked:
+        lines.append(f"| {bins} | {rows} x {cols} | {ridge:g} | {refine} | {mean:.3f} | {n} |")
     return "\n".join(lines), (ranked[0][1] if ranked else None), base_mean
 
 
