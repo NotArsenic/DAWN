@@ -493,10 +493,11 @@ class FlowTrainer:
 
             score("oracle", render(targets.parts, thermal, self.input_size, self.render_settings))
             record("colorfulness/gt", colorfulness(linear_to_srgb(rgb) * 255.0), keep)
+            # Only the network forwards run under autocast; the render and the metrics are float32.
             with self._autocast():
                 cond = self.encoder.encode(thermal, return_attn=True)
-                for method in ("euler", "midpoint"):
-                    sampled = sample_parts(
+                sampled = {
+                    method: sample_parts(
                         self.velocity,
                         cond["patch_tokens"].float(),
                         self.layout,
@@ -508,8 +509,11 @@ class FlowTrainer:
                         nfe=nfe,
                         image_ids=batch["image_id"],
                     )
-                    parts = {name: value[0] for name, value in sampled.items()}
-                    score(method, render(parts, thermal, self.input_size, self.render_settings))
+                    for method in ("euler", "midpoint")
+                }
+            for method, parts in sampled.items():
+                parts = {name: value[0] for name, value in parts.items()}
+                score(method, render(parts, thermal, self.input_size, self.render_settings))
             count += int(keep.sum())
         out = {key: value / max(count, 1) for key, value in totals.items()}
         if "psnr_L/oracle" in out:

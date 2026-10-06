@@ -1,1 +1,1 @@
-"""Bilateral grid operations: fit, slice, apply, guidance."""
+"""Brightness grid: fit, slice, guidance, upsampling and token standardization."""

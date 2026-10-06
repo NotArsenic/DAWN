@@ -219,7 +219,7 @@ Both modes are differentiable with respect to `low`, which is how L_render reach
 | `warp_thermal(thermal, T, (512, 640))` | `(1, H_t, W_t)` float, `T (3, 3)` thermal → RGB → `(1, 512, 640)` float32 warped, `(1, 512, 640)` bool valid |
 | `moving_mask(...)` | boxes, matches, `T` → `(1, 512, 640)` bool, count |
 | `linear_to_lab` / `lab_to_linear` | `(..., 3, H, W)` ↔ `(..., 3, H, W)` float32 |
-| `masked_psnr(pred, target, mask, peak)` | `(B,C,H,W)` ×2, `(B,1,H,W)` → `(B,)` dB |
+| `masked_psnr(pred, target, mask, peak)` / `masked_mean(value, mask)` | `(B,C,H,W)` ×2, `(B,1,H,W)` → `(B,)` dB; `(B,H,W)`, `(B,1,H,W)` → `(B,)` |
 | `ciede2000(lab_1, lab_2)` | `(..., 3, H, W)` ×2 → `(..., H, W)` |
 | `colorfulness(srgb)` | `(B,3,H,W)` in 0–255 → `(B,)` |
 | `AlignedPairs[i]` | dict: `thermal (1, 512, 640)` float32 = code / 255, `rgb (3, 512, 640)` linear float32, `valid`, `moving` and `vehicles` `(1, 512, 640)` bool, `image_id` str, `fallback` bool (aligned by edge correlation, see §10.2). Training adds flips (all four tensors alike) and a thermal-only monotone contrast curve; validation and test are deterministic |

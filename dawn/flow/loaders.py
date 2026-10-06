@@ -85,6 +85,13 @@ def build_loaders(cfg: Mapping, overfit: int | None = None) -> FlowLoaders:
     else:
         train_set = AlignedPairs.from_config(cfg, "train_pairs", train=True)
         val_sets = split_by_pair_kind(AlignedPairs.from_config(cfg, "val_pairs"), max_val)
+    # `pairs.report_fallback_separately: false` drops the fallback robustness number; the headline
+    # subset (`pairs.eval_subset`) is always validated, whatever it is.
+    policy = cfg["pairs"]
+    keep = {policy["eval_subset"], "box_aligned"}
+    if policy["report_fallback_separately"]:
+        keep.add("fallback")
+    val_sets = {name: subset for name, subset in val_sets.items() if name in keep}
     val_batch = int(cfg["loader"].get("val_batch_size", 4))
     return FlowLoaders(
         train=_loader(train_set, cfg, batch_size, shuffle=True, drop_last=True),

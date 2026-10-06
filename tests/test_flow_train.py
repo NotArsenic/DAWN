@@ -262,6 +262,35 @@ def test_validation_reports_the_oracle_and_both_samplers_per_image():
     assert again["psnr_L/euler"] == scores["psnr_L/euler"]
 
 
+def test_only_the_network_forwards_run_under_autocast_never_the_pixel_side(monkeypatch):
+    """bf16 autocast is for network forwards only: targets, the fit, the render and the metrics
+    (matmuls in `area_downsample`, the Lab einsum) must stay float32. CUDA is the only place the
+    trainer turns autocast on, so force CPU bf16 autocast and spy on who runs inside it."""
+    import dawn.flow.trainer as trainer_mod
+
+    trainer, batch = _trainer()
+    monkeypatch.setattr(
+        FlowTrainer, "_autocast", lambda self: torch.autocast("cpu", dtype=torch.bfloat16)
+    )
+    seen = {}
+
+    def spy(name):
+        real = getattr(trainer_mod, name)
+
+        def wrapped(*args, **kwargs):
+            seen.setdefault(name, []).append(torch.is_autocast_enabled("cpu"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(trainer_mod, name, wrapped)
+
+    for name in ("build_targets", "render", "prepare_batch", "patch_histograms"):
+        spy(name)
+    trainer.train_step(batch)
+    trainer.validate([batch])
+    for name in ("build_targets", "render", "prepare_batch", "patch_histograms"):
+        assert name in seen and not any(seen[name]), f"{name} ran under autocast"
+
+
 # --- loaders and --overfit ---------------------------------------------------------------------
 
 
@@ -277,6 +306,16 @@ def test_loaders_split_validation_by_pair_kind_and_respect_the_sample_cap(tmp_pa
     fallback_flags = torch.cat([b["fallback"] for b in loaders.val["fallback"]])
     assert fallback_flags.all()
     assert loaders.train_size == 5
+
+
+def test_the_fallback_subset_is_only_validated_when_the_pair_policy_asks_for_it(tmp_path):
+    cfg = tiny_data_cfg(tmp_path, n_box=2, n_fallback=2)
+    assert cfg["pairs"]["report_fallback_separately"] is True
+    assert set(build_loaders(cfg).val) == {"box_aligned", "fallback"}
+    cfg["pairs"]["report_fallback_separately"] = False
+    assert set(build_loaders(cfg).val) == {"box_aligned"}
+    cfg["pairs"]["eval_subset"] = "fallback"  # the headline subset is always validated
+    assert "fallback" in build_loaders(cfg).val
 
 
 def test_overfit_trains_and_validates_on_the_first_n_train_pairs_without_augmentation(tmp_path):

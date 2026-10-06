@@ -5,8 +5,8 @@ Everything here stays offline and CPU-sized: the encoder is a randomly initializ
 minutes; the images are small synthetic ones whose brightness is an exact function of the thermal.
 Shapes, token layout, register count and the LoRA target names are the real ones.
 
-A tiny setup: a 64 x 80 input gives a 4 x 5 token grid, a 16 x 20 colour map and, at render size
-32 x 40, 8 x 8 render pixels per... patch of 8 x 8 (render / token grid).
+A tiny setup: a 64 x 80 input gives a 4 x 5 token grid and a 16 x 20 colour map; at the 32 x 40
+render size each patch covers 8 x 8 render pixels (render size / token grid).
 """
 
 from __future__ import annotations
