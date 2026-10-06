@@ -187,9 +187,7 @@ def _one_thread() -> None:
     torch.set_num_threads(1)
 
 
-def resolve_labels(
-    stats: Iterable[ImageStats], labels: Mapping[str, str]
-) -> dict[str, str | None]:
+def resolve_labels(stats: Iterable[ImageStats], labels: Mapping[str, str]) -> dict[str, str | None]:
     """Hand labels (`visdrone.read_labels`) -> `{image_id: label or None}` for every image.
 
     An image key wins over its sequence key, and a blank label is as if the row were absent (an
@@ -291,8 +289,17 @@ def write_labels_template(stats: Iterable[ImageStats], path: str | Path) -> None
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    columns = ["key", "label", "note", "sheet_row", "split", "frames", "log10_lum", "noise",
-               "highlight_ratio"]
+    columns = [
+        "key",
+        "label",
+        "note",
+        "sheet_row",
+        "split",
+        "frames",
+        "log10_lum",
+        "noise",
+        "highlight_ratio",
+    ]
     try:
         f = path.open("x", newline="", encoding="utf-8")  # exclusive create: never overwrites
     except FileExistsError:
@@ -302,8 +309,7 @@ def write_labels_template(stats: Iterable[ImageStats], path: str | Path) -> None
         writer.writeheader()
         for number, (seq, rows) in enumerate(_video_sequences(stats), 1):
             writer.writerow(
-                {"key": seq, "label": "", "note": "", "sheet_row": number}
-                | summarize_frames(rows)
+                {"key": seq, "label": "", "note": "", "sheet_row": number} | summarize_frames(rows)
             )
 
 
@@ -431,8 +437,9 @@ def plot_log_luminance_histogram(
         ax.hist(values[split], bins=bins, color=_SERIES, edgecolor=_SURFACE, linewidth=0.8)
         ax.set_ylabel("images", color=_INK_2, fontsize=9)
         counts = " · ".join(f"{name} {len(rows)}" for name, rows in by_label.items())
-        ax.set_title(f"{split}: {len(values[split])} images · {counts}", loc="left",
-                     color=_INK, fontsize=10)
+        ax.set_title(
+            f"{split}: {len(values[split])} images · {counts}", loc="left", color=_INK, fontsize=10
+        )
     axes[-1].set_xlabel(
         "log10(median linear luminance), 256-px linearized image", color=_INK_2, fontsize=9
     )
@@ -479,19 +486,29 @@ def plot_feature_scatter(
             group = [r for r in rows if (image_labels.get(r.image_id) or UNLABELLED) == name]
             if group:
                 ax.scatter(
-                    [r.highlight_ratio for r in group], [r.noise for r in group],
-                    s=9, alpha=0.75 if name != UNLABELLED else 0.4, linewidths=0.3,
-                    color=_LABEL_COLORS.get(name, _UNLABELLED_COLOR), edgecolors=_SURFACE,
-                    marker="x" if name == "exclude" else "o", label=f"{name} ({len(group)})",
+                    [r.highlight_ratio for r in group],
+                    [r.noise for r in group],
+                    s=9,
+                    alpha=0.75 if name != UNLABELLED else 0.4,
+                    linewidths=0.3,
+                    color=_LABEL_COLORS.get(name, _UNLABELLED_COLOR),
+                    edgecolors=_SURFACE,
+                    marker="x" if name == "exclude" else "o",
+                    label=f"{name} ({len(group)})",
                 )
         ax.legend(frameon=False, fontsize=9, labelcolor=_INK, markerscale=2)
         colouring = "coloured by hand label"
     else:
         rows = sorted(rows, key=lambda r: -r.lum_median)  # dark points on top
         points = ax.scatter(
-            [r.highlight_ratio for r in rows], [r.noise for r in rows],
-            c=[_log_luminance(r.lum_median) for r in rows], cmap="Blues_r", s=9, alpha=0.8,
-            linewidths=0.3, edgecolors=_SURFACE,
+            [r.highlight_ratio for r in rows],
+            [r.noise for r in rows],
+            c=[_log_luminance(r.lum_median) for r in rows],
+            cmap="Blues_r",
+            s=9,
+            alpha=0.8,
+            linewidths=0.3,
+            edgecolors=_SURFACE,
         )
         bar = fig.colorbar(points, ax=ax, shrink=0.8)
         bar.set_label("log10 median luminance", color=_INK_2, fontsize=9)
@@ -499,8 +516,9 @@ def plot_feature_scatter(
         colouring = "coloured by brightness (no hand labels yet)"
     ax.set_xlabel("highlight ratio: 99.5th percentile / median luminance", color=_INK_2, fontsize=9)
     ax.set_ylabel("noise level (about sqrt of sensor gain)", color=_INK_2, fontsize=9)
-    ax.set_title(f"VisDrone-DET, {len(rows)} images, {colouring}", loc="left", color=_INK,
-                 fontsize=11)
+    ax.set_title(
+        f"VisDrone-DET, {len(rows)} images, {colouring}", loc="left", color=_INK, fontsize=11
+    )
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, facecolor=_SURFACE)
 
@@ -541,6 +559,80 @@ def save_contact_sheets(
             _tile(thumbs, labels, title).save(path, quality=90)
             written.append(path)
     return written
+
+
+def save_auto_day_sheet(
+    layout: VisDroneLayout,
+    stats: Sequence[ImageStats],
+    image_ids: Sequence[str],
+    out_dir: str | Path,
+    count: int = 200,
+    seed: int = 0,
+    workers: int = 1,
+) -> Path | None:
+    """Contact sheet of `count` random auto-accepted day stills, for spot-checking by eye.
+
+    Nothing hand-labelled the 99999xx collections, so the auto-day cutoffs
+    (`dawn.data.splitting`) are the only thing standing between a night still and the daytime
+    training pool. This sheet is how a person checks that: darkest first, each thumbnail
+    labelled with its log10 median luminance, so a night frame that slipped through shows up at
+    the top left rather than hiding in the middle. Same seed, same sheet.
+
+    Returns:
+        The written path, or None when `image_ids` is empty.
+    """
+    if not image_ids:
+        return None
+    by_id = {row.image_id: row for row in stats}
+    rows = [by_id[image_id] for image_id in image_ids if image_id in by_id]
+    picked = random.Random(f"{seed}/auto_day").sample(rows, min(count, len(rows)))
+    picked.sort(key=lambda r: (r.lum_median, r.image_id))
+    thumbs = run_parallel(
+        thumbnail, [(layout, r.split, r.image_id) for r in picked], workers, desc="auto-day sheet"
+    )
+    labels = [f"{_log_luminance(r.lum_median):+.2f}" for r in picked]
+    title = (
+        f"auto-day stills: {len(picked)} of {len(rows)} accepted, darkest first; "
+        "label = log10 median luminance. Any night frame here is a false accept."
+    )
+    path = Path(out_dir) / "auto_day.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _tile(thumbs, labels, title).save(path, quality=90)
+    return path
+
+
+def save_manifest_sheet(
+    layout: VisDroneLayout,
+    stats: Sequence[ImageStats],
+    image_ids: Sequence[str],
+    out_dir: str | Path,
+    name: str,
+    title: str | None = None,
+    count: int = 50,
+    seed: int = 0,
+    workers: int = 1,
+) -> Path | None:
+    """Contact sheet for an arbitrary list of image IDs (e.g. a manifest), darkest first."""
+    if not image_ids:
+        return None
+    by_id = {row.image_id: row for row in stats}
+    rows = [by_id[image_id] for image_id in image_ids if image_id in by_id]
+    if not rows:
+        return None
+    picked = random.Random(f"{seed}/{name}").sample(rows, min(count, len(rows)))
+    picked.sort(key=lambda r: (r.lum_median, r.image_id))
+    thumbs = run_parallel(
+        thumbnail, [(layout, r.split, r.image_id) for r in picked], workers, desc=f"{name} sheet"
+    )
+    labels = [f"{_log_luminance(r.lum_median):+.2f}" for r in picked]
+    if title is None:
+        title = (
+            f"{name}: {len(picked)} of {len(rows)}, darkest first; label = log10 median luminance"
+        )
+    path = Path(out_dir) / f"{name}.jpg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _tile(thumbs, labels, title).save(path, quality=90)
+    return path
 
 
 def thumbnail(

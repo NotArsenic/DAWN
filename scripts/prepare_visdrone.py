@@ -83,8 +83,17 @@ def run_split(cfg: dict, args: argparse.Namespace) -> None:
         plot_feature_scatter,
         plot_log_luminance_histogram,
         resolve_labels,
+        save_auto_day_sheet,
         save_contact_sheets,
+        save_manifest_sheet,
         write_manifests,
+    )
+    from dawn.data.splitting import (
+        FINAL_SUBSETS,
+        auto_day_ids,
+        build_final_manifests,
+        group_id,
+        write_final_manifests,
     )
     from dawn.data.visdrone import VisDroneLayout, read_labels, read_stats_csv
 
@@ -122,6 +131,54 @@ def run_split(cfg: dict, args: argparse.Namespace) -> None:
     )
     logger.info(f"Contact sheets: {len(sheets)} in {out_dir / 'contact_sheets'}")
 
+    # The five manifests the rest of the project actually reads. `write_manifests` above is the
+    # per-label bookkeeping of phase 2; this is the training split, and it is the step that
+    # auto-accepts still collections, regroups train/val by group and checks test-dev shares no
+    # group with either (dawn/data/splitting.py).
+    if not args.final:
+        logger.info("Skipping final manifests (--no-final)")
+        return
+    final, cutoffs = build_final_manifests(stats, labels, cfg["split"])
+    counts = write_final_manifests(final, layout.manifest_dir)
+    logger.info(f"Final manifests in {layout.manifest_dir}:")
+    for name in FINAL_SUBSETS:
+        groups = len({group_id(image_id) for image_id in final[name]})
+        logger.info(f"  {name:<13}{counts[name]:>9} images{groups:>7} groups")
+
+    for manifest_name in ("hard_test", "night_normal"):
+        sheet = save_manifest_sheet(
+            layout,
+            stats,
+            final[manifest_name],
+            out_dir / "contact_sheets",
+            name=manifest_name,
+            count=args.per_sheet,
+            seed=args.seed,
+            workers=args.workers,
+        )
+        if sheet:
+            logger.info(f"{manifest_name} contact sheet: {sheet}")
+    if cutoffs is None:
+        logger.info("Auto-day is off: no still collection entered a manifest")
+        return
+    logger.info(
+        f"Auto-day cutoffs: median luminance >= {cutoffs.min_luminance:.4g}, "
+        f"highlight ratio <= {cutoffs.max_highlight_ratio:.4g} "
+        f"(fit on {cutoffs.num_day} day and {cutoffs.num_other} non-day hand-labelled frames: "
+        f"{cutoffs.errors} errors, {100 * cutoffs.recall:.1f}% of day frames kept)"
+    )
+    accepted = auto_day_ids(stats, cutoffs)
+    sheet = save_auto_day_sheet(
+        layout,
+        stats,
+        accepted,
+        out_dir / "contact_sheets",
+        count=int(cfg["split"]["auto_day"]["contact_sheet"]),
+        seed=args.seed,
+        workers=args.workers,
+    )
+    logger.info(f"Auto-day accepted {len(accepted)} still images; spot-check sheet: {sheet}")
+
 
 def run_resize(cfg: dict, args: argparse.Namespace) -> None:
     from dawn.data.prepare import make_lowres_copy, run_parallel
@@ -145,8 +202,9 @@ def main():
     )
     parser.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
     parser.add_argument("--splits", nargs="+", default=None, help="Override visdrone.splits")
-    parser.add_argument("--workers", type=int, default=os.cpu_count() or 1,
-                        help="Processes (default: every core)")
+    parser.add_argument(
+        "--workers", type=int, default=os.cpu_count() or 1, help="Processes (default: every core)"
+    )
     phases = parser.add_subparsers(dest="phase", required=True)
 
     stats = phases.add_parser("stats", help="Phase 1: per-image stats CSV (slow, once)")
@@ -160,6 +218,12 @@ def main():
     split = phases.add_parser("split", help="Phase 2: labels -> manifests, plots, contact sheets")
     split.add_argument("--per-sheet", type=int, default=50, help="Thumbnails per contact sheet")
     split.add_argument("--seed", type=int, default=0, help="Contact-sheet sampling seed")
+    split.add_argument(
+        "--no-final",
+        dest="final",
+        action="store_false",
+        help="Per-label manifests and plots only: skip the four training manifests",
+    )
     split.set_defaults(run=run_split)
 
     resize = phases.add_parser("resize", help="Phase 3: 512-px linear-space PNG copies")

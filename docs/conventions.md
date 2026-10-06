@@ -123,16 +123,36 @@ One layout (§2.1), two spaces:
 - Conversion happens only through `standardize` / `unstandardize` (`dawn/grid/normalize.py`), and only here:
   1. Training target: `z_1 = standardize(fit_grid(...)[0])`.
   2. Render loss: `z1_hat = z_t + (1 - t)·v_pred` is standardized, so `unstandardize`, then `slice_grid`, then `apply_affine`, then compare with `day`. `FlowMatchingLoss` only receives the rendered image (`applied_pred`); it never sees stats.
-  3. Inference: the sampler output is standardized; `unstandardize` once, then slice.
+  3. Inference: `dawn.flow.sampler.sample_grid` integrates in standardized space and `unstandardize`s once before returning, so what a caller gets back is already raw and goes straight to `slice_grid`.
   4. Stage 2: fitted grids are already raw; flow-predicted grids go through `unstandardize` first.
 - Nothing else multiplies or divides by stats. A docstring that takes a grid states raw or standardized.
 - Flow time: `t = 0` is noise, `t = 1` is data. `z_t = (1 - t)·z_0 + t·z_1`, `v_target = z_1 - z_0`, samplers integrate 0 → 1.
+- **NFE is velocity evaluations, not steps.** Euler spends one per step, midpoint two, so `nfe = 2` is two Euler steps but a single midpoint step. `flow.num_inference_steps` is an NFE budget; `steps_for_nfe` converts.
 
 ## 6. Noise model
 
-`Var[y | x] = a·x + b` per pixel and channel, in linear `[0, 1]` units. `a` is the shot-noise gain, `b` the read-noise **variance** (σ², not a standard deviation). Both are positive. `camera.py` produces `(a, b)` as floats; the degradation transform exposes `noise_params = {"a": ..., "b": ...}`; `NoiseHead` predicts the natural logs `(log a, log b)`; `sensor_variance` takes raw `a`, `b`.
+`Var[y | x] = a·x + b` per pixel and channel, in linear `[0, 1]` units. `a` is the shot-noise gain, `b` the read-noise **variance** (σ², not a standard deviation). Both are positive. `NoiseHead` predicts the natural logs `(log a, log b)`; `sensor_variance` takes raw `a`, `b`.
+
+**Per channel.** `(a, b)` are `(3,)` tensors, not scalars. Everything after the sensor is a per-channel linear scale `s_c = gain · wb_c`, and a scale `s` takes `a → s·a` but `b → s²·b`, so the channel the white balance pushes hardest is disproportionately the noisiest. `CameraResult` and `DegradationResult` both carry `(3,)`; a single number is only ever a summary for reporting.
 
 **Resolution.** `(a, b)` are recorded at **native** resolution (the raw camera frame). A pixel that area-averages `n` native pixels (§4a) has `Var = (a/n)·x + b/n`: a sum of Poisson counts is Poisson and read-noise variances add, so this is exact. The camera model therefore simulates binned pixels: a 512-px training pixel stands for `n = W·H / (w·h)` native pixels, which is why `VisDroneDataset` returns `native_size` with every image.
+
+**Quantization.** The ADC digitizes native pixels, so `quant_var = step²/12` is reported at native resolution like `a` and `b` and divides by `n` with them. A simulated pixel that averages `n` 12-bit samples lands on a lattice `n` times finer. The full budget at the returned resolution is computed by `DegradationResult.variance()`, which uses the ISP matrices. Off the native path (where S and M are identity), it simplifies to:
+
+```
+Var[y_c] = (a_c · y_c + b_c + quant_var) / n
+```
+
+JPEG and the final 8-bit step are nonlinear and are **not** in the budget.
+
+**The ISP.** On the native path only, the ISP applies a colour-specific denoise blur (on C1, C2) and a composite denoise and unsharp mask. Because these are linear filters that mix channels, the variance of the output `y` involves a mixing matrix `S` and a DC colour matrix `M`:
+
+```
+x = M⁻¹ y
+Var[y] = S (a · x + b + quant_var) / n
+```
+
+where `S[i, j] = Σ_tap W[i, j, tap]²` and `M[i, j] = Σ_tap W[i, j, tap]` for the composite 3×3 channel kernel `W`. `CameraResult` reports `S` and `M` directly, and `DegradationResult.variance()` evaluates this exact formula. Off the native path, `S` and `M` are the identity.
 
 ## 7. Shapes at module boundaries
 
@@ -144,14 +164,17 @@ One layout (§2.1), two spaces:
 | `slice_grid(grid, guidance)` | raw grid, `(B,1,H,W)` → `coeffs (B,12,H,W)` |
 | `apply_affine(coeffs, image)` | `(B,12,H,W)`, `(B,3,H,W)` → `(B,3,H,W)`, clamped |
 | `standardize` / `unstandardize(grid, mean, std)` | grid `(B,12,K,gy,gx)`, stats `(12,K)` |
-| `DINOEncoder.forward(image_linear)` | `(B,3,256,256)` → `patch_tokens (B,256,384)`, `cls_token (B,384)`, and with `return_attn` also `patch_attn (B,256,256)`: last layer, head-averaged, CLS and the 4 register tokens stripped |
-| `VelocityTransformer(z_t, t, dino_features, dino_attn)` | `(B,12,K,gy,gx)`, `(B,)`, `(B,256,384)`, `(B,256,256)` → `v (B,12,K,gy,gx)` |
+| `DINOEncoder.forward(image_linear)` | `(B,3,256,256)` → `patch_tokens (B,256,384)`, `cls_token (B,384)`, and with `return_attn` also `patch_attn (B,256,256)`: last layer, head-averaged, CLS and the 4 register tokens stripped, rows renormalized to sum to 1, detached |
+| `DINOEncoder.encode(image_linear)` | `(B,3,256,256)` → dict: `patch_tokens (B,256,384)`, `patch_map (B,384,16,16)` (the same tokens, row-major), `cls (B,384)`, `thumb (B,3,16,16)` = `log(area_downsample(linear) + 1e-3)`, and with `return_attn` also `attn_bias (B,1,256,256)` = `log(patch_attn + 1e-6)` |
+| `VelocityTransformer(z_t, t, dino_features, dino_attn, thumb)` | `(B,12,K,gy,gx)`, `(B,)`, `(B,256,384)`, `(B,256,256)`, `(B,3,gy,gx)` → `v (B,12,K,gy,gx)`. `attn_bias (B,1,256,256)` may be passed instead of `dino_attn` |
 | `euler_sample(velocity_fn, z_0, n)` | `(B,12,K,gy,gx)` → same, standardized |
-| `NoiseHead(dino_features)` | `(B,256,384)` → `(B,2)` |
+| `sample_grid(velocity_model, dino_features, mean, std, …)` | `(B,256,384)`, stats `(12,K)` → `(num_samples,B,12,K,gy,gx)` **raw** |
+| `NoiseHead(cls_token)` | `(B,384)`, or `(B,256,384)` patch tokens which are mean-pooled first → `(B,2)` = `(log a, log b)` at native resolution |
 | `propagate_variance(coeffs, sigma_sq_in)` | `(B,12,H,W)`, `(B,3,H,W)` → `(B,3,H,W)` |
 | `BoundedDenoiser(enhanced, log_variance)` | `(B,3,H,W)` linear, `(B,1,H,W)` → `(B,3,H,W)` linear |
 | `area_downsample(img, (h, w))` | `(..., H, W)` float → `(..., h, w)`, same dtype and device |
 | `VisDroneDataset[i]` | dict: `day` `(3,h,w)` linear, `image_id`, `native_size` `(2,)` int64 `(W, H)`, `scale`; in `eval` mode also `boxes` `(N,4)` xyxy and `categories` `(N,)`. No degradation: that is a separate transform in the dataloader workers, which ends with fixed 256×256 `night`, `night_clean`, `day` and `noise_params` |
+| `NightPairs[i]` | that transform (`dawn/flow/dataset.py`): dict with `night`, `night_clean`, `day` `(3,256,256)` linear, `noise_params`, `image_id`, `native_size` |
 
 ## 8. Rules
 
@@ -166,3 +189,43 @@ One layout (§2.1), two spaces:
 
 - The guidance blur is a fixed 5×5 **pixels**. At 256² training 5 px is 2% of the width; at 2000×1500 inference it is 0.25%, so the effective smoothing differs. If bins flicker at full resolution, scale the kernel with resolution and update §4.
 - The 16×16 grid, 256-token layout and DINO patch correspondence in §2.3 are coupled; changing the grid size means changing the conditioning.
+- **Splat-and-solve is biased.** `fit_grid` solves each node against the pixels that touch it, as if that node alone applied to them; the renderer then blends 8 nodes per pixel. The two disagree wherever the grid changes quickly from node to node, so a fitted grid does not re-render its own target exactly even with no noise anywhere. The error is small on smooth grids and is what `refine_steps` buys down, by fitting the render residual and adding the correction. Judge a fit on the **rendered** image, never on coefficient error against a reference grid.
+
+## 10. Data: manifests, degradation, determinism
+
+### 10.1 The five manifests
+
+`scripts/prepare_visdrone.py split` ends by writing exactly five files, `<manifest_dir>/<name>.txt`, one image ID per line, sorted (`dawn/data/splitting.py: FINAL_SUBSETS`). Training, evaluation and the oracle check read these and nothing else.
+
+| manifest | what is in it |
+|---|---|
+| `train_day` | daytime sources for the degradation, drawn from `train` + `val` |
+| `val_day` | about 10% of the train+val **groups**, held out whole |
+| `test_day` | the daytime images of `test-dev`, left exactly as the dataset ships them |
+| `hard_test` | real near-black night frames (`lum_median <= hard_test_max_lum`): the only images that are never synthesized |
+| `night_normal` | real ordinary night frames (`lum_median > hard_test_max_lum`): qualitative comparison only, never synthesized |
+
+- A **group** is a video sequence ID, or the collection ID for a `99999xx` still collection (`splitting.group_id`). Consecutive frames of a VisDrone video are near-duplicates, so an image-level split puts almost the same picture on both sides and validation stops measuring anything. Whole groups move together, and `train_day`, `val_day` and `test_day` are checked to share no group ID on every build (both `hard_test` and `night_normal` are excluded from the disjointness check).
+- The hand labels in `data/labels/visdrone_labels.csv` are **never written by code**. Their vocabulary (day / night / dusk / exclude) becomes this project's through `split.label_map` in data.yaml, which is also the only place to change it.
+- Frames labelled `night` are split into `hard_test` and `night_normal` by the cutoff `split.night.hard_test_max_lum` in data.yaml (default 0.005). Empirically, 20 night-labelled frames are genuinely near-black (`lum_median <= 0.005`) while the other 100 are ordinary usable night (`lum_median >= 0.0086`, a clean gap).
+- A label on a sequence applies to every frame of that sequence; a label on a single image overrides its sequence.
+- The `99999xx` still collections carry no hand label. They are auto-accepted as day by cutoffs on median luminance and highlight ratio, fitted to make **zero** errors on the hand-labelled frames, and 200 random accepted stills are written to a contact sheet so a person can check what the cutoffs let through.
+
+### 10.2 The degradation contract
+
+`dawn/data/degrade.py` turns one daytime image into a matched pair, by composing `lighting.py` (reflectance × night illumination → scene radiance, ambient white = 1) and `camera.py` (sensor, auto exposure, ISP → night). It returns `night`, `night_clean`, `day`, `noise_a`, `noise_b`, `quant_var`, `n` and every sampled parameter.
+
+- **`night_clean` is the same camera pipeline with the noise draws replaced by their means and the JPEG skipped**, so `night_clean = E[night]` up to clipping. It is *not* the scene radiance: it already carries the exposure gain, the white balance and the ISP filters. Grid fitting is always `night_clean → day`, at the same resolution.
+- With the noise switched off, `night == night_clean` exactly.
+- The flow path returns a fixed 256×256. The daytime frame is area-downsampled **first** (§4a) and the sensor then simulates pixels `n` times bigger, rather than adding native-strength noise to a small image. The native path (denoiser crops) uses `n = 1` and is the only path that applies the in-camera denoise and sharpening.
+- Lighting modes are `moonlit`, `streetlit` (~65-75% of renders) and `starlight`. `streetlit` always has 1-8 lamp pools (20-400× ambient) and together with `starlight` scales with source overcast score (low p95/p05 luminance ratio); `moonlit` takes any. Small emissive points (lit window clusters, headlight and taillight pairs, saturated signs) are added directly to scene radiance (`radiance = reflectance * illumination + emission`) and are deliberately absent from the day target. Emitters use area-coverage rendering so integrated energy is resolution-independent.
+- Training takes a fresh random draw on every call, which is what makes the degradation an augmentation. Validation and test use fixed seeded sets at three darkness levels, `easy` / `medium` / `hard`, which are quantile bands of the target brightness distribution: `hard` is darker because the auto-exposure target is sampled from the darkest 33% of real night frames. The photon count is drawn to hit the target; if it hits the bounds of its range, the frame stays dark and the gain caps out.
+
+### 10.3 Determinism: the seed comes from the image ID
+
+Every random draw that belongs to one image derives its seed from that image's ID, through `dawn.data.seeding.seed_from_image_id(image_id, *salts)`. The same ID gives the same output on any machine, in any worker process, in any iteration order, with any batch size.
+
+- The hash is BLAKE2b over the ID and the salts, so it does not depend on `PYTHONHASHSEED`, and neighbouring IDs do not give neighbouring seeds.
+- Salts separate independent draws for the same image: the darkness level, the stage name. Use one rather than reusing a generator across purposes.
+- `generator_for(...)` returns a seeded `torch.Generator`. Pass it explicitly into every sampling call; never reseed the global RNG inside a dataset or a transform, which would make the result depend on how the loader happened to interleave workers.
+- A fresh draw is requested by passing no ID, not by passing a changing one.

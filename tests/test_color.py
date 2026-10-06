@@ -6,7 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from dawn.data.color import (
+from dawn.data.color import (  # noqa: E402
     COLOR_TEMP_MAX,
     COLOR_TEMP_MIN,
     REFERENCE_COLOR_TEMP,

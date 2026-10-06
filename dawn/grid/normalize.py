@@ -34,10 +34,51 @@ def compute_grid_stats(
         num_samples: Number of samples to use.
         device: Computation device.
 
+    Grids are fit one sample at a time and only the running sums are kept, so the memory cost
+    does not grow with `num_samples`. Statistics pool over samples and over both cell axes, but
+    never over coefficients or bins: a bin-0 offset and a bin-7 offset live on different scales
+    and sharing a mean would undo the point of standardizing.
+
     Returns:
         dict with 'mean' and 'std', each (12, K) float32, statistics over samples and cells.
+
+    Raises:
+        ValueError: `num_samples` is not positive, or the dataset yielded nothing usable.
     """
-    raise NotImplementedError
+    from dawn.grid.fit import fit_grid
+    from dawn.grid.guidance import compute_guidance
+
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+
+    count = 0.0
+    sum_x: torch.Tensor | None = None
+    sum_x2: torch.Tensor | None = None
+
+    for index in range(min(num_samples, len(dataset))):
+        sample = dataset[index]
+        night_clean = sample["night_clean"].to(device=device, dtype=torch.float32)
+        day = sample["day"].to(device=device, dtype=torch.float32)
+        if night_clean.ndim == 3:
+            night_clean, day = night_clean.unsqueeze(0), day.unsqueeze(0)
+        grid, _ = fit_grid(night_clean, day, compute_guidance(night_clean))
+        flat = grid.permute(1, 2, 0, 3, 4).reshape(grid.shape[1], grid.shape[2], -1)  # (12, K, M)
+        batch_sum, batch_sq = flat.sum(dim=-1), flat.pow(2).sum(dim=-1)
+        sum_x = batch_sum if sum_x is None else sum_x + batch_sum
+        sum_x2 = batch_sq if sum_x2 is None else sum_x2 + batch_sq
+        count += flat.shape[-1]
+
+    if sum_x is None or count == 0:
+        raise ValueError("dataset yielded no samples to compute grid stats from")
+
+    mean = sum_x / count
+    var = (sum_x2 / count - mean.pow(2)).clamp(min=0.0)
+    if count > 1:  # unbiased, to match torch.std's default
+        var = var * (count / (count - 1.0))
+    return {
+        "mean": mean.to(torch.float32).cpu(),
+        "std": var.sqrt().clamp(min=STD_FLOOR).to(torch.float32).cpu(),
+    }
 
 
 def _broadcast(stat: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
