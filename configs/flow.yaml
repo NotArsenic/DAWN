@@ -130,6 +130,7 @@ optim:
 loader:
   num_workers: 4          # PNG decode and flips run on CPU workers
   pin_memory: true
+  val_batch_size: 4       # validation runs at the full input resolution: keep it small
 
 # Logging.
 logging:

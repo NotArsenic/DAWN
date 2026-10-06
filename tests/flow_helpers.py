@@ -150,3 +150,58 @@ def synthetic_batch(batch: int = 2, size=TINY_INPUT, seed: int = 0, fallback=Non
         "image_id": [f"train_{seed:02d}{i:03d}" for i in range(batch)],
         "fallback": torch.tensor(fallback if fallback is not None else [False] * batch),
     }
+
+
+def write_tiny_tree(root, n_box: int = 3, n_fallback: int = 1, size=TINY_INPUT) -> dict:
+    """A tiny aligned-pairs tree on disk (what `AlignedPairs` reads); returns the config patch.
+
+    `train_pairs` and `val_pairs` each hold `n_box` box-aligned and `n_fallback` fallback pairs
+    (listed in `fallback_pairs`). Merge the result into `cfg["dronevehicle"]`. Never touches
+    data/DroneVehicle or data/dronevehicle_aligned.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from dawn.data import dronevehicle as dv
+    from dawn.data.color import linear_to_srgb8
+    from dawn.data.pairs import write_manifest
+
+    root = Path(root)
+    patch = {
+        "root": str(root / "raw"),
+        "aligned_dir": str(root / "aligned"),
+        "stats_csv": str(root / "stats.csv"),
+        "manifest_dir": str(root / "manifests"),
+        "outputs_dir": str(root / "out"),
+    }
+    layout = dv.DroneVehicleLayout.from_config(patch)
+    fallback_ids = []
+    for split_index, split in enumerate(("train", "val")):
+        ids = []
+        for i in range(n_box + n_fallback):
+            image_id = f"{split}_{i:05d}"
+            item = synthetic_batch(1, size, seed=10 * split_index + i)
+            arrays = {
+                "rgb": linear_to_srgb8(item["rgb"][0]).permute(1, 2, 0).numpy(),
+                "thermal": (item["thermal"][0, 0] * 255).round().to(torch.uint8).numpy(),
+            }
+            for kind in ("valid", "moving", "vehicles"):
+                arrays[kind] = item[kind][0, 0].numpy().astype(np.uint8) * 255
+            for kind, array in arrays.items():
+                path = layout.aligned_path(image_id, kind)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(array).save(path)
+            ids.append(image_id)
+            if i >= n_box:
+                fallback_ids.append(image_id)
+        write_manifest(layout.manifest(f"{split}_pairs"), ids)
+    write_manifest(layout.manifest("fallback_pairs"), fallback_ids)
+    return patch
+
+
+def tiny_data_cfg(root, correction: bool = False, n_box: int = 3, n_fallback: int = 1, **updates):
+    """`tiny_cfg` pointed at a tiny aligned tree under `root`."""
+    cfg = tiny_cfg(correction, **updates)
+    cfg["dronevehicle"].update(write_tiny_tree(root, n_box, n_fallback))
+    cfg["dronevehicle"]["max_pairs"] = None
+    return cfg
