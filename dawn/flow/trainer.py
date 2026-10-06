@@ -41,7 +41,7 @@ import torch.nn as nn
 
 from dawn.data.color import linear_to_lab, linear_to_srgb
 from dawn.data.resample import area_downsample
-from dawn.eval.metrics import ciede2000, colorfulness, masked_psnr
+from dawn.eval.metrics import ciede2000, colorfulness, masked_mean, masked_psnr
 from dawn.flow.color_bins import patch_histograms, patch_mask_fraction
 from dawn.flow.loss import FlowLoss
 from dawn.flow.render import RenderSettings, render
@@ -468,7 +468,6 @@ class FlowTrainer:
         nfe = self.inference_nfe if nfe is None else nfe
         totals: dict[str, float] = {}
         count = 0
-        tiny = torch.finfo(torch.float32).tiny
 
         def record(key: str, values: torch.Tensor, keep: torch.Tensor) -> None:
             totals[key] = totals.get(key, 0.0) + float(values[keep].sum())
@@ -486,8 +485,7 @@ class FlowTrainer:
 
             def score(name: str, rendered: Mapping[str, torch.Tensor]) -> None:
                 psnr = masked_psnr(rendered["lab"][:, :1], true_lab[:, :1], mask, peak=100.0)
-                diff = ciede2000(rendered["lab"], true_lab).unsqueeze(1)
-                delta = (diff * mask).sum(dim=(1, 2, 3)) / mask.sum(dim=(1, 2, 3)).clamp(min=tiny)
+                delta = masked_mean(ciede2000(rendered["lab"], true_lab), mask)
                 color = colorfulness(linear_to_srgb(rendered["rgb"]) * 255.0)
                 record(f"psnr_L/{name}", psnr, keep)
                 record(f"ciede2000/{name}", delta, keep)

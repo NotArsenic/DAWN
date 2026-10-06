@@ -13,11 +13,6 @@ pytest.importorskip("torch")
 import dawn  # noqa: E402
 
 SCRIPTS = sorted((Path(__file__).resolve().parents[1] / "scripts").glob("*.py"))
-# Scripts of the old night regime that cannot import until the flow phase rebuilds them.
-# `train_flow.py` imports the deleted `dawn.flow.dataset`. Add nothing else here: a script that
-# breaks for another reason needs fixing, not parking.
-PARKED_SCRIPTS = {"train_flow.py"}
-PARKED_REASON = "parked: old night-regime trainer, rebuilt in the flow phase"
 
 
 @pytest.mark.parametrize(
@@ -29,8 +24,6 @@ def test_module_imports(name):
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.name)
 def test_script_help(script, monkeypatch):
-    if script.name in PARKED_SCRIPTS:
-        pytest.skip(PARKED_REASON)
     spec = importlib.util.spec_from_file_location(f"script_{script.stem}", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

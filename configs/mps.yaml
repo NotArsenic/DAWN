@@ -1,0 +1,43 @@
+# Mac overlay (Apple GPU / MPS): fp32 and a smaller frame, for the overfit-100 sanity run.
+#
+#   python scripts/train_flow.py --config configs/flow.yaml --override configs/mps.yaml \
+#       --device mps --overfit 100 --out-dir outputs/overfit
+#
+# bf16 autocast on MPS is patchy (silent slowdowns, errors that have nothing to do with the
+# model), so this overlay runs fp32; bf16 stays the CUDA default in flow.yaml. Set
+# PYTORCH_ENABLE_MPS_FALLBACK=1 if an op is missing on your PyTorch build.
+# The 640x512 numbers (VRAM, speed) need the GPU gate (docs: README, "GPU gate commands").
+
+encoder:
+  input_size: [256, 320]   # half resolution: a 16 x 20 token grid, a 64 x 80 colour map
+  pretrained: true         # needs the DINOv3 license + HF login; override with pretrained=false
+  grad_checkpointing: false
+
+flow:
+  render_size: [128, 160]  # 8 x 8 render pixels per patch
+  num_train_steps: 1500
+  warmup_steps: 200        # the detach schedule, scaled to the short run
+
+color:
+  bgu:
+    grid: [8, 10]
+
+grid:
+  stats_num_samples: 300   # the stats pass runs on this machine; 2,000 is for the real run
+
+optim:
+  batch_size: 8
+  precision: fp32
+  lr_warmup_steps: 100
+
+loader:
+  num_workers: 2
+  pin_memory: false
+  val_batch_size: 4
+
+logging:
+  wandb_mode: disabled
+  log_every: 25
+  save_every: 500
+  val_every: 250
+  num_val_samples: 16

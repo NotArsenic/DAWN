@@ -1,21 +1,34 @@
-# Debug overlay: a tiny, fast stage-1 run that exercises the whole loop end to end.
+# Debug overlay: a tiny, fast stage-1 run that exercises the whole loop end to end on REAL aligned
+# pairs, on the CPU.
 #
 # Merged on top of flow.yaml + data.yaml, later files winning:
 #   python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu
+# Add `configs/debug.yaml` to `--override` together with `--out-dir outputs/debug` to keep the
+# checkpoints out of ./checkpoints.
 #
 # Every key here must already exist in flow.yaml or data.yaml (tests/test_configs.py checks it),
 # so a typo cannot silently do nothing.
 
 dronevehicle:
-  max_pairs: 16
+  max_pairs: 16            # the first 16 pairs of every manifest
 
 encoder:
+  input_size: [256, 320]   # (H, W): a 16 x 20 token grid, a 64 x 80 colour map
   pretrained: false        # no HF token, no gated download: random weights are enough here
+  grad_checkpointing: false
 
 flow:
-  num_train_steps: 50
+  num_train_steps: 40
   timesteps_per_image: 2
   warmup_steps: 10
+  render_size: [128, 160]  # 8 x 8 render pixels per patch
+
+color:
+  bgu:
+    grid: [8, 10]          # a coarser bilateral grid for the 64 x 80 colour map
+
+grid:
+  stats_num_samples: 16
 
 optim:
   batch_size: 2
@@ -23,13 +36,13 @@ optim:
   lr_warmup_steps: 5
 
 loader:
-  num_workers: 0           # degradation in-process: a traceback instead of a worker crash
+  num_workers: 0           # in-process: a traceback instead of a worker crash
   pin_memory: false
-  synthetic_images: 16     # generated images, so the run needs nothing on disk
+  val_batch_size: 2
 
 logging:
   wandb_mode: disabled
   log_every: 1
-  save_every: 25
-  val_every: 25
+  save_every: 20
+  val_every: 20
   num_val_samples: 4

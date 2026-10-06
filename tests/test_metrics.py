@@ -6,7 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from dawn.eval.metrics import ciede2000, colorfulness, masked_psnr  # noqa: E402
+from dawn.eval.metrics import ciede2000, colorfulness, masked_mean, masked_psnr  # noqa: E402
 
 
 def _random_lab(shape, seed):
@@ -113,3 +113,13 @@ def test_colorfulness_matches_the_hasler_suesstrunk_formula():
 def test_colorfulness_rejects_non_rgb():
     with pytest.raises(ValueError, match="RGB"):
         colorfulness(torch.rand(1, 1, 4, 4))
+
+
+def test_masked_mean_is_a_weighted_mean_per_image_and_zero_without_weight():
+    value = torch.arange(8.0).reshape(2, 1, 2, 2)
+    mask = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]], [[[0.0, 0.0], [0.0, 0.0]]]])
+    out = masked_mean(value, mask)
+    assert torch.allclose(out, torch.tensor([1.0, 0.0]))  # (0 + 2) / 2 ; an empty mask is 0
+    half = masked_mean(torch.tensor([[[0.0, 4.0]]]), torch.tensor([[[[1.0, 0.5]]]]))
+    assert torch.allclose(half, torch.tensor([2.0 / 1.5]))
+    assert masked_mean(torch.ones(2, 4, 4), torch.ones(2, 1, 4, 4)).shape == (2,)

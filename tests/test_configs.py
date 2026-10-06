@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("torch")
 omegaconf = pytest.importorskip("omegaconf")
 
-from dawn.grid import layout  # noqa: E402
+from dawn.flow.tokens import TokenLayout  # noqa: E402
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
@@ -37,10 +37,17 @@ def test_config_parses(name):
     assert isinstance(_load(name), dict)
 
 
-def test_grid_config_matches_layout():
-    grid = _load("flow.yaml")["grid"]
-    assert grid["coeffs_per_bin"] == layout.NUM_COEFFS
-    assert grid["spatial_size"] * grid["spatial_size"] == 256  # tokens; docs/conventions.md 2.3
+def test_the_default_resolution_is_the_plans_and_everything_derives_from_it():
+    cfg = _load("flow.yaml")
+    assert cfg["encoder"]["input_size"] == [512, 640]  # (H, W) of the 640x512 frame
+    layout = TokenLayout.from_config(cfg)
+    assert layout.grid == (32, 40) and layout.num_tokens == 1280
+    assert layout.color_size == (128, 160) and layout.dim == 48
+    assert cfg["encoder"]["grad_checkpointing"] is True
+    render = cfg["flow"]["render_size"]
+    assert (
+        render == [256, 320] and render[0] % layout.grid[0] == 0 and render[1] % layout.grid[1] == 0
+    )
 
 
 def test_flow_config_has_the_decided_keys():
@@ -50,14 +57,56 @@ def test_flow_config_has_the_decided_keys():
         assert set(cfg["encoder"][table]) == {"timm", "transformers"}
     for path in [
         ("encoder", "lora_alpha"),
+        ("encoder", "input_size"),
+        ("grid", "num_bins"),
+        ("grid", "ridge_alpha"),
+        ("grid", "refine_steps"),
+        ("grid", "stats_cache"),
+        ("grid", "stats_num_samples"),
+        ("color", "block"),
+        ("color", "bin_step"),
+        ("color", "soft_k"),
+        ("color", "soft_sigma"),
+        ("color", "min_patch_fraction"),
+        ("color", "bgu", "bins"),
+        ("color", "bgu", "grid"),
+        ("color", "bgu", "ridge_alpha"),
+        ("color", "bgu", "refine_steps"),
+        ("brightness_correction", "enabled"),
+        ("flow", "velocity_weight"),
+        ("flow", "render_weight"),
         ("flow", "align_weight"),
+        ("flow", "color_weight"),
+        ("flow", "segment_balance"),
+        ("flow", "render_size"),
         ("flow", "timesteps_per_image"),
         ("flow", "warmup_steps"),
         ("velocity", "detach_dino_attn"),
+        ("loader", "val_batch_size"),
         ("logging", "log_attn_gates"),
         ("logging", "wandb_mode"),
     ]:
         assert _has(cfg, path), ".".join(path)
+    assert not _has(cfg, ("flow", "noise_weight")) and not _has(cfg, ("grid", "spatial_size"))
+
+
+def test_the_decided_values_hold():
+    cfg = _load("flow.yaml")
+    assert cfg["brightness_correction"]["enabled"] is False  # off until the oracle sheet + GPU gate
+    assert cfg["grid"]["num_bins"] == 8 and cfg["grid"]["refine_steps"] == 1
+    assert cfg["color"]["block"] == 4 and cfg["color"]["bin_step"] == 10
+    assert (cfg["color"]["soft_k"], cfg["color"]["soft_sigma"]) == (5, 5.0)
+    flow = cfg["flow"]
+    assert (flow["velocity_weight"], flow["render_weight"]) == (1.0, 0.1)
+    assert (flow["align_weight"], flow["color_weight"]) == (0.5, 0.2)
+    # 20K steps (~90 passes over ~3,660 pairs; 40K would be ~175) with a 3K-step detach warmup.
+    assert flow["num_train_steps"] == 20000 and flow["warmup_steps"] == 3000
+    assert flow["timesteps_per_image"] == 4 and flow["num_inference_steps"] == 2
+    assert flow["segment_balance"] == "per_value"  # a stated choice, see flow.yaml
+    assert cfg["optim"]["batch_size"] == 16 and cfg["optim"]["precision"] == "bf16"
+    assert (
+        cfg["optim"]["lr_warmup_steps"] == 1000
+    )  # the optimizer's warmup is not flow.warmup_steps
 
 
 def test_flow_config_records_the_pair_policy():
@@ -126,7 +175,48 @@ def test_data_config_decisions_hold():
     assert cfg["align"]["exclude_copied_boxes"] is True
 
 
-def test_debug_overlay_only_overrides_existing_keys():
+OVERLAYS = ["debug.yaml", "mps.yaml", "gpu_probe.yaml"]
+
+
+@pytest.mark.parametrize("name", OVERLAYS)
+def test_overlays_only_override_existing_keys(name):
     base = {**_load("flow.yaml"), **_load("data.yaml")}
-    missing = [".".join(p) for p in _leaf_paths(_load("debug.yaml")) if not _has(base, p)]
-    assert not missing, f"debug.yaml overrides keys that do not exist: {missing}"
+    missing = [".".join(p) for p in _leaf_paths(_load(name)) if not _has(base, p)]
+    assert not missing, f"{name} overrides keys that do not exist: {missing}"
+
+
+def _merged(*overlays):
+    cfg = omegaconf.OmegaConf.merge(
+        omegaconf.OmegaConf.load(CONFIGS / "flow.yaml"),
+        omegaconf.OmegaConf.load(CONFIGS / "data.yaml"),
+        *[omegaconf.OmegaConf.load(CONFIGS / name) for name in overlays],
+    )
+    return omegaconf.OmegaConf.to_container(cfg, resolve=True)
+
+
+@pytest.mark.parametrize("name", OVERLAYS)
+def test_overlays_give_a_consistent_resolution(name):
+    cfg = _merged(name)
+    layout = TokenLayout.from_config(cfg)
+    render, color = cfg["flow"]["render_size"], layout.color_size
+    assert render[0] % layout.grid[0] == 0 and render[1] % layout.grid[1] == 0
+    assert render[0] >= color[0] and render[1] >= color[1]
+    assert render[0] <= cfg["encoder"]["input_size"][0]
+
+
+def test_the_mac_overlay_is_fp32_and_the_gpu_probe_keeps_the_real_precision():
+    assert _merged("mps.yaml")["optim"]["precision"] == "fp32"
+    assert _merged("debug.yaml")["optim"]["precision"] == "fp32"
+    probe = _merged("gpu_probe.yaml")
+    assert probe["optim"]["precision"] == "bf16" and probe["optim"]["batch_size"] == 16
+    assert probe["encoder"]["input_size"] == [512, 640] and probe["flow"]["warmup_steps"] < 50
+
+
+def test_the_debug_overlay_runs_on_the_cpu_with_random_weights_and_no_wandb():
+    cfg = _merged("debug.yaml")
+    assert cfg["encoder"]["pretrained"] is False and cfg["logging"]["wandb_mode"] == "disabled"
+    assert cfg["dronevehicle"]["max_pairs"] == 16 and cfg["loader"]["num_workers"] == 0
+
+
+def test_the_old_regime_configs_are_gone():
+    assert not (CONFIGS / "camera_calib.yaml").exists()

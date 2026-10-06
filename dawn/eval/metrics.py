@@ -105,6 +105,23 @@ def masked_psnr(
     return 10.0 * torch.log10(peak**2 / mse.clamp(min=1e-10))
 
 
+def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Per-image mean of `value` over the pixels that count: `sum(value * w) / sum(w)`.
+
+    Args:
+        value: (B, H, W) or (B, 1, H, W) per-pixel values (a colour difference, an error norm).
+        mask: (B, 1, H, W) weights in [0, 1].
+
+    Returns:
+        (B,), 0 for an image with no weight.
+    """
+    weight = mask.to(torch.float32).flatten(1)
+    value = value.to(torch.float32).reshape(value.shape[0], -1)
+    return (value * weight).sum(dim=1) / weight.sum(dim=1).clamp(
+        min=torch.finfo(torch.float32).tiny
+    )
+
+
 def ciede2000(
     lab_1: torch.Tensor, lab_2: torch.Tensor, k_l: float = 1.0, k_c: float = 1.0, k_h: float = 1.0
 ) -> torch.Tensor:

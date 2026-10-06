@@ -1,0 +1,20 @@
+# GPU probe overlay: 50 steps of the REAL configuration, to read peak VRAM and seconds per step
+# before committing a night to a run. The Mac cannot measure VRAM at 640x512, and DINO's attention
+# is passed to the velocity net as a float mask, so PyTorch has to pick an attention kernel that
+# keeps 1,280-token attention affordable: this is where you find out.
+#
+#   python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_probe.yaml \
+#       --device cuda --max-steps 50 --out-dir outputs/gpu_probe
+#
+# The detach warmup is shortened so BOTH regimes (LoRA fed by L_align / L_color only, then by every
+# loss) run inside the 50 steps; precision, batch size and resolution are the real ones.
+
+flow:
+  warmup_steps: 10
+
+logging:
+  wandb_mode: disabled
+  log_every: 5
+  save_every: 1000000
+  val_every: 1000000      # no validation in the probe (it is the training step that is measured)
+  num_val_samples: 8
