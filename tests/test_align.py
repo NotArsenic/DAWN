@@ -757,3 +757,131 @@ def test_rgb_edge_luma_is_the_srgb_coded_luma_of_a_linear_image():
     luma = align.rgb_edge_luma(rgb)
     assert luma.shape == (4, 4) and luma.dtype == np.float32
     assert luma[0, 0] == pytest.approx(0.8625, abs=1e-3)  # sRGB code of linear 0.7152, /255
+
+
+# --- edge-correlation fallback: the translation estimator ----------------------------------------
+
+FB_CFG = align.AlignConfig(
+    fallback_search_px=6, fallback_min_prominence=0.02, fallback_max_quadrant_dev_px=2
+)
+
+
+def _brute_ncc(ref, padded, s):
+    """Pearson correlation for every shift by looping: grid[dy + s, dx + s]."""
+    h, w = ref.shape
+    out = np.zeros((2 * s + 1, 2 * s + 1))
+    for dy in range(-s, s + 1):
+        for dx in range(-s, s + 1):
+            cand = padded[s - dy : s - dy + h, s - dx : s - dx + w]
+            out[dy + s, dx + s] = np.corrcoef(cand.ravel(), ref.ravel())[0, 1]
+    return out
+
+
+def test_ncc_grid_matches_a_brute_force_loop_over_shifts():
+    rng = np.random.default_rng(0)
+    s = 3
+    ref = rng.random((24, 30))
+    padded = rng.random((24 + 2 * s, 30 + 2 * s))
+    got = align._ncc_grid(torch.from_numpy(ref), torch.from_numpy(padded), s).numpy()
+    np.testing.assert_allclose(got, _brute_ncc(ref, padded, s), atol=1e-9)
+
+
+def test_ncc_grid_peaks_at_the_shift_that_realigns_the_content():
+    rng = np.random.default_rng(1)
+    s = 4
+    base = rng.random((60, 70))
+    # the content of `padded` is `ref` displaced by (+2 cols, -3 rows): realigning moves it by
+    # (-2, +3), and grid[dy + s, dx + s] is the correlation after moving the content by (dx, dy)
+    ref = base[10:50, 10:60]
+    padded = np.zeros((40 + 2 * s, 50 + 2 * s))
+    padded[:, :] = base[10 - s + 3 : 50 + s + 3, 10 - s - 2 : 60 + s - 2]
+    grid = align._ncc_grid(torch.from_numpy(ref), torch.from_numpy(padded), s).numpy()
+    iy, ix = np.unravel_index(grid.argmax(), grid.shape)
+    assert (ix - s, iy - s) == (-2, 3)
+    assert grid.max() == pytest.approx(1.0, abs=1e-9)
+
+
+def _textured(seed=0):
+    return _luma(seed)  # blurred noise with sharp rectangles: plenty of edges
+
+
+def _thermal_from(luma, dx, dy):
+    """A thermal whose content sits where RGB content sits, displaced by (-dx, -dy)."""
+    return torch.from_numpy(_shifted(luma, -dx, -dy))[None]
+
+
+@pytest.mark.parametrize("dx, dy", [(0, 0), (3, -2), (-5, 4), (6, 0)])
+def test_the_estimator_recovers_a_known_translation(dx, dy):
+    luma = _textured(2)
+    est = align.edge_translation(_thermal_from(luma, dx, dy), luma, FB_CFG)
+    assert (est.dx, est.dy) == (dx, dy)
+    assert est.prominence > 0.02 and est.quad_dev == 0
+    assert est.corr > est.corr_at_zero or (dx, dy) == (0, 0)
+    assert est.saturated == (max(abs(dx), abs(dy)) == FB_CFG.fallback_search_px)
+
+
+def test_a_shift_beyond_the_window_is_flagged_as_saturated_not_trusted():
+    luma = _textured(3)
+    est = align.edge_translation(_thermal_from(luma, 9, 0), luma, FB_CFG)
+    assert est.saturated
+    assert not align.fallback_accepts(est, FB_CFG)
+
+
+def test_unrelated_content_has_no_prominent_peak_or_disagreeing_quadrants():
+    a, b = _textured(4), _textured(5)
+    est = align.edge_translation(torch.from_numpy(b)[None], a, FB_CFG)
+    assert not align.fallback_accepts(est, FB_CFG)
+
+
+def test_quadrants_that_move_differently_are_rejected_even_with_a_clear_global_peak():
+    luma = _textured(6)
+    thermal = _shifted(luma, -2, 0).copy()  # most of the frame shifted by +2 columns
+    thermal[:, 320:] = _shifted(luma, 3, 0)[:, 320:]  # the right half the other way
+    est = align.edge_translation(torch.from_numpy(thermal)[None], luma, FB_CFG)
+    assert est.quad_dev >= 3
+    assert not align.fallback_accepts(est, FB_CFG)
+
+
+def _est(**kw):
+    base = dict(
+        dx=1, dy=-1, corr=0.7, corr_at_zero=0.5, prominence=0.05, quad_dev=1, saturated=False
+    )
+    return align.TranslationEstimate(**{**base, **kw})
+
+
+@pytest.mark.parametrize(
+    "change, accepted",
+    [
+        ({}, True),
+        ({"prominence": 0.02}, True),  # inclusive
+        ({"prominence": 0.0199}, False),
+        ({"quad_dev": 2}, True),  # inclusive
+        ({"quad_dev": 3}, False),
+        ({"saturated": True}, False),
+        ({"prominence": float("nan")}, False),
+    ],
+)
+def test_the_fallback_acceptance_rule_at_its_boundaries(change, accepted):
+    assert align.fallback_accepts(_est(**change), FB_CFG) is accepted
+
+
+def test_the_fallback_can_be_switched_off():
+    off = align.AlignConfig(fallback_enabled=False)
+    assert not align.fallback_accepts(_est(), off)
+
+
+def test_translation_matrix_moves_thermal_pixels_onto_rgb():
+    T = align.translation_matrix(4, -3)
+    np.testing.assert_allclose(align.apply_transform(T, np.array([[10.0, 20.0]])), [[14.0, 17.0]])
+    scale, rot, shift = align.transform_summary(T, SIZE)
+    assert (scale, rot, shift) == (pytest.approx(1.0), pytest.approx(0.0), pytest.approx(5.0))
+
+
+def test_config_reads_the_fallback_section_of_data_yaml():
+    path = Path(__file__).resolve().parents[1] / "configs" / "data.yaml"
+    cfg = align.AlignConfig.from_config(
+        omegaconf.OmegaConf.to_container(omegaconf.OmegaConf.load(path))["align"]
+    )
+    assert cfg.fallback_enabled is True
+    assert (cfg.fallback_search_px, cfg.fallback_min_prominence) == (10, 0.02)
+    assert cfg.fallback_max_quadrant_dev_px == 2

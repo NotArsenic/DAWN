@@ -101,14 +101,21 @@ def write_aligned_pair(
     warped, valid = align.warp_thermal(thermal8.float() / 255, transform, layout.crop_size)
     thermal_codes = (warped[0].clamp(0, 1) * 255).round().to(torch.uint8)
 
-    thermal_ann = dv.parse_annotation(
-        layout.thermal_label(split, stem), layout.class_map, layout.border
-    )
-    rgb_ann = dv.parse_annotation(layout.rgb_label(split, stem), layout.class_map, layout.border)
-    matches = align.match_boxes(thermal_ann.boxes, rgb_ann.boxes, cfg)
-    moving, _ = align.moving_mask(
-        thermal_ann.boxes, rgb_ann.boxes, matches, transform, layout.crop_size, cfg
-    )
+    if row.model == "edge_translation":
+        # Aligned by edge correlation, not boxes: a translation cannot tell which matched
+        # vehicles moved, so there is no moving mask (the pair is listed in fallback_pairs).
+        moving = torch.zeros(1, *layout.crop_size, dtype=torch.bool)
+    else:
+        thermal_ann = dv.parse_annotation(
+            layout.thermal_label(split, stem), layout.class_map, layout.border
+        )
+        rgb_ann = dv.parse_annotation(
+            layout.rgb_label(split, stem), layout.class_map, layout.border
+        )
+        matches = align.match_boxes(thermal_ann.boxes, rgb_ann.boxes, cfg)
+        moving, _ = align.moving_mask(
+            thermal_ann.boxes, rgb_ann.boxes, matches, transform, layout.crop_size, cfg
+        )
 
     _save_png(rgb8.permute(1, 2, 0).numpy(), paths["rgb"])
     _save_png(thermal_codes.numpy(), paths["thermal"])
@@ -202,6 +209,9 @@ class AlignedPairs(Dataset):
         valid     (1, 512, 640) bool     True where the warped thermal is real data
         moving    (1, 512, 640) bool     True on vehicles that moved between the two exposures
         image_id  str                    `<split>_<stem>`
+        fallback  bool                   aligned by edge correlation, not boxes: the `moving` mask
+                                         is empty and unknown, so keep the pair out of the pixel
+                                         losses (listed in `fallback_pairs.txt`)
 
     With `train=True`, a random horizontal and vertical flip is applied to all four tensors alike,
     then a random monotone contrast curve to thermal only. Validation and test (`train=False`) are
@@ -237,6 +247,8 @@ class AlignedPairs(Dataset):
         self.generator = generator
         limit = max_pairs if max_pairs is not None else layout.max_pairs
         self.image_ids = read_manifest(path)[:limit]
+        fallback_path = layout.manifest("fallback_pairs")
+        self.fallback_ids = set(read_manifest(fallback_path)) if fallback_path.exists() else set()
 
     @classmethod
     def from_config(
@@ -271,6 +283,7 @@ class AlignedPairs(Dataset):
             "valid": valid,
             "moving": moving,
             "image_id": image_id,
+            "fallback": image_id in self.fallback_ids,
         }
         return self._augmented(item) if self.train else item
 

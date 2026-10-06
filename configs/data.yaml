@@ -86,6 +86,20 @@ align:
     min_gain: -0.2        # RELAXED from 0.0: accept when correlation(after) - correlation(before) >= this
     search_px: 4          # best integer shift of the warped pair is searched within +/- this
     max_best_shift_px: 3  # RELAXED from 1: accept when that best shift is at most this (each axis)
+  # Edge-correlation fallback (plan step 7) for the pairs the boxes cannot judge: `labels_copied`
+  # (the thermal labels are copies of the RGB ones) and `few_matches`. Those ~4,900 day pairs are
+  # not known to be misaligned, there is just no evidence either way. The fallback estimates a
+  # global integer translation from the gradient-magnitude correlation of thermal and RGB, then
+  # again inside each image quadrant. Measured against box-fitted pairs (500 controls), accepted
+  # fallback pairs are within 2 px of the box fit 84% of the time and within 3 px 96% of the time,
+  # so they are noisier than box pairs. They have no moving mask (no boxes were matched) and are
+  # listed in `fallback_pairs.txt`; the loss code should keep them out of the pixel losses.
+  fallback:
+    enabled: true
+    search_px: 10         # shifts within +/- this are tried; a best shift ON this edge is "saturated"
+                          # (the true shift may be larger) and is rejected
+    min_prominence: 0.02  # the correlation peak must beat the best shift >= 2 px from it by this
+    max_quadrant_dev_px: 2    # each image quadrant's own best shift must be within this of the global
   # Moving vehicles (plan step 10)
   moving:
     min_residual_px: 4    # a matched box whose own residual under the fit exceeds this moved

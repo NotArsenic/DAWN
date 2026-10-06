@@ -12,15 +12,18 @@
             *** Choose the cutoff by looking at these before running `align`. ***
     align   Box matching, RANSAC similarity (homography fallback), acceptance and the
             independent edge check for the day pairs -> <manifest_dir>/logs/align.csv, with the
-            fitted transform of every pair. Incremental: only pairs missing from the log are
-            computed, unless the align thresholds changed (then all) or `--force`.
+            fitted transform of every pair. Pairs the boxes cannot judge (`labels_copied`,
+            `few_matches`) get the edge-correlation fallback (`align.fallback`). Incremental: only
+            pairs missing from the log are computed, unless the align thresholds changed (then
+            all) or `--force`.
             `--include-copied` is a dry run with copied boxes allowed to count as evidence: it
             writes <outputs_dir>/align_include_copied.csv and touches nothing else.
     dedup   Accepted val and test pairs against the train pairs that passed the day filter
             (RGB and thermal hashes both within `dedup.max_hamming`) -> logs/dedup.csv and an
             example sheet just under / over the threshold.
     write   Warp, mask and write the PNGs of the surviving pairs under `aligned_dir`, the three
-            manifests <manifest_dir>/{train,val,test}_pairs.txt and logs/summary.md.
+            manifests <manifest_dir>/{train,val,test}_pairs.txt, <manifest_dir>/fallback_pairs.txt
+            (the ones aligned by edge correlation instead of boxes) and logs/summary.md.
     all     stats, day, align, dedup, write, with no pause. Look at `day` first on a new dataset.
 
 Paths and thresholds come from configs/data.yaml. Every stage skips work already on disk unless
@@ -189,9 +192,11 @@ def run_align(cfg: dict, args: argparse.Namespace) -> None:
     for split in args.splits:
         reasons = Counter(r.reason for r in ordered if _split_of(r.image_id) == split)
         logger.info(f"  {split}: {dict(sorted(reasons.items(), key=lambda kv: -kv[1]))}")
+    by_edges = sum(r.model == "edge_translation" for r in ordered)
     logger.info(
         f"  match gate: {acfg.max_match_dist_px:g} px; homography fallback used on "
-        f"{sum(r.model == 'homography' for r in ordered)} pairs"
+        f"{sum(r.model == 'homography' for r in ordered)} pairs; edge-correlation fallback aligned "
+        f"{by_edges} of {sum(r.fb_tried for r in ordered)} tried"
     )
 
 
@@ -284,6 +289,12 @@ def run_write(cfg: dict, args: argparse.Namespace) -> None:
         ids = [i for i in keep if _split_of(i) == split]
         pairs.write_manifest(layout.manifest(f"{split}_pairs"), ids)
         logger.info(f"  {layout.manifest(f'{split}_pairs')}: {len(ids)} pairs")
+    fallback = report.fallback_ids(final, aligned)
+    pairs.write_manifest(layout.manifest("fallback_pairs"), fallback)
+    logger.info(
+        f"  {layout.manifest('fallback_pairs')}: {len(fallback)} of them aligned by edge "
+        "correlation (no boxes, no moving mask)"
+    )
     summary = layout.log("summary").with_suffix(".md")
     summary.parent.mkdir(parents=True, exist_ok=True)
     summary.write_text(report.build_summary(stats, day_log, aligned, dedups, cfg), encoding="utf-8")

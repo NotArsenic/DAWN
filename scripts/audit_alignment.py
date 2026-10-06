@@ -10,6 +10,9 @@ Reads the align log written by `prepare_dronevehicle.py align` and writes, under
     fit_histograms.png  histograms of the median inlier residual, scale, rotation, shift and the
                       edge-check gain, accepted against rejected, with the thresholds marked
     sampled.csv       which pair is on which sheet, and why it was rejected
+    fallback_accepted_NN.jpg / fallback_rejected_NN.jpg   the pairs the edge-correlation fallback
+                      aligned (no boxes behind them) and the ones it looked at and rejected, on
+                      sheets of their own: audit these separately from the box-aligned pairs
     usable_luminance.png  luminance of the usable pairs (the final manifests) against the day
                       pairs that were rejected later, per split
     usable_darkest.jpg / usable_random.jpg   RGB | thermal of the 24 darkest and of 24 random
@@ -49,6 +52,12 @@ def main() -> None:
     parser.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
     parser.add_argument("--accepted", type=int, default=100, help="Accepted pairs to show")
     parser.add_argument("--rejected", type=int, default=100, help="Rejected pairs to show")
+    parser.add_argument(
+        "--fallback",
+        type=int,
+        default=60,
+        help="Edge-fallback pairs to show, accepted (and rejected)",
+    )
     parser.add_argument("--per-sheet", type=int, default=20, help="Tiles per sheet")
     parser.add_argument("--seed", type=int, default=0, help="Sampling seed")
     parser.add_argument(
@@ -69,7 +78,8 @@ def main() -> None:
     out_dir = layout.outputs_dir / "audit"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    accepted_all = sorted((r for r in rows if r.accepted), key=lambda r: r.image_id)
+    box_rows = [r for r in rows if r.model != "edge_translation"]
+    accepted_all = sorted((r for r in box_rows if r.accepted), key=lambda r: r.image_id)
     accepted = sorted(
         random.Random(f"{args.seed}/accepted").sample(
             accepted_all, min(args.accepted, len(accepted_all))
@@ -77,7 +87,7 @@ def main() -> None:
         key=lambda r: r.image_id,
     )
     by_reason: dict[str, list] = {}
-    for row in sorted((r for r in rows if not r.accepted), key=lambda r: r.image_id):
+    for row in sorted((r for r in box_rows if not r.accepted), key=lambda r: r.image_id):
         by_reason.setdefault(row.reason, []).append(row)
     rejected = [row for _, row in report.stratified_sample(by_reason, args.rejected, args.seed)]
     reason_counts = {reason: len(group) for reason, group in sorted(by_reason.items())}
@@ -91,6 +101,33 @@ def main() -> None:
     )
     for sheet in sheets:
         logger.info(f"Sheet: {sheet}")
+    fb_accepted = sorted(
+        (r for r in rows if r.model == "edge_translation"), key=lambda r: r.image_id
+    )
+    fb_rejected = sorted(
+        (r for r in rows if r.fb_tried and not r.accepted), key=lambda r: r.image_id
+    )
+    fb_sample = {
+        "fallback_accepted": random.Random(f"{args.seed}/fb_accepted").sample(
+            fb_accepted, min(args.fallback, len(fb_accepted))
+        ),
+        "fallback_rejected": random.Random(f"{args.seed}/fb_rejected").sample(
+            fb_rejected, min(args.fallback, len(fb_rejected))
+        ),
+    }
+    logger.info(
+        f"Edge fallback: {len(fb_accepted)} aligned, {len(fb_rejected)} tried and rejected; "
+        f"showing {len(fb_sample['fallback_accepted'])} and {len(fb_sample['fallback_rejected'])}"
+    )
+    sheets += audit.save_audit_sheets(
+        layout,
+        fb_sample["fallback_accepted"],
+        fb_sample["fallback_rejected"],
+        out_dir,
+        per_sheet=args.per_sheet,
+        workers=args.workers,
+        prefix="fallback_",
+    )
     hist = out_dir / "fit_histograms.png"
     audit.plot_fit_histograms(rows, acfg, hist)
     logger.info(f"Histograms: {hist}")
@@ -122,7 +159,12 @@ def main() -> None:
 
     with (out_dir / "sampled.csv").open("w", encoding="utf-8", newline="") as f:
         f.write("sheet,position,image_id,reason\n")
-        for name, shown in (("accepted", accepted), ("rejected", rejected)):
+        for name, shown in (
+            ("accepted", accepted),
+            ("rejected", rejected),
+            ("fallback_accepted", fb_sample["fallback_accepted"]),
+            ("fallback_rejected", fb_sample["fallback_rejected"]),
+        ):
             for index, row in enumerate(shown):
                 sheet = f"{name}_{index // args.per_sheet + 1:02d}.jpg"
                 f.write(f"{sheet},{index % args.per_sheet + 1},{row.image_id},{row.reason}\n")

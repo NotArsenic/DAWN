@@ -149,6 +149,23 @@ def test_summary_reports_alignment_diagnostics(world):
     assert "homography" in text and "moving" in text and "copied" in text
 
 
+def test_summary_counts_the_pairs_aligned_by_the_edge_fallback(world):
+    stats, day_log, aligned, dedups = world
+    aligned["train_1"] = _align("train_1", "ok", model="edge_translation", fb_tried=True)
+    aligned["train_3"] = _align("train_3", "labels_copied", fb_tried=True)  # tried, not accepted
+    text = report.build_summary(stats, day_log, aligned, dedups, {})
+    assert "aligned by the edge-correlation fallback: 1 (tried: 2)" in text
+
+
+def test_fallback_ids_are_the_final_pairs_whose_model_is_the_edge_translation(world):
+    stats, day_log, aligned, dedups = world
+    aligned["val_2"] = _align("val_2", "ok", model="edge_translation", fb_tried=True)
+    aligned["test_1"] = _align("test_1", "ok", model="edge_translation", fb_tried=True)
+    aligned["val_1"] = _align("val_1", "ok", model="edge_translation", fb_tried=True)  # near-dup
+    final = report.final_reasons(stats, day_log, aligned, dedups)
+    assert report.fallback_ids(final, aligned) == ["test_1", "val_2"]
+
+
 # --- stratified sampling -------------------------------------------------------------------------
 
 

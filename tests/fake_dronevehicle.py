@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -51,6 +51,7 @@ class PairSpec:
     has_thermal: bool = True
     copy_boxes: int = 0  # this many thermal boxes are exact copies of RGB boxes
     all_copied: bool = False  # the thermal label file equals the RGB one
+    content_unrelated: bool = False  # the thermal image shows a different scene altogether
     perspective: float = 0.0  # thermal boxes also bent by a perspective term: no similarity fits
     movers: tuple[int, ...] = ()  # vehicles whose thermal box is displaced 14 px (moved)
     content_shift_px: int = 0  # thermal content is displaced this much from what the labels say
@@ -75,8 +76,22 @@ FAKE_PAIRS = [
         copy_boxes=1,
         extras=True,
     ),
-    PairSpec("train", "00002", "labels copied", vehicles=10, seed=2, all_copied=True),
-    PairSpec("train", "00003", "few vehicles", (1.0, 0.3, 2, 1), vehicles=3, seed=3),
+    PairSpec(
+        "train",
+        "00002",
+        "labels copied, content aligned: edge fallback",
+        vehicles=10,
+        seed=2,
+        all_copied=True,
+    ),
+    PairSpec(
+        "train",
+        "00003",
+        "few vehicles, content aligned: edge fallback",
+        (1.0, 0.3, 2, 1),
+        vehicles=3,
+        seed=3,
+    ),
     PairSpec(
         "train", "00004", "night frame", (1.0, 0.0, 1, 1), vehicles=10, seed=4, brightness=0.12
     ),
@@ -110,6 +125,24 @@ FAKE_PAIRS = [
         seed=10,
         thermal_mode="RGB",
     ),
+    PairSpec(
+        "train",
+        "00011",
+        "labels copied, thermal content unrelated",
+        vehicles=10,
+        seed=11,
+        all_copied=True,
+        content_unrelated=True,
+    ),
+    PairSpec(
+        "train",
+        "00012",
+        "few vehicles, thermal content unrelated",
+        (1.0, 0.0, 2, 1),
+        vehicles=3,
+        seed=13,
+        content_unrelated=True,
+    ),
     PairSpec("val", "00001", "duplicate of train 00001", duplicate_of=("train", "00001")),
     PairSpec("val", "00002", "good, unique", (1.005, 0.2, 3, 4), vehicles=9, seed=12),
     PairSpec("test", "00001", "good, unique", (0.995, -0.3, -2, 5), vehicles=9, seed=21),
@@ -118,8 +151,8 @@ FAKE_PAIRS = [
 # What `stats -> day -> align -> dedup -> write` should decide, by image ID.
 EXPECTED_FINAL = {
     "train_00001": "ok",
-    "train_00002": "labels_copied",
-    "train_00003": "few_matches",
+    "train_00002": "ok",  # labels copied, but the edge fallback aligns it
+    "train_00003": "ok",  # three vehicles, but the edge fallback aligns it
     "train_00004": "not_day",
     "train_00005": "missing_thermal",
     "train_00006": "scale",
@@ -127,12 +160,15 @@ EXPECTED_FINAL = {
     "train_00008": "edge_check",
     "train_00009": "bad_border",
     "train_00010": "ok",
+    "train_00011": "labels_copied",  # the fallback finds nothing: the content is unrelated
+    "train_00012": "few_matches",
     "val_00001": "near_duplicate",
     "val_00002": "ok",
     "test_00001": "ok",
 }
+EXPECTED_FALLBACK = ["train_00002", "train_00003"]  # aligned by edge correlation, not boxes
 EXPECTED_MANIFESTS = {
-    "train": ["train_00001", "train_00010"],
+    "train": ["train_00001", "train_00002", "train_00003", "train_00010"],
     "val": ["val_00002"],
     "test": ["test_00001"],
 }
@@ -310,7 +346,10 @@ def make_fake_dronevehicle(root: Path, specs: list[PairSpec] | None = None) -> F
             rgb_frame = _frame(rgb8, "RGB")
         rgb_frame.save(paths["img"], quality=95)
         if spec.has_thermal:
-            t8 = np.round(_thermal(scene, spec, warp, rng) * 255).astype(np.uint8)
+            source = (
+                _scene(replace(spec, seed=spec.seed + 777)) if spec.content_unrelated else scene
+            )
+            t8 = np.round(_thermal(source, spec, warp, rng) * 255).astype(np.uint8)
             thermal_frame = _frame(t8, "L")
             if spec.thermal_mode == "RGB":
                 thermal_frame = thermal_frame.convert("RGB")

@@ -60,6 +60,16 @@ def final_reasons(
     return final
 
 
+def fallback_ids(final: Mapping[str, str], align_rows: Mapping[str, AlignRow]) -> list[str]:
+    """Sorted IDs of the final pairs that the edge-correlation fallback aligned (no boxes behind
+    them, no moving mask): the contents of `fallback_pairs.txt`."""
+    return sorted(
+        i
+        for i, reason in final.items()
+        if reason == "ok" and i in align_rows and align_rows[i].model == "edge_translation"
+    )
+
+
 def stage_counts(
     stats: Sequence[PairStats],
     day_log: Mapping[str, tuple[bool, str]],
@@ -150,6 +160,9 @@ def build_summary(
         f"(tried: {sum(r.hom_tried for r in rows)})",
         "- pairs with a moving vehicle (accepted): "
         f"{sum(r.n_moving > 0 for r in rows if r.accepted)}",
+        "- aligned by the edge-correlation fallback: "
+        f"{sum(r.model == 'edge_translation' for r in rows)} "
+        f"(tried: {sum(r.fb_tried for r in rows)})",
         f"- aligned pairs with copied boxes excluded: {sum(r.n_copied > 0 for r in rows)}",
         f"- pairs whose label sets are identical (copied): {sum(r.labels_identical for r in rows)}",
     ]

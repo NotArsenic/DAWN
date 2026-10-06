@@ -24,6 +24,7 @@ from dawn.data import align, dedup, pairs, report  # noqa: E402
 from dawn.data import day_filter as df  # noqa: E402
 from dawn.data import dronevehicle as dv  # noqa: E402
 from tests.fake_dronevehicle import (  # noqa: E402
+    EXPECTED_FALLBACK,
     EXPECTED_FINAL,
     EXPECTED_MANIFESTS,
     FAKE_PAIRS,
@@ -112,12 +113,37 @@ def test_accepted_transforms_are_close_to_the_ground_truth(pipe):
     log = align.read_align_log(pipe.layout.log("align"))
     xs, ys = np.meshgrid(np.linspace(0, 640, 9), np.linspace(0, 512, 7))
     pts = np.stack([xs.ravel(), ys.ravel()], axis=1)
+    centre = np.array([[320.0, 256.0]])
     for image_id, row in log.items():
         if not row.accepted:
             continue
-        fit = align.apply_transform(align.transform_of(row), pts)
-        truth = align.apply_transform(pipe.tree.truth[image_id], pts)
-        assert np.abs(fit - truth).max() < 0.7, image_id
+        T, truth = align.transform_of(row), pipe.tree.truth[image_id]
+        if row.model == "edge_translation":  # a translation only matches the truth at the centre
+            moved = align.apply_transform(T, centre) - align.apply_transform(truth, centre)
+            assert np.abs(moved).max() < 1.0, image_id
+            continue
+        fit = align.apply_transform(T, pts)
+        assert np.abs(fit - align.apply_transform(truth, pts)).max() < 0.7, image_id
+
+
+def test_the_fallback_aligned_exactly_the_planted_pairs(pipe):
+    log = align.read_align_log(pipe.layout.log("align"))
+    by_fallback = sorted(i for i, r in log.items() if r.model == "edge_translation")
+    assert by_fallback == EXPECTED_FALLBACK
+    tried = sorted(i for i, r in log.items() if r.fb_tried)
+    assert tried == ["train_00002", "train_00003", "train_00011", "train_00012"]
+
+
+def test_the_fallback_manifest_dataset_flag_and_empty_moving_masks(pipe):
+    path = pipe.layout.manifest("fallback_pairs")
+    assert pairs.read_manifest(path) == EXPECTED_FALLBACK
+    ds = pairs.AlignedPairs(pipe.layout, "train_pairs")
+    flags = {ds[i]["image_id"]: ds[i]["fallback"] for i in range(len(ds))}
+    assert {k for k, v in flags.items() if v} == set(EXPECTED_FALLBACK)
+    for image_id in EXPECTED_FALLBACK:
+        moving = np.asarray(Image.open(pipe.layout.aligned_path(image_id, "moving")))
+        assert not moving.any()  # nothing is known about which vehicles moved
+    assert np.asarray(Image.open(pipe.layout.aligned_path("train_00001", "moving"))).any()
 
 
 def test_dedup_drops_the_planted_val_duplicate_and_never_touches_train(pipe):
@@ -174,7 +200,8 @@ def test_the_dataset_serves_what_write_stored(pipe):
 
 def test_summary_counts_every_stage_and_lists_the_thresholds(pipe):
     text = (pipe.layout.manifest_dir / "logs" / "summary.md").read_text(encoding="utf-8")
-    assert "| final pairs (manifests) | 2 | 1 | 1 | 4 |" in text
+    assert "| final pairs (manifests) | 4 | 1 | 1 | 6 |" in text
+    assert "aligned by the edge-correlation fallback: 2 (tried: 4)" in text
     for reason in (
         "labels_copied",
         "few_matches",
@@ -206,7 +233,8 @@ def test_final_reasons_match_the_documented_expectations(pipe):
 
 def test_rerunning_is_idempotent(pipe):
     before = {name: pipe.layout.log(name).read_bytes() for name in ("day", "align", "dedup")} | {
-        "train": pipe.layout.manifest("train_pairs").read_bytes()
+        "train": pipe.layout.manifest("train_pairs").read_bytes(),
+        "fallback": pipe.layout.manifest("fallback_pairs").read_bytes(),
     }
     png = pipe.layout.aligned_path("train_00001", "thermal")
     mtime = png.stat().st_mtime_ns
@@ -216,7 +244,8 @@ def test_rerunning_is_idempotent(pipe):
     pipe.run("dedup")
     pipe.run("write")
     after = {name: pipe.layout.log(name).read_bytes() for name in ("day", "align", "dedup")} | {
-        "train": pipe.layout.manifest("train_pairs").read_bytes()
+        "train": pipe.layout.manifest("train_pairs").read_bytes(),
+        "fallback": pipe.layout.manifest("fallback_pairs").read_bytes(),
     }
     assert after == before
     assert png.stat().st_mtime_ns == mtime  # write skipped the finished pair
@@ -281,6 +310,8 @@ def test_the_audit_script_writes_sheets_histograms_and_the_sample_list(pipe):
         "3",
         "--rejected",
         "4",
+        "--fallback",
+        "3",
         "--per-sheet",
         "2",
         "--seed",
@@ -290,6 +321,10 @@ def test_the_audit_script_writes_sheets_histograms_and_the_sample_list(pipe):
         module.main()
     out = pipe.layout.outputs_dir / "audit"
     assert (out / "fit_histograms.png").stat().st_size > 1000
+    # the fallback pairs get sheets of their own: 2 aligned by edge correlation, 2 it rejected
+    assert (out / "fallback_accepted_01.jpg").stat().st_size > 1000
+    assert (out / "fallback_rejected_01.jpg").stat().st_size > 1000
+    assert not list(out.glob("fallback_accepted_02.jpg"))
     for name in ("usable_luminance.png", "usable_darkest.jpg", "usable_random.jpg"):
         assert (out / name).stat().st_size > 1000, name
     assert sorted(p.name for p in out.glob("accepted_*.jpg")) == [
@@ -302,6 +337,6 @@ def test_the_audit_script_writes_sheets_histograms_and_the_sample_list(pipe):
     ]
     lines = (out / "sampled.csv").read_text(encoding="utf-8").splitlines()
     assert lines[0] == "sheet,position,image_id,reason"
-    assert len(lines) == 1 + 3 + 4
+    assert len(lines) == 1 + 3 + 4 + 2 + 2  # + the fallback sheets
     rejected_reasons = {line.split(",")[3] for line in lines[1:] if line.startswith("rejected")}
     assert len(rejected_reasons) >= 3  # stratified: more than one reason on the sheets

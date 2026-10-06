@@ -45,7 +45,7 @@ def rows(fake_dronevehicle, tmp_path_factory):
     cfg = fake_config(base, fake_dronevehicle.root)
     layout = dv.DroneVehicleLayout.from_config(cfg["dronevehicle"])
     acfg = align.AlignConfig.from_config(cfg["align"])
-    ids = ["train_00001", "train_00010", "val_00002", "train_00003", "train_00006", "train_00008"]
+    ids = ["train_00001", "train_00010", "val_00002", "train_00011", "train_00006", "train_00008"]
     out = [align.align_pair(layout, acfg, *dv.parse_image_id(i)) for i in ids]
     return layout, acfg, out
 
@@ -222,3 +222,42 @@ def test_pick_darkest_and_random_usable_ids():
     assert sample != audit.pick_usable(lum, "random", 5, seed=1)
     with pytest.raises(ValueError, match="how"):
         audit.pick_usable(lum, "brightest", 5, seed=0)
+
+
+def _fb_row(**kw):
+    from dawn.data.align import _failed_row
+
+    base = dataclasses.replace(
+        _failed_row("train_00002", "ok"),
+        accepted=True,
+        model="edge_translation",
+        fb_tried=True,
+        fb_dx=3.0,
+        fb_dy=-1.0,
+        fb_corr=0.7,
+        fb_prominence=0.05,
+        fb_quad_dev=1.0,
+        transform="1 0 3 0 1 -1",
+    )
+    return dataclasses.replace(base, **kw)
+
+
+def test_a_fallback_row_caption_shows_the_estimate_not_a_box_residual():
+    caption = audit._caption(_fb_row())
+    assert "fb" in caption and "(+3,-1)" in caption and "p0.05" in caption and "q1" in caption
+
+
+def test_fit_histograms_leave_fallback_rows_out_of_the_box_fit_panels(rows, tmp_path):
+    _, acfg, aligned = rows
+    out = tmp_path / "h.png"
+    audit.plot_fit_histograms([*aligned, _fb_row()], acfg, out)  # must not trip on NaN residuals
+    assert out.stat().st_size > 1000
+    assert audit.box_fitted([*aligned, _fb_row()]) == [r for r in aligned if r.model != "none"]
+
+
+def test_sheet_names_can_carry_a_prefix(rows, tmp_path):
+    layout, _, aligned = rows
+    written = audit.save_audit_sheets(
+        layout, aligned[:1], aligned[3:4], tmp_path, per_sheet=2, workers=1, prefix="fallback_"
+    )
+    assert [p.name for p in written] == ["fallback_accepted_01.jpg", "fallback_rejected_01.jpg"]

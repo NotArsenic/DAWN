@@ -33,6 +33,7 @@ Conventions (docs/conventions.md section 10)
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import logging
 import math
@@ -51,6 +52,7 @@ from dawn.data.seeding import generator_for
 
 logger = logging.getLogger(__name__)
 
+AFFINE_MODELS = ("similarity", "edge_translation")  # logged as the first two rows (6 numbers)
 _EPS = 1e-9  # slack on inclusive thresholds, so 1.05 passes a "within 5%" check in floating point
 _NAN = float("nan")
 _MIN_EDGE_PIXELS = 1000  # fewer valid pixels than this and the edge check is not meaningful
@@ -82,6 +84,10 @@ class AlignConfig:
     grad_max_best_shift_px: int = 3
     moving_min_residual_px: float = 4.0
     moving_dilate_px: int = 3
+    fallback_enabled: bool = True
+    fallback_search_px: int = 10
+    fallback_min_prominence: float = 0.02
+    fallback_max_quadrant_dev_px: int = 2
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> AlignConfig:
@@ -89,6 +95,7 @@ class AlignConfig:
         homography = cfg.get("homography") or {}
         grad = cfg.get("grad_check") or {}
         moving = cfg.get("moving") or {}
+        fallback = cfg.get("fallback") or {}
         flat = {
             k: cfg[k]
             for k in (
@@ -118,6 +125,10 @@ class AlignConfig:
             "grad_max_best_shift_px": grad.get("max_best_shift_px"),
             "moving_min_residual_px": moving.get("min_residual_px"),
             "moving_dilate_px": moving.get("dilate_px"),
+            "fallback_enabled": fallback.get("enabled"),
+            "fallback_search_px": fallback.get("search_px"),
+            "fallback_min_prominence": fallback.get("min_prominence"),
+            "fallback_max_quadrant_dev_px": fallback.get("max_quadrant_dev_px"),
         }
         return cls(**flat, **{k: v for k, v in nested.items() if v is not None})
 
@@ -800,6 +811,131 @@ def edge_check(
     return EdgeResult(before, after, gain, best_dx, best_dy, passed)
 
 
+# --- edge-correlation fallback: translation from the pixels alone -------------------------------
+
+
+def translation_matrix(dx: float, dy: float) -> np.ndarray:
+    """3x3 pure translation, thermal onto RGB: pixel `(c, r)` lands on `(c + dx, r + dy)`."""
+    return np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)], [0.0, 0.0, 1.0]])
+
+
+def _ncc_grid(ref: torch.Tensor, padded: torch.Tensor, s: int) -> torch.Tensor:
+    """Pearson correlation between `ref` `(h, w)` and every shifted window of `padded`.
+
+    `padded` is `(h + 2s, w + 2s)`: the same region of the other image with `s` pixels of context
+    on every side. The result is `(2s + 1, 2s + 1)`, indexed `[dy + s, dx + s]`: the correlation
+    after moving the `padded` content by `(+dx, +dy)` (the convention of `edge_check`). All
+    shifts at once: the numerator is a circular cross-correlation by FFT (exact here, no window
+    wraps), the per-window mean and variance come from integral images. float64 throughout.
+    """
+    h, w = ref.shape
+    ph, pw = padded.shape
+    ref_c = ref - ref.mean()
+    ref_norm = ref_c.pow(2).sum().sqrt()
+    ref_pad = torch.zeros_like(padded)
+    ref_pad[:h, :w] = ref_c
+    spectrum = torch.fft.rfft2(padded) * torch.fft.rfft2(ref_pad).conj()
+    numerator = torch.fft.irfft2(spectrum, s=(ph, pw))[: 2 * s + 1, : 2 * s + 1]
+
+    def window_sums(a: torch.Tensor) -> torch.Tensor:
+        ii = torch.nn.functional.pad(a.cumsum(0).cumsum(1), (1, 0, 1, 0))
+        top, left = slice(0, 2 * s + 1), slice(0, 2 * s + 1)
+        bottom, right = slice(h, h + 2 * s + 1), slice(w, w + 2 * s + 1)
+        return ii[bottom, right] - ii[top, right] - ii[bottom, left] + ii[top, left]
+
+    total, total_sq = window_sums(padded), window_sums(padded.pow(2))
+    variance = (total_sq - total.pow(2) / (h * w)).clamp_min(1e-12)
+    grid = numerator / (ref_norm.clamp_min(1e-12) * variance.sqrt())
+    return grid.flip(0).flip(1)  # window start i = s - dy, j = s - dx
+
+
+@dataclass(frozen=True)
+class TranslationEstimate:
+    """A global integer translation of the thermal onto the RGB, from edge correlation alone.
+
+    `dx`, `dy` is the shift (columns, rows) to apply to the thermal content, so the transform is
+    `translation_matrix(dx, dy)`. `corr` is the correlation at that shift, `corr_at_zero` with no
+    shift, `prominence` the margin of the peak over the best shift at least 2 px from it,
+    `quad_dev` the largest disagreement (Chebyshev, px) between a quadrant's own best shift and
+    the global one, and `saturated` says the best shift sits on the edge of the search window.
+    """
+
+    dx: int
+    dy: int
+    corr: float
+    corr_at_zero: float
+    prominence: float
+    quad_dev: int
+    saturated: bool
+
+
+def _grid_peak(grid: torch.Tensor, s: int) -> tuple[int, int, float, float]:
+    """`(dx, dy, best, prominence)` of a correlation grid."""
+    flat = int(torch.argmax(grid))
+    iy, ix = divmod(flat, grid.shape[1])
+    best = float(grid[iy, ix])
+    yy, xx = torch.meshgrid(torch.arange(grid.shape[0]), torch.arange(grid.shape[1]), indexing="ij")
+    far = torch.maximum((yy - iy).abs(), (xx - ix).abs()) >= 2
+    return ix - s, iy - s, best, best - float(grid[far].max())
+
+
+def edge_translation(
+    thermal: torch.Tensor, rgb_luma: np.ndarray, cfg: AlignConfig
+) -> TranslationEstimate:
+    """Estimate the thermal -> RGB translation by maximizing the gradient-magnitude correlation.
+
+    For pairs the boxes cannot align (`labels_copied`, `few_matches`): the same blurred Sobel
+    gradient magnitude as `edge_check`, correlated over every integer shift within
+    `+-fallback_search_px` (normalized correlation over the whole frame less that margin), then
+    again inside each image quadrant. Quadrants that disagree with the global shift mean the
+    pair is not a plain translation (or the correlation is not trustworthy).
+
+    Args:
+        thermal: `(1, H, W)` float, codes / 255, the unwarped thermal crop.
+        rgb_luma: `(H, W)` float32 from `rgb_edge_luma`.
+    """
+    plane = thermal.detach().cpu().numpy()[0]
+    if plane.shape != rgb_luma.shape:
+        raise ValueError(f"thermal {plane.shape} and RGB {rgb_luma.shape} differ in size")
+    s = cfg.fallback_search_px
+    g_rgb = torch.from_numpy(gradient_magnitude(rgb_luma, cfg.grad_blur_sigma)).double()
+    g_thermal = torch.from_numpy(gradient_magnitude(plane, cfg.grad_blur_sigma)).double()
+    height, width = plane.shape
+
+    def grid_for(rows: tuple[int, int], cols: tuple[int, int]) -> torch.Tensor:
+        (r0, r1), (c0, c1) = rows, cols
+        return _ncc_grid(g_rgb[r0:r1, c0:c1], g_thermal[r0 - s : r1 + s, c0 - s : c1 + s], s)
+
+    full = grid_for((s, height - s), (s, width - s))
+    dx, dy, best, prominence = _grid_peak(full, s)
+    deviation = 0
+    for rows in ((s, height // 2), (height // 2, height - s)):
+        for cols in ((s, width // 2), (width // 2, width - s)):
+            qx, qy, _, _ = _grid_peak(grid_for(rows, cols), s)
+            deviation = max(deviation, abs(qx - dx), abs(qy - dy))
+    return TranslationEstimate(
+        dx=dx,
+        dy=dy,
+        corr=best,
+        corr_at_zero=float(full[s, s]),
+        prominence=prominence,
+        quad_dev=deviation,
+        saturated=max(abs(dx), abs(dy)) >= s,
+    )
+
+
+def fallback_accepts(est: TranslationEstimate, cfg: AlignConfig) -> bool:
+    """The fallback's acceptance rule: not on the window edge, a clear single peak
+    (`prominence >= fallback_min_prominence`) and quadrants within `fallback_max_quadrant_dev_px`
+    of the global shift. NaN fails."""
+    return bool(
+        cfg.fallback_enabled
+        and not est.saturated
+        and est.prominence >= cfg.fallback_min_prominence - _EPS
+        and est.quad_dev <= cfg.fallback_max_quadrant_dev_px
+    )
+
+
 # --- per-pair verdict, log and I/O ---------------------------------------------------------------
 
 
@@ -810,9 +946,17 @@ class AlignRow:
     The top-level metrics (`n_inliers` ... `shift_px`) belong to the model used (`model`), which is
     the similarity unless the homography fallback passed. `hom_*` are the homography attempt when
     one was made (`hom_tried`), else NaN. `edge_*` belong to `transform`, NaN when the edge check
-    did not run. `transform` is 6 numbers (the first two rows of a similarity) or 9 (a homography),
-    so `write` never refits. `reason` is `ok` or the first failed check; `accepted` is
-    `reason == ok`.
+    did not run. `transform` is 6 numbers (the first two rows of a similarity, or of the pure
+    translation of the edge fallback) or 9 (a homography), so `write` never refits. `reason` is
+    `ok` or the first failed check; `accepted` is `reason == ok`.
+
+    `fb_*` are the edge-correlation fallback, tried only on pairs the boxes rejected for lack of
+    evidence (`labels_copied`, `few_matches`): `fb_dx`, `fb_dy` the estimated translation,
+    `fb_corr`, `fb_prominence`, `fb_quad_dev`, `fb_saturated` what `fallback_accepts` looks at
+    (NaN when not tried). A pair the fallback accepts has `model == "edge_translation"`, `scale` 1,
+    `rotation_deg` 0, `shift_px` the length of the translation, no residuals, `n_moving` 0 (no
+    boxes were matched, so no moving mask can be made) and `reason == "ok"`; its `edge_*` are
+    the correlation at zero shift, at the estimate, and their difference.
     """
 
     image_id: str
@@ -844,15 +988,23 @@ class AlignRow:
     edge_gain: float
     edge_dx: int
     edge_dy: int
+    fb_tried: bool
+    fb_dx: float
+    fb_dy: float
+    fb_corr: float
+    fb_prominence: float
+    fb_quad_dev: float
+    fb_saturated: bool
     accepted: bool
     reason: str
 
 
 def format_transform(model: str, T: np.ndarray | None) -> str:
-    """Space-separated numbers, 10 significant digits: 6 for a similarity, 9 for a homography."""
+    """Space-separated numbers, 10 significant digits: 6 for a similarity or the fallback's pure
+    translation (the first two rows), 9 for a homography."""
     if model == "none" or T is None:
         return ""
-    values = T[:2].ravel() if model == "similarity" else T.ravel()
+    values = T[:2].ravel() if model in AFFINE_MODELS else T.ravel()
     return " ".join(f"{v:.10g}" for v in values)
 
 
@@ -861,7 +1013,7 @@ def parse_transform(model: str, text: str) -> np.ndarray | None:
     if model == "none" or not text.strip():
         return None
     values = np.array([float(v) for v in text.split()])
-    if model == "similarity":
+    if model in AFFINE_MODELS:
         return np.vstack([values.reshape(2, 3), [0.0, 0.0, 1.0]])
     return values.reshape(3, 3)
 
@@ -917,6 +1069,13 @@ def row_from_result(
         edge_gain=edge.gain if edge else _NAN,
         edge_dx=edge.best_dx if edge else 0,
         edge_dy=edge.best_dy if edge else 0,
+        fb_tried=False,
+        fb_dx=_NAN,
+        fb_dy=_NAN,
+        fb_corr=_NAN,
+        fb_prominence=_NAN,
+        fb_quad_dev=_NAN,
+        fb_saturated=False,
         accepted=reason == "ok",
         reason=reason,
     )
@@ -924,37 +1083,95 @@ def row_from_result(
 
 def _failed_row(image_id: str, reason: str) -> AlignRow:
     return AlignRow(
-        image_id,
-        0,
-        0,
-        0,
-        False,
-        0,
-        0,
-        _NAN,
-        _NAN,
-        _NAN,
-        "none",
-        _NAN,
-        _NAN,
-        _NAN,
-        "",
-        False,
-        _NAN,
-        _NAN,
-        _NAN,
-        _NAN,
-        _NAN,
-        0,
-        0,
-        0,
-        _NAN,
-        _NAN,
-        _NAN,
-        0,
-        0,
-        False,
-        reason,
+        image_id=image_id,
+        n_thermal=0,
+        n_rgb=0,
+        n_copied=0,
+        labels_identical=False,
+        n_matches=0,
+        n_inliers=0,
+        inlier_ratio=_NAN,
+        median_residual=_NAN,
+        median_residual_all=_NAN,
+        model="none",
+        scale=_NAN,
+        rotation_deg=_NAN,
+        shift_px=_NAN,
+        transform="",
+        hom_tried=False,
+        hom_inlier_ratio=_NAN,
+        hom_median_residual=_NAN,
+        hom_scale=_NAN,
+        hom_rotation_deg=_NAN,
+        hom_shift_px=_NAN,
+        n_moving=0,
+        n_unmatched_thermal=0,
+        n_unmatched_rgb=0,
+        edge_before=_NAN,
+        edge_after=_NAN,
+        edge_gain=_NAN,
+        edge_dx=0,
+        edge_dy=0,
+        fb_tried=False,
+        fb_dx=_NAN,
+        fb_dy=_NAN,
+        fb_corr=_NAN,
+        fb_prominence=_NAN,
+        fb_quad_dev=_NAN,
+        fb_saturated=False,
+        accepted=False,
+        reason=reason,
+    )
+
+
+NO_EVIDENCE = ("labels_copied", "few_matches")  # box rejections the edge fallback may overturn
+
+
+def apply_fallback(row: AlignRow, est: TranslationEstimate, cfg: AlignConfig) -> AlignRow:
+    """The row after the edge fallback has looked at a pair the boxes could not judge.
+
+    The estimate is always logged (`fb_*`). When `fallback_accepts` it, the pair becomes an
+    `edge_translation` pair: the transform is the pure translation, the box-path metrics that
+    described a fit that was never accepted are cleared, and the verdict is `ok`. Otherwise the
+    box reason stands.
+    """
+    logged = dataclasses.replace(
+        row,
+        fb_tried=True,
+        fb_dx=float(est.dx),
+        fb_dy=float(est.dy),
+        fb_corr=est.corr,
+        fb_prominence=est.prominence,
+        fb_quad_dev=float(est.quad_dev),
+        fb_saturated=est.saturated,
+    )
+    if not fallback_accepts(est, cfg):
+        return logged
+    return dataclasses.replace(
+        logged,
+        model="edge_translation",
+        transform=format_transform("edge_translation", translation_matrix(est.dx, est.dy)),
+        n_inliers=0,
+        inlier_ratio=_NAN,
+        median_residual=_NAN,
+        median_residual_all=_NAN,
+        scale=1.0,
+        rotation_deg=0.0,
+        shift_px=math.hypot(est.dx, est.dy),
+        hom_tried=False,
+        hom_inlier_ratio=_NAN,
+        hom_median_residual=_NAN,
+        hom_scale=_NAN,
+        hom_rotation_deg=_NAN,
+        hom_shift_px=_NAN,
+        n_moving=0,
+        edge_before=est.corr_at_zero,
+        edge_after=est.corr,
+        edge_gain=est.corr - est.corr_at_zero,
+        edge_dx=0,
+        edge_dy=0,
+        accepted=True,
+        reason="ok",
     )
 
 
@@ -962,8 +1179,10 @@ def align_pair(layout: dv.DroneVehicleLayout, cfg: AlignConfig, split: str, stem
     """Align one pair from the raw files: parse both label files, fit, and run the edge check.
 
     The edge check runs for every pair that has a fitted transform, accepted or not, so the audit
-    and the sensitivity table can see how the rejected pairs would have done. A pair that cannot
-    be read gets the reason `read_error` instead of raising (a `run_parallel` job).
+    and the sensitivity table can see how the rejected pairs would have done. A pair the boxes
+    rejected for lack of evidence (`NO_EVIDENCE`) then gets the edge-correlation fallback
+    (`edge_translation`, `apply_fallback`). A pair that cannot be read gets the reason
+    `read_error` instead of raising (a `run_parallel` job).
     """
     image_id = dv.image_id(split, stem)
     try:
@@ -977,9 +1196,10 @@ def align_pair(layout: dv.DroneVehicleLayout, cfg: AlignConfig, split: str, stem
         logger.warning(f"{image_id}: labels: {exc}")
         return _failed_row(image_id, "read_error")
     result = align_boxes(thermal_ann.boxes, rgb_ann.boxes, cfg, image_id, layout.crop_size)
-    edge = None
-    if cfg.grad_enabled and result.T is not None:
-        try:
+    images: list[tuple[torch.Tensor, np.ndarray]] = []
+
+    def load() -> tuple[torch.Tensor, np.ndarray]:
+        if not images:
             thermal = dv.crop_border(
                 dv.read_thermal8(layout.thermal_image(split, stem)),
                 layout.border,
@@ -988,11 +1208,22 @@ def align_pair(layout: dv.DroneVehicleLayout, cfg: AlignConfig, split: str, stem
             rgb = dv.crop_border(
                 dv.read_rgb8(layout.rgb_image(split, stem)), layout.border, layout.frame_size
             )
-        except Exception as exc:
-            logger.warning(f"{image_id}: images: {exc}")
-            return _failed_row(image_id, "read_error")
-        edge = edge_check(thermal.float() / 255, rgb_edge_luma(srgb8_to_linear(rgb)), result.T, cfg)
-    return row_from_result(image_id, result, edge, cfg)
+            images.append((thermal.float() / 255, rgb_edge_luma(srgb8_to_linear(rgb))))
+        return images[0]
+
+    try:
+        edge = None
+        if cfg.grad_enabled and result.T is not None:
+            thermal, luma = load()
+            edge = edge_check(thermal, luma, result.T, cfg)
+        row = row_from_result(image_id, result, edge, cfg)
+        if cfg.fallback_enabled and row.reason in NO_EVIDENCE:
+            thermal, luma = load()
+            row = apply_fallback(row, edge_translation(thermal, luma, cfg), cfg)
+    except Exception as exc:
+        logger.warning(f"{image_id}: images: {exc}")
+        return _failed_row(image_id, "read_error")
+    return row
 
 
 _TYPES = {
@@ -1062,17 +1293,38 @@ def _hom_metrics_of(row: AlignRow) -> GeometryMetrics:
     )
 
 
+def _estimate_of(row: AlignRow) -> TranslationEstimate:
+    return TranslationEstimate(
+        dx=int(row.fb_dx),
+        dy=int(row.fb_dy),
+        corr=row.fb_corr,
+        corr_at_zero=row.edge_before if row.model == "edge_translation" else _NAN,
+        prominence=row.fb_prominence,
+        quad_dev=int(row.fb_quad_dev),
+        saturated=row.fb_saturated,
+    )
+
+
 def reevaluate(row: AlignRow, cfg: AlignConfig) -> str:
     """The verdict a logged pair would get under other thresholds, without refitting.
 
-    Applies `cfg` to the logged metrics: the model used first, then (when a homography was tried)
-    the homography's, then the logged edge check against `cfg`'s edge thresholds. It is exact for
+    Applies `cfg` to the logged metrics: the box path first (and, for a pair the boxes could not
+    judge, the logged edge-fallback estimate against `cfg`'s fallback thresholds), then (when a
+    homography was tried) the homography's, then the logged edge check against `cfg`'s edge
+    thresholds. It is exact for
     thresholds that only move the acceptance of the logged fits. It cannot know about a homography
     that a tighter residual threshold would have triggered but the run never tried, nor re-match
     boxes (`exclude_copied_boxes`, `max_match_dist_px`) or re-fit (RANSAC thresholds); those need
     a new `align` run.
     """
     failed = failed_checks(_metrics_of(row), cfg)
+    if (
+        failed
+        and failed[0] in NO_EVIDENCE
+        and row.fb_tried
+        and fallback_accepts(_estimate_of(row), cfg)
+    ):
+        return "ok"
     if failed and row.hom_tried and not failed_checks(_hom_metrics_of(row), cfg):
         failed = []
     if failed:

@@ -102,7 +102,11 @@ def audit_tile(
 def _caption(row: align.AlignRow) -> str:
     gain = "" if math.isnan(row.edge_gain) else f" g{row.edge_gain:+.2f}"
     residual = "" if math.isnan(row.median_residual) else f" r{row.median_residual:.1f}"
-    return f"{row.image_id} {row.reason}{residual}{gain}"
+    fallback = ""
+    if row.fb_tried:  # what the edge fallback estimated: shift, peak margin, quadrant disagreement
+        shift = f"({row.fb_dx:+.0f},{row.fb_dy:+.0f})"
+        fallback = f" fb{shift} p{row.fb_prominence:.2f} q{row.fb_quad_dev:.0f}"
+    return f"{row.image_id} {row.reason}{residual}{gain}{fallback}"
 
 
 def save_audit_sheets(
@@ -112,8 +116,10 @@ def save_audit_sheets(
     out_dir: str | Path,
     per_sheet: int = 20,
     workers: int = 1,
+    prefix: str = "",
 ) -> list[Path]:
-    """Contact sheets `accepted_NN.jpg` and `rejected_NN.jpg`, `per_sheet` tiles each, 4 per row.
+    """Contact sheets `<prefix>accepted_NN.jpg` and `<prefix>rejected_NN.jpg`, `per_sheet` tiles
+    each, 4 per row.
 
     Each caption is `image_id reason r<median residual px> g<edge gain>`. The rows are drawn in the
     order given, so pass them already sampled (`report.stratified_sample`).
@@ -129,7 +135,7 @@ def save_audit_sheets(
                 f"{name} {start + 1}-{start + len(page)} of {len(rows)}: thermal edges (magenta) "
                 "over the RGB; r = median inlier residual px, g = edge-correlation gain"
             )
-            path = out_dir / f"{name}_{start // per_sheet + 1:02d}.jpg"
+            path = out_dir / f"{prefix}{name}_{start // per_sheet + 1:02d}.jpg"
             tile_sheet(tiles, [_caption(r) for r in page], title, columns=4, box=TILE_BOX).save(
                 path, quality=90
             )
@@ -148,6 +154,12 @@ def _style(ax) -> None:
     ax.tick_params(colors=_INK_2, labelsize=8)
 
 
+def box_fitted(rows: Sequence[align.AlignRow]) -> list[align.AlignRow]:
+    """The rows that have a box-based fit (similarity or homography), i.e. not the fallback's pure
+    translations, whose scale, rotation and residual are not measurements."""
+    return [r for r in rows if r.model not in ("none", "edge_translation")]
+
+
 def plot_fit_histograms(
     rows: Sequence[align.AlignRow], cfg: align.AlignConfig, out_path: str | Path
 ) -> None:
@@ -160,7 +172,7 @@ def plot_fit_histograms(
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
-    fitted = [r for r in rows if r.model != "none"]
+    fitted = box_fitted(rows)
     panels = [
         ("median_residual", "median inlier residual (px)", (0, 6), [cfg.max_median_residual_px]),
         ("scale", "scale", (0.9, 1.1), [1 - cfg.max_scale_deviation, 1 + cfg.max_scale_deviation]),

@@ -33,6 +33,18 @@ def rows(setup):
     return out
 
 
+@pytest.fixture(scope="module")
+def box_rows(setup):
+    """The same pairs with the edge fallback switched off: the box path's own verdicts."""
+    layout, cfg, tree = setup
+    box_only = align.AlignConfig(**{**cfg.__dict__, "fallback_enabled": False})
+    return {
+        spec.image_id: align.align_pair(layout, box_only, spec.split, spec.stem)
+        for spec in tree.specs
+        if spec.image_id in ("train_00002", "train_00003", "train_00011", "train_00012")
+    }
+
+
 def _same_map(fit, truth, tol=0.7):
     xs, ys = np.meshgrid(np.linspace(0, 640, 9), np.linspace(0, 512, 7))
     pts = np.stack([xs.ravel(), ys.ravel()], axis=1)
@@ -66,17 +78,78 @@ def test_the_first_pair_has_a_moving_vehicle_a_copied_box_and_skipped_objects(ro
 @pytest.mark.parametrize(
     "image_id, reason",
     [
-        ("train_00002", "labels_copied"),
-        ("train_00003", "few_matches"),
         ("train_00006", "scale"),
         ("train_00007", "residual"),
         ("train_00008", "edge_check"),
+        ("train_00011", "labels_copied"),
+        ("train_00012", "few_matches"),
     ],
 )
 def test_each_failing_pair_gets_its_own_reason_code(rows, image_id, reason):
     assert rows[image_id].reason == reason
     assert EXPECTED_FINAL[image_id] == reason
     assert not rows[image_id].accepted
+
+
+@pytest.mark.parametrize(
+    "image_id, reason",
+    [
+        ("train_00002", "labels_copied"),
+        ("train_00003", "few_matches"),
+        ("train_00011", "labels_copied"),
+        ("train_00012", "few_matches"),
+    ],
+)
+def test_without_the_fallback_the_boxes_alone_reject_these(box_rows, image_id, reason):
+    assert box_rows[image_id].reason == reason
+    assert not box_rows[image_id].fb_tried and box_rows[image_id].model != "edge_translation"
+
+
+# --- the edge-correlation fallback ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("image_id", ["train_00002", "train_00003"])
+def test_the_fallback_aligns_pairs_the_boxes_cannot_when_the_content_lines_up(
+    setup, rows, image_id
+):
+    _, _, tree = setup
+    row = rows[image_id]
+    assert row.accepted and row.reason == "ok"
+    assert row.model == "edge_translation" and row.fb_tried
+    T = align.transform_of(row)
+    np.testing.assert_allclose(T[:2, :2], np.eye(2))  # a pure translation
+    centre = np.array([[320.0, 256.0]])
+    truth = align.apply_transform(tree.truth[image_id], centre) - centre
+    got = align.apply_transform(T, centre) - centre
+    assert np.abs(got - truth).max() < 1.0, "the translation matches the true shift at the centre"
+    assert (row.fb_dx, row.fb_dy) == (T[0, 2], T[1, 2])
+    assert row.fb_prominence >= 0.02 and row.fb_quad_dev <= 2 and not row.fb_saturated
+    assert row.n_moving == 0  # no boxes were matched: no moving mask
+
+
+@pytest.mark.parametrize(
+    "image_id, reason", [("train_00011", "labels_copied"), ("train_00012", "few_matches")]
+)
+def test_the_fallback_keeps_the_box_reason_when_it_finds_nothing_trustworthy(
+    rows, image_id, reason
+):
+    row = rows[image_id]
+    assert row.fb_tried and not row.accepted and row.reason == reason
+    assert row.model != "edge_translation"
+    assert not math.isnan(row.fb_prominence)  # what it saw is logged
+
+
+def test_the_fallback_runs_only_where_the_boxes_gave_no_evidence(rows):
+    tried = {i for i, r in rows.items() if r.fb_tried}
+    assert tried == {"train_00002", "train_00003", "train_00011", "train_00012"}
+    assert not rows["train_00006"].fb_tried  # the boxes said "wrong scale": evidence, not absence
+
+
+def test_the_fallback_transform_text_has_six_numbers_like_a_similarity():
+    T = align.translation_matrix(3, -2)
+    text = align.format_transform("edge_translation", T)
+    assert len(text.split()) == 6
+    np.testing.assert_allclose(align.parse_transform("edge_translation", text), T)
 
 
 def test_the_edge_check_decides_only_after_the_geometry_passes(rows):
@@ -170,7 +243,23 @@ def test_reevaluate_loosens_and_tightens_from_the_logged_numbers(setup, rows):
     tight = align.AlignConfig(**{**cfg.__dict__, "max_median_residual_px": 0.0001})
     assert align.reevaluate(rows["train_00001"], tight) == "residual"
     few = align.AlignConfig(**{**cfg.__dict__, "min_matches": 3})
-    assert align.reevaluate(rows["train_00003"], few) != "few_matches"
+    assert align.reevaluate(rows["train_00012"], few) != "few_matches"
+
+
+def test_reevaluate_applies_the_fallback_thresholds_to_the_logged_estimate(setup, rows):
+    _, cfg, _ = setup
+    strict = align.AlignConfig(**{**cfg.__dict__, "fallback_min_prominence": 0.99})
+    assert align.reevaluate(rows["train_00002"], strict) == "labels_copied"  # no longer clear
+    assert align.reevaluate(rows["train_00003"], strict) == "few_matches"
+    off = align.AlignConfig(**{**cfg.__dict__, "fallback_enabled": False})
+    assert align.reevaluate(rows["train_00002"], off) == "labels_copied"
+    lax = align.AlignConfig(
+        **{**cfg.__dict__, "fallback_min_prominence": -1.0, "fallback_max_quadrant_dev_px": 99}
+    )
+    for image_id in ("train_00011", "train_00012"):
+        fb = rows[image_id]
+        saturated = fb.fb_saturated
+        assert (align.reevaluate(fb, lax) == "ok") is (not saturated)
 
 
 def test_config_fingerprint_changes_with_any_threshold_and_is_stable(setup):

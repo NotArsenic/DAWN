@@ -92,7 +92,8 @@ def test_items_have_the_documented_shapes_dtypes_and_ranges(made):
     ds = pairs.AlignedPairs(layout, "train_pairs")
     assert len(ds) == 3
     item = ds[0]
-    assert set(item) == {"thermal", "rgb", "valid", "moving", "image_id"}
+    assert set(item) == {"thermal", "rgb", "valid", "moving", "image_id", "fallback"}
+    assert item["fallback"] is False
     assert item["thermal"].shape == (1, H, W) and item["thermal"].dtype == torch.float32
     assert item["rgb"].shape == (3, H, W) and item["rgb"].dtype == torch.float32
     assert item["valid"].shape == (1, H, W) and item["valid"].dtype == torch.bool
@@ -420,3 +421,53 @@ def test_a_written_pair_loads_through_the_dataset(raw, written):
     pairs.write_manifest(layout.manifest("train_pairs"), list(written))
     item = pairs.AlignedPairs(layout, "train_pairs")[0]
     assert item["thermal"].shape == (1, 512, 640) and item["image_id"] == "train_00001"
+
+
+# --- fallback pairs ------------------------------------------------------------------------------
+
+
+def test_the_dataset_flags_fallback_pairs_from_their_manifest(made):
+    layout, _ = made
+    pairs.write_manifest(layout.manifest("fallback_pairs"), ["train_00002"])
+    ds = pairs.AlignedPairs(layout, "train_pairs")
+    flags = {ds[i]["image_id"]: ds[i]["fallback"] for i in range(len(ds))}
+    assert flags == {"train_00001": False, "train_00002": True, "train_00003": False}
+
+
+def test_without_a_fallback_manifest_nothing_is_flagged(made):
+    layout, _ = made
+    assert not layout.manifest("fallback_pairs").exists()
+    assert not any(pairs.AlignedPairs(layout, "train_pairs")[i]["fallback"] for i in range(3))
+
+
+def test_the_flag_survives_augmentation_and_collation(made):
+    from torch.utils.data import DataLoader
+
+    layout, _ = made
+    pairs.write_manifest(layout.manifest("fallback_pairs"), ["train_00002"])
+    aug = pairs.AugmentConfig(hflip=1.0, vflip=1.0, contrast_prob=1.0)
+    ds = pairs.AlignedPairs(layout, "train_pairs", train=True, augment=aug)
+    batch = next(iter(DataLoader(ds, batch_size=3)))
+    assert batch["fallback"].dtype == torch.bool
+    assert batch["fallback"].tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize("stem", ["00002", "00003"])  # 00003 has 3 matched boxes, 00002 none
+def test_a_fallback_pair_is_written_as_an_exact_shift_with_an_empty_moving_mask(raw, stem):
+    layout, acfg, _ = raw
+    image_id = f"train_{stem}"
+    row = align.align_pair(layout, acfg, "train", stem)
+    assert row.model == "edge_translation" and row.accepted
+    assert pairs.write_aligned_pair(layout, acfg, row) is True
+    T = align.transform_of(row)
+    dx, dy = int(T[0, 2]), int(T[1, 2])
+    moving = np.asarray(Image.open(layout.aligned_path(image_id, "moving")))
+    assert not moving.any()  # a translation cannot say which matched vehicles moved
+    raw_thermal = dv.crop_border(dv.read_thermal8(layout.thermal_image("train", stem)))[0].numpy()
+    got = np.asarray(Image.open(layout.aligned_path(image_id, "thermal")))
+    h, w = raw_thermal.shape
+    r0, r1 = max(dy, 0) + 1, h + min(dy, 0) - 1
+    c0, c1 = max(dx, 0) + 1, w + min(dx, 0) - 1
+    np.testing.assert_array_equal(
+        got[r0:r1, c0:c1], raw_thermal[r0 - dy : r1 - dy, c0 - dx : c1 - dx]
+    )
