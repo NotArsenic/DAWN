@@ -72,7 +72,7 @@ import torch
 import torch.nn.functional as F
 
 from dawn.data.camera import CameraParams, isp_kernel
-from dawn.data.color import luminance, srgb8_to_linear
+from dawn.data.color import linear_to_srgb8, luminance, srgb8_to_linear
 from dawn.data.visdrone import read_srgb8
 
 logger = logging.getLogger(__name__)
@@ -102,9 +102,7 @@ def _surface_projector(patch: int, device: torch.device) -> torch.Tensor:
     coords = torch.linspace(-1.0, 1.0, patch, device=device)
     ys, xs = torch.meshgrid(coords, coords, indexing="ij")
     ys, xs = ys.reshape(-1), xs.reshape(-1)
-    basis = torch.stack(
-        [torch.ones_like(ys), ys, xs, ys * ys, ys * xs, xs * xs], dim=1
-    )
+    basis = torch.stack([torch.ones_like(ys), ys, xs, ys * ys, ys * xs, xs * xs], dim=1)
     pinv = torch.linalg.pinv(basis)
     return torch.eye(patch * patch, device=device) - basis @ pinv
 
@@ -167,6 +165,7 @@ class PatchAccumulator:
     gate_quantile: float = 0.25
     gate_scale: float = 1.3
     max_mean: float = 0.90  # above this a patch may be clipping, and clipping is not noise
+    min_code: int = 3  # 8-bit sRGB code; patches with any pixel at or below this are crushed
 
     count: torch.Tensor = field(init=False)
     sum_mean: torch.Tensor = field(init=False)
@@ -213,15 +212,25 @@ class PatchAccumulator:
 
         # A patch that touches either rail is not measuring noise: clipping squashes the
         # variance toward zero and would read as a flat patch with impossibly clean pixels.
-        usable = (tiles.amax(dim=2) < self.max_mean) & (tiles.amin(dim=2) > 0.0)
-        usable &= ratio <= self._gate(ratio, usable)
+        # Pixels near code 0 are crushed: pins at code 0 understate the variance.
+        # Exclude every patch where any pixel (any channel) is at or below min_code,
+        # or at or above clipping (max_mean).
+        if self.min_code >= 0:
+            min_linear = float(
+                srgb8_to_linear(torch.tensor([self.min_code], dtype=torch.uint8)).item()
+            )
+        else:
+            min_linear = -1.0
+        uncrushed = (tiles.amin(dim=(0, 2)) > min_linear + 1e-6).unsqueeze(0).expand(CHANNELS, -1)
+        usable = (tiles.amax(dim=2) < self.max_mean) & uncrushed
+        usable = usable & (ratio <= self._gate(ratio, usable))
         self.num_images += 1
         self.num_patches_seen += int(usable.sum())
 
         # Bin on sqrt(mean), not mean: read noise is only visible where the signal is
         # faint, and night frames pile up there. Equal-width bins would put the whole
         # dark end, the part that pins `b`, into one or two of them.
-        bins = (means.clamp(min=0.0).sqrt() * self.num_bins)
+        bins = means.clamp(min=0.0).sqrt() * self.num_bins
         bins = bins.floor().clamp(0, self.num_bins - 1).to(torch.int64)
         for channel in range(CHANNELS):
             for index in bins[channel][usable[channel]].unique().tolist():
@@ -281,8 +290,14 @@ class PatchAccumulator:
     def merge(self, other: PatchAccumulator) -> PatchAccumulator:
         """Fold another accumulator's totals into this one. Every total is a plain sum, so
         splitting the images across processes and merging gives the same answer as one pass."""
-        if (other.num_bins, other.patch) != (self.num_bins, self.patch):
-            raise ValueError("cannot merge accumulators with different binning or patch size")
+        if (other.num_bins, other.patch, other.min_code) != (
+            self.num_bins,
+            self.patch,
+            self.min_code,
+        ):
+            raise ValueError(
+                "cannot merge accumulators with different binning, patch size, or min_code"
+            )
         self.count += other.count
         self.sum_mean += other.sum_mean
         self.sum_var += other.sum_var
@@ -341,8 +356,10 @@ def _patch_lag_tables(patch: int) -> dict[str, torch.Tensor]:
     rows, cols = torch.meshgrid(torch.arange(patch), torch.arange(patch), indexing="ij")
     rows, cols = rows.reshape(-1), cols.reshape(-1)
     span = 2 * patch - 1
-    lag = ((rows.view(-1, 1) - rows.view(1, -1) + patch - 1) * span
-           + (cols.view(-1, 1) - cols.view(1, -1) + patch - 1)).reshape(-1)
+    lag = (
+        (rows.view(-1, 1) - rows.view(1, -1) + patch - 1) * span
+        + (cols.view(-1, 1) - cols.view(1, -1) + patch - 1)
+    ).reshape(-1)
 
     def fold(weights: torch.Tensor) -> torch.Tensor:
         out = torch.zeros(span * span, dtype=torch.float64)
@@ -434,8 +451,9 @@ def projected_dof(kernel: torch.Tensor, patch: int = PATCH) -> float:
     cov_lag = _kernel_lag_covariance(kernel, patch)
     rows, cols = torch.meshgrid(torch.arange(patch), torch.arange(patch), indexing="ij")
     rows, cols = rows.reshape(-1), cols.reshape(-1)
-    lag = ((rows.view(-1, 1) - rows.view(1, -1) + patch - 1) * span
-           + (cols.view(-1, 1) - cols.view(1, -1) + patch - 1))
+    lag = (rows.view(-1, 1) - rows.view(1, -1) + patch - 1) * span + (
+        cols.view(-1, 1) - cols.view(1, -1) + patch - 1
+    )
     cov = cov_lag.reshape(-1)[lag]
     projected = projector @ cov @ projector
     trace = float(projected.diagonal().sum())
@@ -566,8 +584,16 @@ def _isp_params(denoise_sigma: float, sharpen_amount: float, isp_cfg: dict) -> C
     """A CameraParams carrying only the ISP fields, so `camera.isp_kernel` stays the one
     implementation of the composite filter (no second copy to drift out of step)."""
     return CameraParams(
-        n_white=1.0, read_noise=0.0, wb_gains=torch.ones(CHANNELS), jpeg_quality=100,
-        a_raw=1.0, b_raw=0.0, ae_target=0.5, ae_percentile=0.5, gain_min=1.0, gain_max=1.0,
+        n_white=1.0,
+        read_noise=0.0,
+        wb_gains=torch.ones(CHANNELS),
+        jpeg_quality=100,
+        a_raw=1.0,
+        b_raw=0.0,
+        ae_target=0.5,
+        ae_percentile=0.5,
+        gain_min=1.0,
+        gain_max=1.0,
         quant_bits=12,
         denoise_sigma=denoise_sigma,
         denoise_radius=int(isp_cfg["denoise_radius"]),
@@ -661,6 +687,8 @@ class NoiseCalibration:
     num_images: int
     num_patches: int
     num_bins_used: int
+    exposure_percentile: float = 0.9
+    target_log10_quantiles: list[float] = field(default_factory=list)
 
 
 def calibrate(
@@ -672,7 +700,8 @@ def calibrate(
     num_bins: int = 40,
     min_bin_patches: int = 64,
     reference_gain: float = 1.0,
-    exposure_percentile: float = 0.5,
+    exposure_percentile: float = 0.9,
+    min_code: int = 3,
 ) -> NoiseCalibration:
     """Measure `(a, b)` and the ISP's denoising from a list of native-resolution night frames.
 
@@ -690,6 +719,7 @@ def calibrate(
             observable without EXIF; the sensor constants scale as `1/g` and `1/g^2` with it,
             and it is recorded alongside them.
         exposure_percentile: Percentile of per-frame luminance reported as `exposure.target`.
+        min_code: Exclude patches containing pixels at or below this 8-bit sRGB code.
 
     Returns:
         A NoiseCalibration.
@@ -702,11 +732,12 @@ def calibrate(
         flat_quantile=flat_quantile,
         gate_quantile=gate_quantile,
         gate_scale=gate_scale,
+        min_code=min_code,
     )
     luminances = []
     for image in images:
         accumulator.add_image(image)
-        luminances.append(frame_luminance(image))
+        luminances.append(frame_luminance(image, percentile=exposure_percentile))
     return analyze(
         accumulator,
         luminances,
@@ -723,7 +754,7 @@ def analyze(
     isp_cfg: dict,
     min_bin_patches: int = 64,
     reference_gain: float = 1.0,
-    exposure_percentile: float = 0.5,
+    exposure_percentile: float = 0.9,
 ) -> NoiseCalibration:
     """Turn accumulated patch totals into the two fits and the sensor constants.
 
@@ -733,7 +764,7 @@ def analyze(
 
     Args:
         accumulator: Totals over every calibration frame.
-        luminances: One median linear luminance per frame, for `exposure.target`.
+        luminances: One linear luminance statistic per frame, for `exposure.target`.
         isp_cfg: The `isp` section of the calibration config, for the fixed radii.
         min_bin_patches: Bins with fewer survivors than this are dropped from the line fit.
         reference_gain: Digital gain assumed applied by the real camera (see `calibrate`).
@@ -781,8 +812,12 @@ def analyze(
     read_sigma = math.sqrt(max(b_raw, 0.0)) * full_well
 
     axis_corr = [float((autocorr_2d[0, d] + autocorr_2d[d, 0]) / 2) for d in range(1, MAX_LAG + 1)]
-    luminances.sort()
-    target = luminances[min(len(luminances) - 1, int(exposure_percentile * len(luminances)))]
+    log_luminances = [math.log10(max(lum, 1e-12)) for lum in luminances]
+    log_tensor = torch.tensor(sorted(log_luminances), dtype=torch.float32)
+    q = torch.linspace(0.0, 1.0, 21)
+    quantiles = torch.quantile(log_tensor, q)
+    target_log10_quantiles = [round(float(v), 3) for v in quantiles]
+    target = 10.0 ** float(torch.quantile(log_tensor, torch.tensor(0.5)).item())
     return NoiseCalibration(
         effective_a=pooled_a,
         effective_b=pooled_b,
@@ -807,6 +842,8 @@ def analyze(
         num_images=accumulator.num_images,
         num_patches=int(counts.reshape(-1)[kept].sum()),
         num_bins_used=int(kept.sum()),
+        exposure_percentile=exposure_percentile,
+        target_log10_quantiles=target_log10_quantiles,
     )
 
 
@@ -815,9 +852,10 @@ def read_native_linear(path: str | Path) -> torch.Tensor:
     return srgb8_to_linear(read_srgb8(path))
 
 
-def frame_luminance(image: torch.Tensor) -> float:
-    """Median linear Rec. 709 luminance of one `(3, H, W)` frame (docs/conventions.md 4)."""
-    return float(luminance(image.unsqueeze(0)).median())
+def frame_luminance(image: torch.Tensor, percentile: float = 0.5) -> float:
+    """Percentile of linear Rec. 709 luminance of one `(3, H, W)` frame (docs/conventions.md 4)."""
+    lum = luminance(image.unsqueeze(0)).flatten()
+    return float(torch.quantile(lum, torch.tensor(percentile, dtype=torch.float32)).item())
 
 
 def accumulate_path(
@@ -826,6 +864,8 @@ def accumulate_path(
     flat_quantile: float = 0.15,
     gate_quantile: float = 0.25,
     gate_scale: float = 1.3,
+    min_code: int = 3,
+    exposure_percentile: float = 0.9,
 ) -> tuple[PatchAccumulator, float]:
     """Measure one file. Top level and picklable, so `prepare.run_parallel` can spread it out."""
     image = read_native_linear(path)
@@ -834,9 +874,10 @@ def accumulate_path(
         flat_quantile=flat_quantile,
         gate_quantile=gate_quantile,
         gate_scale=gate_scale,
+        min_code=min_code,
     )
     accumulator.add_image(image)
-    return accumulator, frame_luminance(image)
+    return accumulator, frame_luminance(image, percentile=exposure_percentile)
 
 
 def calibrate_paths(
@@ -849,8 +890,9 @@ def calibrate_paths(
     num_bins: int = 40,
     min_bin_patches: int = 64,
     reference_gain: float = 1.0,
-    exposure_percentile: float = 0.5,
+    exposure_percentile: float = 0.9,
     exposure_paths: Iterable[str | Path] | None = None,
+    min_code: int = 3,
 ) -> NoiseCalibration:
     """`calibrate`, reading from disk and measuring the frames in parallel.
 
@@ -868,21 +910,25 @@ def calibrate_paths(
 
     if not paths:
         raise ValueError("no calibration images")
-    jobs = [(path, num_bins, flat_quantile, gate_quantile, gate_scale) for path in paths]
+    jobs = [
+        (path, num_bins, flat_quantile, gate_quantile, gate_scale, min_code, exposure_percentile)
+        for path in paths
+    ]
     results = run_parallel(accumulate_path, jobs, workers, desc="calibrate")
-    wanted = None if exposure_paths is None else {str(path) for path in exposure_paths}
+    wanted = None if exposure_paths is None else {str(Path(p).resolve()) for p in exposure_paths}
     total = PatchAccumulator(
         num_bins=num_bins,
         flat_quantile=flat_quantile,
         gate_quantile=gate_quantile,
         gate_scale=gate_scale,
+        min_code=min_code,
     )
     luminances, subset = [], []
-    for path, (accumulator, median) in zip(paths, results, strict=True):
+    for path, (accumulator, p_val) in zip(paths, results, strict=True):
         total.merge(accumulator)
-        luminances.append(median)
-        if wanted is not None and str(path) in wanted:
-            subset.append(median)
+        luminances.append(p_val)
+        if wanted is not None and str(Path(path).resolve()) in wanted:
+            subset.append(p_val)
     return analyze(
         total,
         subset or luminances,
@@ -917,6 +963,7 @@ def synthetic_frame(
     texture_fraction: float = 0.5,
     region: int = 128,
     texture_strength: float = 0.7,
+    crush_blacks: bool = False,
 ) -> torch.Tensor:
     """One frame with a known sensor and a known ISP, to check the estimator against truth.
 
@@ -943,6 +990,7 @@ def synthetic_frame(
         texture_fraction: Share of the frame covered by detail.
         region: Side of one textured region, in pixels.
         texture_strength: How hard the texture modulates the background.
+        crush_blacks: Clip at 0 and round to 8-bit sRGB codes before returning.
 
     Returns:
         `(3, height, width)` linear float32 in [0, 1], as a camera would deliver it.
@@ -962,4 +1010,7 @@ def synthetic_frame(
     radius = kernel.shape[0] // 2
     weight = kernel.view(1, 1, *kernel.shape).expand(CHANNELS, 1, *kernel.shape)
     padded = F.pad((scene + noise).unsqueeze(0), (radius,) * 4, mode="replicate")
-    return F.conv2d(padded, weight, groups=CHANNELS)[0].clamp(0.0, 1.0)
+    out = F.conv2d(padded, weight, groups=CHANNELS)[0].clamp(0.0, 1.0)
+    if crush_blacks:
+        out = srgb8_to_linear(linear_to_srgb8(out))
+    return out

@@ -46,9 +46,9 @@ def _row(image_id, split="train", lum=0.2, highlight=4.0):
 # --- vocabulary ------------------------------------------------------------------------------
 
 
-def test_night_becomes_hard_test_and_dusk_is_dropped(split_cfg):
+def test_night_maps_to_night_and_dusk_is_dropped(split_cfg):
     labels = {"a": "day", "b": "night", "c": "dusk", "d": "exclude", "e": None}
-    assert map_labels(labels, split_cfg["label_map"]) == {"a": "day", "b": "hard_test"}
+    assert map_labels(labels, split_cfg["label_map"]) == {"a": "day", "b": "night"}
 
 
 def test_an_unmapped_hand_label_is_an_error_not_a_silent_drop():
@@ -69,7 +69,7 @@ def _separable_corpus():
     for i in range(20):
         image_id = f"000{300 + i}_00000_d_000000{i % 10}"
         stats.append(_row(image_id, lum=0.01 + 0.001 * i, highlight=25.0 + i))
-        labels[image_id] = "hard_test"
+        labels[image_id] = "night" if i % 2 == 0 else "hard_test"
     return stats, labels
 
 
@@ -123,6 +123,25 @@ def test_fitting_needs_both_classes():
         fit_auto_day_cutoffs(stats, only_day, min_recall=0.0)
 
 
+def test_both_night_and_hard_test_count_as_non_day_negatives():
+    stats = [
+        _row("0000001_00000_d_0000001", lum=0.3, highlight=3.0),
+        _row("0000002_00000_d_0000001", lum=0.002, highlight=50.0),
+        _row("0000003_00000_d_0000001", lum=0.01, highlight=40.0),
+        _row("0000004_00000_d_0000001", lum=0.015, highlight=35.0),
+    ]
+    labels = {
+        "0000001_00000_d_0000001": "day",
+        "0000002_00000_d_0000001": "night",
+        "0000003_00000_d_0000001": "hard_test",
+        "0000004_00000_d_0000001": "night_normal",
+    }
+    cutoffs = fit_auto_day_cutoffs(stats, labels, margin=0.0, min_recall=0.0)
+    assert cutoffs.num_day == 1
+    assert cutoffs.num_other == 3
+    assert cutoffs.errors == 0
+
+
 def test_only_still_collections_are_auto_labelled():
     cutoffs = AutoDayCutoffs(0.1, 10.0, 1.0, 1, 1, 0, 0.1)
     stats = [
@@ -172,13 +191,20 @@ def _corpus_with_stills():
     for seq in range(30):  # labelled day videos, split train/val in the raw download
         for frame in range(4):
             image_id = f"{seq:07d}_00000_d_{frame:07d}"
-            stats.append(_row(image_id, split="train" if seq < 25 else "val",
-                              lum=0.18 + 0.001 * seq, highlight=3.0 + 0.02 * seq))
+            stats.append(
+                _row(
+                    image_id,
+                    split="train" if seq < 25 else "val",
+                    lum=0.18 + 0.001 * seq,
+                    highlight=3.0 + 0.02 * seq,
+                )
+            )
             hand[image_id] = "day"
     for seq in range(30, 38):  # labelled night videos
         for frame in range(3):
             image_id = f"{seq:07d}_00000_d_{frame:07d}"
-            stats.append(_row(image_id, lum=0.015, highlight=40.0))
+            lum = 0.002 if seq < 32 else 0.015
+            stats.append(_row(image_id, lum=lum, highlight=40.0))
             hand[image_id] = "night"
     for seq in range(38, 42):  # labelled dusk: dropped entirely
         image_id = f"{seq:07d}_00000_d_0000001"
@@ -191,37 +217,68 @@ def _corpus_with_stills():
     for i in range(40):  # unlabelled still collections, half bright half dark
         bright = i % 2 == 0
         image_id = f"999990{i % 4}_00000_d_{i:07d}"
-        stats.append(_row(image_id, lum=0.25 if bright else 0.008,
-                          highlight=3.0 if bright else 60.0))
+        stats.append(
+            _row(image_id, lum=0.25 if bright else 0.008, highlight=3.0 if bright else 60.0)
+        )
         hand[image_id] = None
     return stats, hand
 
 
-def test_build_final_manifests_produces_the_four_manifests(split_cfg, tmp_path):
+def test_build_final_manifests_produces_the_five_manifests(split_cfg, tmp_path):
     stats, hand = _corpus_with_stills()
     manifests, cutoffs = build_final_manifests(stats, hand, split_cfg)
 
     assert set(manifests) == set(FINAL_SUBSETS)
     assert cutoffs is not None and cutoffs.errors == 0
-    assert manifests["test_day"] and manifests["hard_test"]
+    assert manifests["test_day"] and manifests["hard_test"] and manifests["night_normal"]
     assert manifests["train_day"] and manifests["val_day"]
 
     # Dusk never appears anywhere.
     everything = {i for ids in manifests.values() for i in ids}
     assert not any(hand.get(i) == "dusk" for i in everything)
+    # Night frames partition into hard_test and night_normal by hard_test_max_lum
+    stats_map = {r.image_id: float(r.lum_median) for r in stats}
+    assert all(stats_map[i] <= 0.005 for i in manifests["hard_test"])
+    assert all(stats_map[i] > 0.005 for i in manifests["night_normal"])
     # Bright stills were picked up as day; dark ones were not.
     stills = [i for i in manifests["train_day"] + manifests["val_day"] if i.startswith("99999")]
     assert stills
     assert all(float(next(r.lum_median for r in stats if r.image_id == i)) > 0.1 for i in stills)
     # test-dev stays whole and keeps away from train and val.
     assert len(manifests["test_day"]) == 20
-    assert_groups_disjoint({k: v for k, v in manifests.items() if k != "hard_test"})
+    assert_groups_disjoint(
+        {k: v for k, v in manifests.items() if k not in ("hard_test", "night_normal")}
+    )
 
     counts = write_final_manifests(manifests, tmp_path)
     for name in FINAL_SUBSETS:
         assert (tmp_path / f"{name}.txt").exists()
         assert read_manifest(tmp_path / f"{name}.txt") == manifests[name]
         assert counts[name] == len(manifests[name])
+
+
+def test_night_frames_split_to_hard_test_or_night_normal_at_cutoff():
+    stats = [
+        _row("0000001_00000_d_0000001", lum=0.0049),
+        _row("0000002_00000_d_0000001", lum=0.0050),
+        _row("0000003_00000_d_0000001", lum=0.0051),
+        _row("0000004_00000_d_0000001", lum=0.0086),
+    ]
+    hand = {
+        "0000001_00000_d_0000001": "night",
+        "0000002_00000_d_0000001": "night",
+        "0000003_00000_d_0000001": "night",
+        "0000004_00000_d_0000001": "night",
+    }
+    cfg = {
+        "label_map": {"night": "night"},
+        "night": {"hard_test_max_lum": 0.005},
+        "auto_day": {"enabled": False},
+        "regroup": {},
+    }
+    manifests, _ = build_final_manifests(stats, hand, cfg)
+    assert manifests["hard_test"] == ["0000001_00000_d_0000001", "0000002_00000_d_0000001"]
+    assert manifests["night_normal"] == ["0000003_00000_d_0000001", "0000004_00000_d_0000001"]
 
 
 def test_disabling_auto_day_leaves_the_stills_out(split_cfg):
@@ -235,9 +292,7 @@ def test_disabling_auto_day_leaves_the_stills_out(split_cfg):
 def test_validation_holds_out_roughly_the_configured_share_of_groups(split_cfg):
     stats, hand = _corpus_with_stills()
     manifests, _ = build_final_manifests(stats, hand, split_cfg)
-    groups = assert_groups_disjoint(
-        {k: manifests[k] for k in ("train_day", "val_day", "test_day")}
-    )
+    groups = assert_groups_disjoint({k: manifests[k] for k in ("train_day", "val_day", "test_day")})
     pool = len(groups["train_day"]) + len(groups["val_day"])
     share = len(groups["val_day"]) / pool
     assert 0.03 < share < 0.25, f"validation holds out {share:.0%} of groups"

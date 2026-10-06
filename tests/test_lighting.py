@@ -12,6 +12,7 @@ from dawn.data.lighting import (  # noqa: E402
     MODES,
     apply_lighting,
     choose_mode,
+    emission_field,
     illumination_field,
     overcast_score,
     sample_lighting_params,
@@ -35,6 +36,7 @@ def test_ambient_sits_at_relative_level_one(cfg, mode):
     generator = torch.Generator().manual_seed(0)
     params = sample_lighting_params(32, 48, cfg, mode, generator)
     params.light_xy = torch.zeros(0, 2)  # drop any lamps; ambient only
+    params.emitters = []  # drop any emitters; ambient only
     white = torch.ones(3, 32, 48)
     lit = apply_lighting(white, params)
     # Green is the reference channel of `color_temp_to_gains`, so it is exactly the level.
@@ -151,7 +153,7 @@ def _flat_image():
 
 
 def _contrasty_image():
-    image = torch.full((3, 64, 64), 0.02)
+    image = torch.full((3, 64, 64), 0.01)
     image[:, :32] = 0.95  # hard sun / shadow split
     return image
 
@@ -191,3 +193,96 @@ def test_apply_lighting_rejects_a_size_mismatch(cfg):
 def test_sample_lighting_params_rejects_an_unknown_mode(cfg):
     with pytest.raises(ValueError):
         sample_lighting_params(8, 8, cfg, "daylight")
+
+
+# --- emitters & streetlit lamps -------------------------------------------------------------
+
+
+@skip_until_implemented
+def test_streetlit_always_has_lamps(cfg):
+    """Streetlit must always have at least 1 lamp, and lamp peaks dominate ambient."""
+    generator = torch.Generator().manual_seed(42)
+    for _ in range(50):
+        params = sample_lighting_params(32, 48, cfg, "streetlit", generator)
+        assert params.num_lights >= 1
+        assert params.light_peak.min() >= cfg["light_peak_range"][0]
+        assert params.light_peak.max() <= cfg["light_peak_range"][1]
+
+
+@skip_until_implemented
+def test_emission_non_negative_and_absent_from_day(cfg):
+    """Emission field is non-negative and is deliberately absent from the day reflectance."""
+    generator = torch.Generator().manual_seed(43)
+    for mode in MODES:
+        params = sample_lighting_params(64, 64, cfg, mode, generator)
+        em = emission_field(params)
+        assert em.min() >= 0.0
+
+        day = torch.rand(3, 64, 64)
+        day_clone = day.clone()
+        radiance = apply_lighting(day, params)
+        # Day input tensor is never modified in-place
+        assert torch.equal(day, day_clone)
+        # Scene radiance is reflectance * illumination + emission
+        illum = illumination_field(params)
+        diff = radiance - (day * illum)
+        assert diff.min() >= -1e-6
+        if params.num_emitters > 0:
+            assert diff.max() > 0.0
+
+
+@skip_until_implemented
+def test_emitter_counts_per_mode_respected(cfg):
+    """Sampled counts of windows, headlights, taillights, signs respect configured ranges."""
+    generator = torch.Generator().manual_seed(44)
+    for mode in MODES:
+        counts_cfg = cfg.get("emitter_counts", {}).get(mode, {})
+        for _ in range(30):
+            params = sample_lighting_params(64, 64, cfg, mode, generator)
+            for key in ("windows", "headlights", "taillights", "signs"):
+                lo, hi = counts_cfg.get(key, (0, 0))
+                actual = params.emitter_counts.get(key, 0)
+                assert lo <= actual <= hi
+        if mode == "starlight":
+            assert params.num_emitters == 0
+
+
+@skip_until_implemented
+def test_emitter_determinism(cfg):
+    """RNG seed reproducibility: same generator seed produces identical emitter parameters."""
+    for mode in MODES:
+        g1 = torch.Generator().manual_seed(101)
+        g2 = torch.Generator().manual_seed(101)
+        p1 = sample_lighting_params(64, 64, cfg, mode, generator=g1)
+        p2 = sample_lighting_params(64, 64, cfg, mode, generator=g2)
+        assert p1.num_emitters == p2.num_emitters
+        assert p1.emitter_counts == p2.emitter_counts
+        for e1, e2 in zip(p1.emitters, p2.emitters, strict=True):
+            assert e1.shape == e2.shape
+            assert e1.emitter_type == e2.emitter_type
+            assert e1.x == e2.x and e1.y == e2.y
+            assert e1.w == e2.w and e1.h == e2.h
+            assert e1.core_peak == e2.core_peak
+            assert e1.halo_peak == e2.halo_peak
+            assert e1.halo_sigma == e2.halo_sigma
+            assert torch.equal(e1.color, e2.color)
+        em1 = emission_field(p1)
+        em2 = emission_field(p2)
+        assert torch.equal(em1, em2)
+
+
+@skip_until_implemented
+def test_emitter_energy_resolution_independence(cfg):
+    """Area coverage preserves total emitted energy per unit area across resolutions within ~5%."""
+    generator = torch.Generator().manual_seed(202)
+    params = sample_lighting_params(256, 256, cfg, "streetlit", generator)
+    assert params.num_emitters > 0
+
+    em256 = emission_field(params, height=256, width=256)
+    em1024 = emission_field(params, height=1024, width=1024)
+
+    energy_256 = float(em256.mean())
+    energy_1024 = float(em1024.mean())
+    rel_diff = abs(energy_256 - energy_1024) / energy_1024
+    assert rel_diff < 0.05, f"Energy mismatch: {rel_diff * 100:.2f}% (exceeds 5%)"
+

@@ -64,22 +64,29 @@ CHANNELS = 3
 class CameraParams:
     """Sampled camera settings for one image. `a_raw` and `b_raw` come from the calibration."""
 
-    n_white: float  # electrons from a white pixel (radiance 1) at native resolution
+    u: float
+    target: float
+    photon_window_u: float
     read_noise: float  # sigma_r, electrons per native pixel
     wb_gains: torch.Tensor  # (3,) partial white-balance gains, green == 1
     jpeg_quality: int
+    chroma_sigma: float
+    chroma_gain: float
     a_raw: float  # 1 / full_well
     b_raw: float  # sigma_r^2 / full_well^2
-    ae_target: float
     ae_percentile: float
     gain_min: float
     gain_max: float
+    n_white_range: tuple[float, float]
     quant_bits: int
     denoise_sigma: float
     denoise_radius: int
     sharpen_amount: float
     sharpen_sigma: float
     sharpen_radius: int
+    n_white: float | None = None
+    gain: float | None = None
+    n_white_clamped: bool | None = None
 
 
 @dataclass
@@ -89,11 +96,12 @@ class CameraResult:
     night: torch.Tensor  # (3, H, W) linear RGB, float32, [0, 1]
     gain: float  # the auto-exposure gain actually applied
     gain_capped: bool  # True when AE wanted more than `gain_max`: the frame stays dark
-    noise_a: torch.Tensor  # (3,) shot term at NATIVE resolution
-    noise_b: torch.Tensor  # (3,) read variance at NATIVE resolution
+    noise_a: torch.Tensor  # (3,) shot term at NATIVE resolution (pre-ISP)
+    noise_b: torch.Tensor  # (3,) read variance at NATIVE resolution (pre-ISP)
     quant_var: float  # quantization variance at NATIVE resolution; divide by n like a and b
     n: float  # native pixels per simulated pixel
-    isp_var_scale: float  # sum of squared weights of the native-path filter (1.0 off the path)
+    S: torch.Tensor  # (3, 3) ISP variance mixing matrix
+    M: torch.Tensor  # (3, 3) ISP DC colour matrix
     saturated: float  # fraction of samples clipped at 1.0
     jpeg_quality: int | None  # None when the JPEG round trip was skipped
 
@@ -139,7 +147,6 @@ def sample_camera_params(
     ranges = cfg["n_white_range"]
     if mode not in ranges:
         raise ValueError(f"no n_white_range for mode {mode!r}; have {sorted(ranges)}")
-    lo, hi = (float(v) for v in ranges[mode])
 
     if level is None:
         quantile = _uniform(0.0, 1.0, generator)
@@ -150,6 +157,17 @@ def sample_camera_params(
         q_lo, q_hi = (float(v) for v in bands[level])
         quantile = _uniform(q_lo, q_hi, generator)
 
+    target_log10_quantiles = calib["exposure"]["target_log10_quantiles"]
+    idx = quantile * 20.0
+    idx_floor = int(math.floor(idx))
+    if idx_floor >= 20:
+        target = float(10**target_log10_quantiles[20])
+    else:
+        frac = idx - idx_floor
+        log10_T = target_log10_quantiles[idx_floor] * (1.0 - frac) + target_log10_quantiles[idx_floor + 1] * frac
+        target = float(10**log10_T)
+
+    photon_window_u = _uniform(0.0, 1.0, generator)
     read_noise = _uniform(*(float(v) for v in cfg["read_noise_range"]), generator)
     a_raw = float(calib["measured"]["noise_a"])
     strength = _uniform(*(float(v) for v in cfg["white_balance_strength"]), generator)
@@ -157,29 +175,37 @@ def sample_camera_params(
     if ambient_gains is None:
         wb = torch.ones(CHANNELS, dtype=torch.float32, device=device)
     else:
-        # Undo a fraction `strength` of the illuminant's cast, keeping green fixed.
         wb = ambient_gains.to(device=device, dtype=torch.float32).clamp(min=1e-3).pow(-strength)
         wb = wb / wb[1].clamp(min=1e-6)
 
+    jpeg_quality = int(
+        torch.randint(
+            int(cfg["jpeg_quality_range"][0]),
+            int(cfg["jpeg_quality_range"][1]) + 1,
+            (),
+            generator=generator,
+        )
+    )
+
+    chroma_sigma = _uniform(*(float(v) for v in cfg["chroma"]["sigma_range"]), generator)
+    chroma_gain = _uniform(*(float(v) for v in cfg["chroma"]["gain_range"]), generator)
+
     isp = calib["isp"]
     return CameraParams(
-        n_white=_log_uniform_at(lo, hi, quantile),
+        u=quantile,
+        target=target,
+        photon_window_u=photon_window_u,
         read_noise=read_noise,
         wb_gains=wb,
-        jpeg_quality=int(
-            torch.randint(
-                int(cfg["jpeg_quality_range"][0]),
-                int(cfg["jpeg_quality_range"][1]) + 1,
-                (),
-                generator=generator,
-            )
-        ),
+        jpeg_quality=jpeg_quality,
+        chroma_sigma=chroma_sigma,
+        chroma_gain=chroma_gain,
         a_raw=a_raw,
         b_raw=read_noise**2 * a_raw**2,
-        ae_target=float(calib["exposure"]["target"]),
         ae_percentile=float(calib["exposure"]["percentile"]),
         gain_min=float(cfg["gain_min"]),
         gain_max=float(calib["exposure"]["gain_max"]),
+        n_white_range=(float(ranges[mode][0]), float(ranges[mode][1])),
         quant_bits=int(cfg["quant_bits"]),
         denoise_sigma=float(isp["denoise_sigma"]),
         denoise_radius=int(isp["denoise_radius"]),
@@ -223,14 +249,6 @@ def isp_kernel(params: CameraParams, device: torch.device = torch.device("cpu"))
     )[0, 0]
 
 
-def _filter(image: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-    """Apply a (k, k) kernel to a (3, H, W) image per channel, replicate-padded."""
-    radius = kernel.shape[0] // 2
-    padded = F.pad(image.unsqueeze(0), (radius,) * 4, mode="replicate")
-    weight = kernel.view(1, 1, *kernel.shape).expand(CHANNELS, 1, *kernel.shape)
-    return F.conv2d(padded, weight, groups=CHANNELS)[0]
-
-
 def jpeg_roundtrip(image_linear: torch.Tensor, quality: int) -> torch.Tensor:
     """Encode a linear image as an 8-bit sRGB JPEG and decode it back to linear.
 
@@ -253,22 +271,36 @@ def jpeg_roundtrip(image_linear: torch.Tensor, quality: int) -> torch.Tensor:
     return srgb8_to_linear(decoded.permute(2, 0, 1).contiguous())
 
 
-def auto_exposure_gain(raw_mean: torch.Tensor, params: CameraParams) -> tuple[float, bool]:
-    """The digital gain that drives `raw_mean` toward the calibrated target, capped.
+def resolve_exposure(radiance: torch.Tensor, params: CameraParams) -> None:
+    """Fills n_white and gain in params from the radiance."""
+    if params.n_white is not None:
+        return
+    device = radiance.device
+    wb_signal = radiance * params.a_raw * params.wb_gains.view(3, 1, 1).to(device)
+    l1_map = luminance(wb_signal)
+    L1 = float(torch.quantile(l1_map.flatten().to(torch.float32), params.ae_percentile))
+    L1 = max(L1, 1e-12)
 
-    Args:
-        raw_mean: (3, H, W) the noise-free normalized sensor signal, before gain.
-        params: Camera settings, which carry the target and the cap.
+    T = params.target
+    win_min = T / (params.gain_max * L1)
+    win_max = T / (params.gain_min * L1)
 
-    Returns:
-        `(gain, capped)`. `capped` is True when the uncapped gain exceeded `gain_max`, which is
-        the case where the frame comes out darker than the target and stays that way.
-    """
-    y = luminance(raw_mean.unsqueeze(0).clamp(0.0, 1.0)).flatten()
-    level = float(torch.quantile(y, params.ae_percentile))
-    wanted = params.ae_target / max(level, 1e-9)
-    gain = min(max(wanted, params.gain_min), params.gain_max)
-    return gain, wanted > params.gain_max
+    cfg_min, cfg_max = params.n_white_range
+    inter_min = max(win_min, cfg_min)
+    inter_max = min(win_max, cfg_max)
+
+    clamped = False
+    if inter_min >= inter_max:
+        clamped = True
+        inter_min, inter_max = win_min, win_max
+
+    n_white = _log_uniform_at(inter_min, inter_max, params.photon_window_u)
+    gain = T / (n_white * L1)
+    gain = min(max(gain, params.gain_min), params.gain_max)
+
+    params.n_white = n_white
+    params.gain = gain
+    params.n_white_clamped = clamped
 
 
 def apply_camera(
@@ -312,9 +344,9 @@ def apply_camera(
     device = radiance.device
     radiance = radiance.to(torch.float32).clamp(min=0.0)
 
+    resolve_exposure(radiance, params)
+
     # --- sensor ---------------------------------------------------------------------------
-    # Normalized full-scale signal: a_raw == 1 / full_well, so N_white * a_raw is what fraction
-    # of the well a white pixel fills.
     scale = params.n_white * params.a_raw
     raw_mean = radiance * scale
     if noise:
@@ -330,15 +362,11 @@ def apply_camera(
     raw = raw.clamp(0.0, 1.0)
 
     # --- auto exposure and partial white balance ---------------------------------------------
-    gain, capped = auto_exposure_gain(raw_mean, params)
-    channel_scale = gain * params.wb_gains.to(device)  # (3,)
+    channel_scale = params.gain * params.wb_gains.to(device)  # (3,)
     signal = (raw * channel_scale.view(CHANNELS, 1, 1)).clamp(0.0, 1.0)
     saturated = float((signal >= 1.0).to(torch.float32).mean())
 
     # --- 12-bit quantization -------------------------------------------------------------
-    # The ADC digitizes NATIVE pixels. A simulated pixel is the mean of `n` of them, so it
-    # lands on a lattice `n` times finer and carries `step^2 / (12 n)` of quantization noise.
-    # `quant_var` is therefore reported at native resolution, like `a` and `b`.
     levels = float(2**params.quant_bits - 1)
     step = 1.0 / levels
     signal = torch.round(signal * levels * n) / (levels * n)
@@ -348,13 +376,40 @@ def apply_camera(
     noise_b = channel_scale.pow(2) * params.b_raw
 
     # --- in-camera ISP, native resolution only ------------------------------------------------
-    isp_var_scale = 1.0
+    S = torch.eye(3, device=device)
+    M = torch.eye(3, device=device)
     if native_path:
-        kernel = isp_kernel(params, device)
-        signal = _filter(signal, kernel).clamp(0.0, 1.0)
-        isp_var_scale = float(kernel.pow(2).sum())
-        noise_a, noise_b = noise_a * isp_var_scale, noise_b * isp_var_scale
-        quant_var *= isp_var_scale
+        chroma_radius = int(math.ceil(3 * params.chroma_sigma))
+        k_c = 2 * chroma_radius + 1
+        chroma_blur = _gaussian_2d(params.chroma_sigma, chroma_radius, device)
+        K_m = torch.zeros(3, k_c, k_c, device=device)
+        K_m[0, chroma_radius, chroma_radius] = 1.0
+        K_m[1] = chroma_blur * params.chroma_gain
+        K_m[2] = chroma_blur * params.chroma_gain
+
+        T = torch.tensor([
+            [0.2126, 0.7152, 0.0722],
+            [-0.2126, -0.7152, 0.9278],
+            [0.7874, -0.7152, -0.0722],
+        ], device=device)
+        Tinv = torch.linalg.inv(T)
+
+        W_chroma = torch.einsum('im, myx, mj -> ijyx', Tinv, K_m, T)
+
+        K_luma = isp_kernel(params, device)
+        k_l = K_luma.shape[0]
+
+        W_flat = W_chroma.reshape(9, 1, k_c, k_c)
+        W_full = F.conv2d(W_flat, K_luma.view(1, 1, k_l, k_l), padding=k_l - 1)
+        k_full = W_full.shape[-1]
+        W_full = W_full.view(3, 3, k_full, k_full)
+
+        pad = k_full // 2
+        padded = F.pad(signal.unsqueeze(0), (pad, pad, pad, pad), mode="replicate")
+        signal = F.conv2d(padded, W_full)[0].clamp(0.0, 1.0)
+
+        S = W_full.pow(2).sum(dim=(2, 3))
+        M = W_full.sum(dim=(2, 3))
 
     # --- output transfer function ----------------------------------------------------------
     if jpeg:
@@ -363,13 +418,14 @@ def apply_camera(
         night = signal
     return CameraResult(
         night=night.clamp(0.0, 1.0).to(torch.float32),
-        gain=gain,
-        gain_capped=capped,
+        gain=params.gain,
+        gain_capped=params.n_white_clamped,
         noise_a=noise_a.to(torch.float32).cpu(),
         noise_b=noise_b.to(torch.float32).cpu(),
         quant_var=quant_var,
         n=float(n),
-        isp_var_scale=isp_var_scale,
+        S=S.cpu(),
+        M=M.cpu(),
         saturated=saturated,
         jpeg_quality=int(params.jpeg_quality) if jpeg else None,
     )

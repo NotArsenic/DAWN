@@ -190,8 +190,10 @@ def main():
             params = result.params
             logger.info(
                 f"  {stem:<34} {params.mode:<10} "
-                f"N_white {params.camera.n_white:>7.1f} e-  gain {result.gain:>5.2f}"
-                f"{' (capped)' if result.gain_capped else '         '}  "
+                f"target {params.camera.target:.5f}  "
+                f"N_white {params.camera.n_white:>7.1f} e- "
+                f"{'(clamped)' if params.camera.n_white_clamped else '         '}  "
+                f"gain {result.gain:>5.2f}  "
                 f"a {result.noise_a.mean():.2e}  b {result.noise_b.mean():.2e}  "
                 f"n {result.n:g}  sigma_max {peak:.4f}"
             )

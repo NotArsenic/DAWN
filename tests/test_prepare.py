@@ -25,6 +25,7 @@ from dawn.data.prepare import (  # noqa: E402
     resolve_labels,
     run_parallel,
     save_contact_sheets,
+    save_manifest_sheet,
     save_sequence_sheets,
     write_labels_template,
     write_manifests,
@@ -300,6 +301,15 @@ def test_sequence_sheets_show_every_video_sequence(prepared_visdrone, tmp_path):
     pages = save_sequence_sheets(prepared_visdrone, stats, tmp_path, per_page=2)
     assert [p.name for p in pages] == ["sequences_01.jpg", "sequences_02.jpg"]  # 3 videos
     assert all(Image.open(p).size[1] > 0 for p in pages)
+
+
+def test_manifest_sheet_is_written(prepared_visdrone, tmp_path):
+    stats = list(read_stats_csv(prepared_visdrone.stats_csv).values())
+    ids = [r.image_id for r in stats[:3]]
+    sheet = save_manifest_sheet(prepared_visdrone, stats, ids, tmp_path, name="hard_test", count=2)
+    assert sheet is not None and sheet.name == "hard_test.jpg"
+    assert Image.open(sheet).size[0] > 0
+    assert save_manifest_sheet(prepared_visdrone, stats, [], tmp_path, name="empty") is None
 
 
 # --- phase 3: 512-px copies --------------------------------------------------------------------

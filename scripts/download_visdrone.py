@@ -8,7 +8,6 @@ Extracts images into data/visdrone/{train,val,test}/images/.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import tarfile
 import zipfile
