@@ -85,6 +85,7 @@ def run_split(cfg: dict, args: argparse.Namespace) -> None:
         resolve_labels,
         save_auto_day_sheet,
         save_contact_sheets,
+        save_manifest_sheet,
         write_manifests,
     )
     from dawn.data.splitting import (
@@ -130,7 +131,7 @@ def run_split(cfg: dict, args: argparse.Namespace) -> None:
     )
     logger.info(f"Contact sheets: {len(sheets)} in {out_dir / 'contact_sheets'}")
 
-    # The four manifests the rest of the project actually reads. `write_manifests` above is the
+    # The five manifests the rest of the project actually reads. `write_manifests` above is the
     # per-label bookkeeping of phase 2; this is the training split, and it is the step that
     # auto-accepts still collections, regroups train/val by group and checks test-dev shares no
     # group with either (dawn/data/splitting.py).
@@ -142,7 +143,21 @@ def run_split(cfg: dict, args: argparse.Namespace) -> None:
     logger.info(f"Final manifests in {layout.manifest_dir}:")
     for name in FINAL_SUBSETS:
         groups = len({group_id(image_id) for image_id in final[name]})
-        logger.info(f"  {name:<10}{counts[name]:>9} images{groups:>7} groups")
+        logger.info(f"  {name:<13}{counts[name]:>9} images{groups:>7} groups")
+
+    for manifest_name in ("hard_test", "night_normal"):
+        sheet = save_manifest_sheet(
+            layout,
+            stats,
+            final[manifest_name],
+            out_dir / "contact_sheets",
+            name=manifest_name,
+            count=args.per_sheet,
+            seed=args.seed,
+            workers=args.workers,
+        )
+        if sheet:
+            logger.info(f"{manifest_name} contact sheet: {sheet}")
     if cutoffs is None:
         logger.info("Auto-day is off: no still collection entered a manifest")
         return
@@ -187,8 +202,9 @@ def main():
     )
     parser.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
     parser.add_argument("--splits", nargs="+", default=None, help="Override visdrone.splits")
-    parser.add_argument("--workers", type=int, default=os.cpu_count() or 1,
-                        help="Processes (default: every core)")
+    parser.add_argument(
+        "--workers", type=int, default=os.cpu_count() or 1, help="Processes (default: every core)"
+    )
     phases = parser.add_subparsers(dest="phase", required=True)
 
     stats = phases.add_parser("stats", help="Phase 1: per-image stats CSV (slow, once)")
@@ -202,8 +218,12 @@ def main():
     split = phases.add_parser("split", help="Phase 2: labels -> manifests, plots, contact sheets")
     split.add_argument("--per-sheet", type=int, default=50, help="Thumbnails per contact sheet")
     split.add_argument("--seed", type=int, default=0, help="Contact-sheet sampling seed")
-    split.add_argument("--no-final", dest="final", action="store_false",
-                       help="Per-label manifests and plots only: skip the four training manifests")
+    split.add_argument(
+        "--no-final",
+        dest="final",
+        action="store_false",
+        help="Per-label manifests and plots only: skip the four training manifests",
+    )
     split.set_defaults(run=run_split)
 
     resize = phases.add_parser("resize", help="Phase 3: 512-px linear-space PNG copies")

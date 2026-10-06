@@ -56,8 +56,9 @@ def kernel():
 def frames(kernel, count=6, seed=23, level=0.06, size=SIZE, **kwargs):
     generator = torch.Generator().manual_seed(seed)
     return [
-        synthetic_frame(size, size, generator, kernel, level=level, a_raw=TRUE_A, b_raw=TRUE_B,
-                        **kwargs)
+        synthetic_frame(
+            size, size, generator, kernel, level=level, a_raw=TRUE_A, b_raw=TRUE_B, **kwargs
+        )
         for _ in range(count)
     ]
 
@@ -90,11 +91,34 @@ def test_recovers_the_read_noise_where_it_is_identifiable(kernel):
         frames(kernel, count=8, level=0.012, texture_fraction=0.35),
         ISP_CFG,
         min_bin_patches=MIN_BIN,
+        min_code=0,
     )
     assert dark.darkest_bin < 0.02
     assert dark.read_noise_share > 0.05  # the fit genuinely reaches down to the read floor
     assert dark.noise_b == pytest.approx(TRUE_B, rel=0.5)
     assert dark.read_noise_sigma == pytest.approx(math.sqrt(TRUE_B) / TRUE_A, rel=0.3)
+
+
+def test_crushed_blacks_exclusion_keeps_a_unbiased(kernel):
+    """Synthetic case with crushed blacks (values clipped at 0 then 8-bit sRGB).
+    Excluding patches near code 0 (min_code=3) keeps effective_a unbiased."""
+    crushed_frames = [
+        synthetic_frame(
+            512,
+            512,
+            torch.Generator().manual_seed(23 + i),
+            kernel,
+            level=level,
+            a_raw=TRUE_A,
+            b_raw=TRUE_B,
+            texture_fraction=0.5,
+            crush_blacks=True,
+        )
+        for i, level in enumerate([0.005, 0.02, 0.06, 0.15] * 2)
+    ]
+    fit = calibrate(crushed_frames, ISP_CFG, min_bin_patches=MIN_BIN, min_code=3)
+    expected_a = TRUE_A * float(kernel.pow(2).sum())
+    assert fit.effective_a == pytest.approx(expected_a, rel=0.20)
 
 
 def test_a_bright_scene_says_so_rather_than_inventing_a_read_floor(kernel):
@@ -106,8 +130,10 @@ def test_a_bright_scene_says_so_rather_than_inventing_a_read_floor(kernel):
     )
     assert bright.darkest_bin > 0.05
     assert bright.read_noise_share < 0.05
-    assert bright.effective_a == pytest.approx(TRUE_A * float(isp_kernel(
-        _isp_params(TRUE_SIGMA, TRUE_AMOUNT, ISP_CFG)).pow(2).sum()), rel=0.15)
+    assert bright.effective_a == pytest.approx(
+        TRUE_A * float(isp_kernel(_isp_params(TRUE_SIGMA, TRUE_AMOUNT, ISP_CFG)).pow(2).sum()),
+        rel=0.15,
+    )
 
 
 def test_recovers_the_isp_denoise_strength(fitted, kernel):

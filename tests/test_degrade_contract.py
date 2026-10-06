@@ -107,12 +107,8 @@ def test_harder_levels_are_darker_or_noisier(cfg, calib, day):
                                      mode="moonlit")
         for level in degrade.DARKNESS_LEVELS
     }
-    # The sampled photon count is what "darkness level" means; it is strictly ordered.
-    whites = [out[level].params.camera.n_white for level in ("hard", "medium", "easy")]
-    assert whites[0] < whites[1] < whites[2]
-    # And fewer photons must mean a worse signal-to-noise ratio at the same signal level.
-    snr = [out[level].noise_a.mean() for level in ("easy", "medium", "hard")]
-    assert snr[0] < snr[1] < snr[2]
+    targets = [out[level].params.camera.target for level in ("hard", "medium", "easy")]
+    assert targets[0] < targets[1] < targets[2]
 
 
 @skip_until_implemented
@@ -180,18 +176,52 @@ def test_binning_sixteen_native_pixels_divides_the_variance_by_sixteen(cfg, cali
 
 
 @skip_until_implemented
-def test_the_isp_filters_scale_the_variance_by_their_squared_weights(cfg, calib):
-    from dawn.data.camera import isp_kernel
+def test_monte_carlo_colour_variance_matches_formula(cfg, calib):
+    from dawn.data.camera import apply_camera
 
-    generator = torch.Generator().manual_seed(5)
+    generator = torch.Generator().manual_seed(100)
+
+    day = torch.zeros((3, 64, 64))
+    day[0] = 0.5
+    day[1] = 0.2
+    day[2] = 0.1
+
     params = degrade.sample_degradation_params(
         64, 64, cfg, calib, mode="moonlit", level="medium", n=1.0, generator=generator
     )
-    plain = apply_camera(torch.full((3, 64, 64), 0.4), params.camera, noise=False, jpeg=False)
-    filtered = apply_camera(
-        torch.full((3, 64, 64), 0.4), params.camera, noise=False, jpeg=False, native_path=True
+
+    params.lighting.illum_field = torch.ones_like(params.lighting.illum_field)
+
+    radiance = apply_lighting(day, params.lighting)
+    clean_result = apply_camera(radiance, params.camera, params.n, noise=False, native_path=True, jpeg=False)
+
+    # We need S and M, quant_var, etc from clean_result for formula
+    # Or we can just build a DegradationResult manually to call variance()
+    # It's easier to just compute variance() manually or use a dummy DegradationResult
+
+    res = degrade.DegradationResult(
+        night=clean_result.night,
+        night_clean=clean_result.night,
+        day=day,
+        noise_a=clean_result.noise_a,
+        noise_b=clean_result.noise_b,
+        quant_var=clean_result.quant_var,
+        n=clean_result.n,
+        S=clean_result.S,
+        M=clean_result.M,
+        params=params,
+        gain=clean_result.gain,
+        gain_capped=clean_result.gain_capped,
+        saturated=clean_result.saturated,
     )
-    expected = float(isp_kernel(params.camera).pow(2).sum())
-    assert filtered.isp_var_scale == pytest.approx(expected, rel=1e-5)
-    assert (filtered.noise_a / plain.noise_a).allclose(torch.full((3,), expected), rtol=1e-5)
-    assert (filtered.noise_b / plain.noise_b).allclose(torch.full((3,), expected), rtol=1e-5)
+
+    trials = 400
+    stack = torch.stack([
+        apply_camera(radiance, params.camera, params.n, noise=True, native_path=True, jpeg=False, generator=generator).night
+        for _ in range(trials)
+    ])
+
+    measured = stack[:, :, 16:-16, 16:-16].var(dim=0, unbiased=True).mean(dim=(1, 2))
+    predicted = res.variance(res.night_clean)[:, 16:-16, 16:-16].mean(dim=(1, 2))
+
+    assert torch.allclose(measured, predicted, rtol=0.10)

@@ -77,6 +77,8 @@ class DegradationResult:
     noise_b: torch.Tensor  # (3,) at native resolution
     quant_var: float
     n: float
+    S: torch.Tensor
+    M: torch.Tensor
     params: DegradationParams
     gain: float
     gain_capped: bool
@@ -88,11 +90,14 @@ class DegradationResult:
         return {"a": self.noise_a, "b": self.noise_b, "n": self.n, "quant_var": self.quant_var}
 
     def variance(self, image: torch.Tensor | None = None) -> torch.Tensor:
-        """`Var[night]` per pixel and channel at this resolution: `(a*y + b + quant_var)/n`."""
+        """`Var[night]` per pixel and channel at this resolution."""
         y = self.night_clean if image is None else image
+        M_inv = torch.linalg.inv(self.M.to(y.device))
+        x = torch.einsum('ij, jhw -> ihw', M_inv, y).clamp(min=0.0)
         a = self.noise_a.view(3, 1, 1).to(y.device)
         b = self.noise_b.view(3, 1, 1).to(y.device)
-        return (a * y.clamp(0.0, 1.0) + b + self.quant_var) / self.n
+        v_in = a * x + b + self.quant_var
+        return torch.einsum('ij, jhw -> ihw', self.S.to(y.device), v_in) / self.n
 
 
 def sample_degradation_params(
@@ -107,27 +112,6 @@ def sample_degradation_params(
     generator: torch.Generator | None = None,
     device: torch.device = torch.device("cpu"),
 ) -> DegradationParams:
-    """Sample lighting and camera settings for one image of the given size.
-
-    Args:
-        height: Output image height.
-        width: Output image width.
-        cfg: The `degradation` section of data.yaml (`lighting` and `camera` subsections).
-        calib: Parsed configs/camera_calib.yaml.
-        mode: Force a lighting mode. `None` picks one with `choose_mode`, which needs
-            `day_linear` to judge how flat the source image's own lighting was.
-        level: `None` for a training draw, else "easy" / "medium" / "hard".
-        n: Native pixels area-averaged into one output pixel.
-        day_linear: (3, H, W) the source image, only used when `mode is None`.
-        generator: Seeded RNG; `None` uses the global one.
-        device: Device for the sampled tensors.
-
-    Returns:
-        DegradationParams.
-
-    Raises:
-        ValueError: `mode` is None and no `day_linear` was given, or `level` is unknown.
-    """
     if level is not None and level not in DARKNESS_LEVELS:
         raise ValueError(f"level must be one of {DARKNESS_LEVELS} or None, got {level!r}")
     if mode is None:
@@ -149,19 +133,6 @@ def apply_degradation(
     native_path: bool = False,
     generator: torch.Generator | None = None,
 ) -> DegradationResult:
-    """Render the night / night_clean pair for one daytime image.
-
-    Args:
-        day_linear: (3, H, W) linear RGB in [0, 1], already at the output resolution.
-        params: From `sample_degradation_params`, sized for this image.
-        noise: False renders with the noise draws replaced by their means, in which case
-            `night is night_clean` and the two are bit-identical.
-        native_path: Run the in-camera denoise and sharpening (native resolution only).
-        generator: Seeded RNG; `None` uses the global one.
-
-    Returns:
-        DegradationResult.
-    """
     radiance = apply_lighting(day_linear, params.lighting)
     clean: CameraResult = apply_camera(
         radiance, params.camera, params.n, noise=False, native_path=native_path, jpeg=False
@@ -186,6 +157,8 @@ def apply_degradation(
         noise_b=noisy.noise_b,
         quant_var=noisy.quant_var,
         n=noisy.n,
+        S=noisy.S,
+        M=noisy.M,
         params=params,
         gain=noisy.gain,
         gain_capped=noisy.gain_capped,
@@ -206,31 +179,6 @@ def degrade_image(
     noise: bool = True,
     deterministic: bool | None = None,
 ) -> DegradationResult:
-    """One call from a daytime image to a night / night_clean pair. The dataloader entry point.
-
-    Args:
-        day_linear: (3, H, W) linear RGB in [0, 1], as `VisDroneDataset` returns it.
-        cfg: The `degradation` section of data.yaml.
-        calib: Parsed configs/camera_calib.yaml.
-        image_id: The VisDrone image ID. Required when the render is deterministic.
-        level: `None` for a fresh training draw, else "easy" / "medium" / "hard" for the fixed
-            validation and test sets.
-        native_size: `(W, H)` of the original camera frame, from `VisDroneDataset`. It sets
-            `n`, how many native pixels one output pixel averages. `None` means `n = 1`.
-        mode: Force a lighting mode instead of choosing one from the source image.
-        native_path: Render at the input resolution with the in-camera denoise and sharpening
-            on (the denoiser's crops). Skips the 256x256 downsample and forces `n = 1`.
-        size: Square output side for the flow path. `None` keeps the input resolution.
-        noise: False gives a noise-free, JPEG-free render where `night == night_clean`.
-        deterministic: Seed from `image_id` and `level`. Defaults to `level is not None`.
-
-    Returns:
-        DegradationResult at the output resolution.
-
-    Raises:
-        ValueError: A deterministic render was asked for without an `image_id`, or
-            `day_linear` is not (3, H, W).
-    """
     if day_linear.ndim != 3 or day_linear.shape[0] != 3:
         raise ValueError(f"day_linear must be (3, H, W), got {tuple(day_linear.shape)}")
     if deterministic is None:
