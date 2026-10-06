@@ -253,6 +253,30 @@ def test_gradient_checkpointing_still_delivers_lora_gradients(backend, thermal):
     assert grads and any(g is not None and float(g.abs().sum()) > 0 for g in grads)
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_checkpointed_backward_works_while_the_attention_is_captured(backend, thermal):
+    """The training step encodes with `return_attn=True` AND checkpointing. The recompute in the
+    backward pass must take the same attention path as the forward did, or torch raises a
+    CheckpointError about tensors with different metadata."""
+    encoder = tiny_encoder(backend, grad_checkpointing=True)
+    encoder.train()
+    out = encoder(thermal, return_attn=True)
+    (out.patch_tokens.square().mean() + out.patch_attn.sum() * 0.0).backward()
+    grads = [p.grad for p in encoder.parameters() if p.requires_grad]
+    assert grads and any(g is not None and float(g.abs().sum()) > 0 for g in grads)
+    bundle = tiny_encoder(backend, grad_checkpointing=True).train().encode(thermal)
+    bundle["patch_tokens"].square().mean().backward()
+
+
+def test_the_attention_with_and_without_the_capture_flag_gives_the_same_tokens(encoder, thermal):
+    """The last block always takes the explicit-softmax path, so asking for the attention cannot
+    change the features (it used to switch between a fused and an explicit kernel)."""
+    with torch.no_grad():
+        plain = encoder(thermal).patch_tokens
+        with_attn = encoder(thermal, return_attn=True).patch_tokens
+    assert torch.equal(plain, with_attn)
+
+
 def test_rope_position_augmentation_is_off(encoder, thermal):
     """Two forwards of one image must agree, in train mode too, or L_align targets drift."""
     encoder.train()

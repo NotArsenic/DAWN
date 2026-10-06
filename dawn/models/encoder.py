@@ -193,6 +193,11 @@ class DINOEncoder(nn.Module):
                 f"{model_id} has {prefix} prefix tokens, config says {self.num_prefix_tokens} "
                 "(1 CLS + encoder.num_register_tokens)"
             )
+        # The LAST block always computes explicit softmax attention (so a hook can capture it).
+        # It must not depend on whether this call asks for the attention: under gradient
+        # checkpointing the backward pass recomputes the block, and a different attention path
+        # there than in the forward raises a CheckpointError. The other 11 blocks stay fused.
+        model.blocks[-1].attn.fused_attn = False
         # timm's RotaryEmbeddingDinoV3 ships with the coordinate augmentation off; make sure.
         rope = getattr(model, "rope", None)
         for name in ("shift_coords", "jitter_coords", "rescale_coords"):
@@ -224,10 +229,12 @@ class DINOEncoder(nn.Module):
                 f"{model_id} has {registers} register tokens, config says "
                 f"{self.num_prefix_tokens - 1} (encoder.num_register_tokens)"
             )
-        # Give the last block's attention its own config object so it can switch to the eager
-        # path (the only one that materializes attention weights) without slowing the other 11.
+        # Give the last block's attention its own config object and keep it on the eager path (the
+        # only one that materializes attention weights) for good, without slowing the other 11:
+        # under gradient checkpointing the recompute must take the same path as the forward.
         last = self._transformers_layers(model)[-1].attention
         last.config = copy.deepcopy(last.config)
+        last.config._attn_implementation = "eager"
         return model
 
     def _apply_lora(
@@ -340,41 +347,30 @@ class DINOEncoder(nn.Module):
 
     @contextmanager
     def _capture_attention(self) -> Iterator[dict[str, torch.Tensor]]:
-        """Make the last block compute explicit softmax attention, and capture it.
+        """Capture the last block's softmax attention with a hook.
 
-        Both backends default to a fused kernel that never materializes the attention matrix.
-        This switches the LAST block only (the other 11 keep the fast path) and restores it
-        afterwards, so `return_attn=False` costs nothing.
+        The last block computes explicit attention whether or not it is captured (set at load time:
+        a fused kernel never materializes the matrix, and the path must not change between a
+        forward and its checkpoint recompute), so asking for the attention only adds the hook.
         """
         captured: dict[str, torch.Tensor] = {}
         model = self._base_model()
         if self.backend == "timm":
-            attn = model.blocks[-1].attn
-            previous, attn.fused_attn = attn.fused_attn, False
 
             def pre_hook(_module, args):  # args[0] is the softmaxed attention
                 captured["attn"] = args[0]
 
-            handle = attn.attn_drop.register_forward_pre_hook(pre_hook)
-            try:
-                yield captured
-            finally:
-                handle.remove()
-                attn.fused_attn = previous
+            handle = model.blocks[-1].attn.attn_drop.register_forward_pre_hook(pre_hook)
         else:
-            attn = self._transformers_layers(model)[-1].attention
-            previous = attn.config._attn_implementation
-            attn.config._attn_implementation = "eager"
 
             def hook(_module, _args, output):  # (attn_output, attn_weights)
                 captured["attn"] = output[1]
 
-            handle = attn.register_forward_hook(hook)
-            try:
-                yield captured
-            finally:
-                handle.remove()
-                attn.config._attn_implementation = previous
+            handle = self._transformers_layers(model)[-1].attention.register_forward_hook(hook)
+        try:
+            yield captured
+        finally:
+            handle.remove()
 
     def _patch_attention(self, full_attn: torch.Tensor) -> torch.Tensor:
         """`(B, heads, T, T)` -> `(B, N, N)`: drop the prefix, average heads, renormalize rows.
@@ -413,7 +409,7 @@ class DINOEncoder(nn.Module):
             thermal: (B, 1, H, W) = code / 255 in [0, 1] at `input_size`, already resized by the
                 caller (area averaging). Copied to 3 channels, ImageNet mean/std; no sRGB.
             return_attn: Also return the last-layer patch-to-patch attention, head-averaged,
-                with CLS and register rows/columns stripped (needs an eager attention path).
+                with CLS and register rows/columns stripped.
 
         Returns:
             EncoderOutput with patch_tokens (B, N, 384), cls_token (B, 384) and
@@ -492,7 +488,7 @@ class DINOEncoder(nn.Module):
         return captured["attn"]
 
     def num_trainable_params(self) -> int:
-        """Return count of trainable parameters (~0.5M: rank 8 on qkv + proj, 12 blocks)."""
+        """Return count of trainable parameters (0.22M: rank 8 on qkv + proj, 12 blocks)."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
