@@ -1,5 +1,5 @@
 """
-Color space conversion utilities.
+Color space conversion utilities: sRGB <-> linear, luminance, CIELAB.
 """
 
 from __future__ import annotations
@@ -10,17 +10,15 @@ SRGB_BREAKPOINT = 0.04045  # toe/power switch (in sRGB-encoded units)
 LINEAR_BREAKPOINT = 0.0031308  # the same switch (in linear units)
 REC709_WEIGHTS = (0.2126, 0.7152, 0.0722)  # linear R, G, B -> relative luminance
 
-COLOR_TEMP_MIN = 1700.0
-COLOR_TEMP_MAX = 12000.0
-REFERENCE_COLOR_TEMP = 6500.0  # gains are relative to this
-CHANNEL_FLOOR = 1e-4  # smallest illuminant channel
-
-# XYZ -> linear sRGB
-_XYZ_TO_SRGB = (
-    (3.2404542, -1.5371385, -0.4985314),
-    (-0.9692660, 1.8760108, 0.0415560),
-    (0.0556434, -0.2040259, 1.0572252),
+# Linear sRGB (D65) -> XYZ. The D65 white point is this matrix applied to (1, 1, 1), so white
+# maps to exactly (100, 0, 0) in CIELAB.
+_SRGB_TO_XYZ = (
+    (0.4124564, 0.3575761, 0.1804375),
+    (0.2126729, 0.7151522, 0.0721750),
+    (0.0193339, 0.1191920, 0.9503041),
 )
+_LAB_DELTA = 6.0 / 29.0  # CIE: the cube root meets its linear segment at t = delta^3
+_LAB_DELTA_CUBED = _LAB_DELTA**3
 
 
 def srgb_to_linear(img: torch.Tensor, clamp: bool = True) -> torch.Tensor:
@@ -86,27 +84,6 @@ def linear_to_srgb8(img: torch.Tensor) -> torch.Tensor:
     return (linear_to_srgb(img) * 255).round().to(torch.uint8)
 
 
-def _planckian_xy(kelvin: float) -> tuple[float, float]:
-    """
-    CIE 1931 chromaticity (x, y) on the Planckian locus, 1,667-25,000 K.
-    Cubic in `1/T` for x, then cubic in x for y, with break points at 4,000 K (x and y)
-    and 2,222 K (y). Agrees with the exact locus to about 5e-4 above 3,000 K and 3e-3
-    at 1,700 K.
-    """
-    t = kelvin
-    if t <= 4000.0:
-        x = -0.2661239e9 / t**3 - 0.2343589e6 / t**2 + 0.8776956e3 / t + 0.179910
-    else:
-        x = -3.0258469e9 / t**3 + 2.1070379e6 / t**2 + 0.2226347e3 / t + 0.240390
-    if t <= 2222.0:
-        y = -1.1063814 * x**3 - 1.34811020 * x**2 + 2.18555832 * x - 0.20219683
-    elif t <= 4000.0:
-        y = -0.9549476 * x**3 - 1.37418593 * x**2 + 2.09137015 * x - 0.16748867
-    else:
-        y = 3.0817580 * x**3 - 5.87338670 * x**2 + 3.75112997 * x - 0.37001483
-    return x, y
-
-
 def luminance(img_linear: torch.Tensor) -> torch.Tensor:
     """
     Relative luminance of a linear RGB image (Rec. 709 weights).
@@ -124,48 +101,67 @@ def luminance(img_linear: torch.Tensor) -> torch.Tensor:
     return (img_linear * weights).sum(dim=-3, keepdim=True)
 
 
-def color_temp_to_illuminant_rgb(color_temp: float) -> torch.Tensor:
+def _check_three_channels(img: torch.Tensor) -> None:
+    if img.ndim < 3 or img.shape[-3] != 3:
+        raise ValueError(f"expected (..., 3, H, W), got {tuple(img.shape)}")
+
+
+def _xyz_matrices(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`(rgb_to_xyz, xyz_to_rgb, white)` in `img`'s dtype and device, inverted in float64 so the
+    round trip does not inherit the rounding of the printed constants."""
+    forward = torch.tensor(_SRGB_TO_XYZ, dtype=torch.float64)
+    white = forward.sum(dim=1)
+    inverse = torch.linalg.inv(forward)
+    return tuple(m.to(device=img.device, dtype=img.dtype) for m in (forward, inverse, white))
+
+
+def linear_to_lab(img_linear: torch.Tensor) -> torch.Tensor:
     """
-    Linear sRGB color of a blackbody light at `color_temp` Kelvin, scaled to luminance Y = 1.
+    Linear sRGB to CIELAB (D65 white), in the pipeline's `(..., 3, H, W)` layout.
+
+    Channels out are L*, a*, b*: L* in [0, 100] for linear values in [0, 1], a* and b* roughly
+    within [-100, 100]. The CIE linear segment below `(6/29)^3` keeps gradients finite at black.
+    No clamping: callers clamp to [0, 1] first if the input can leave the range.
 
     Args:
-        color_temp: Kelvin, within [COLOR_TEMP_MIN, COLOR_TEMP_MAX] (1,700 to 12,000).
-
-    Returns:
-        (3,) float32 linear RGB, every entry at least 1e-4.
+        img_linear: `(..., 3, H, W)` linear RGB (not sRGB-encoded), float32.
 
     Raises:
-        ValueError: `color_temp` is outside the valid range, or NaN.
+        ValueError: The channel dimension (-3) is not 3.
     """
-    kelvin = float(color_temp)
-    if not COLOR_TEMP_MIN <= kelvin <= COLOR_TEMP_MAX:  # also false for NaN
-        raise ValueError(
-            f"color_temp must be within [{COLOR_TEMP_MIN:g}, {COLOR_TEMP_MAX:g}] K, "
-            f"got {color_temp}"
-        )
-    x, y = _planckian_xy(kelvin)
-    xyz = (x / y, 1.0, (1.0 - x - y) / y)  # Y = 1
-    rgb = [max(sum(m * c for m, c in zip(row, xyz)), CHANNEL_FLOOR) for row in _XYZ_TO_SRGB]
-    return torch.tensor(rgb, dtype=torch.float32)
+    _check_three_channels(img_linear)
+    to_xyz, _, white = _xyz_matrices(img_linear)
+    xyz = torch.einsum("ij,...jhw->...ihw", to_xyz, img_linear)
+    t = xyz / white.view(3, 1, 1)
+    cube_root = t.clamp(min=_LAB_DELTA_CUBED) ** (1.0 / 3.0)  # clamped: no inf gradient at 0
+    linear = t / (3.0 * _LAB_DELTA**2) + 4.0 / 29.0
+    f = torch.where(t > _LAB_DELTA_CUBED, cube_root, linear)
+    fx, fy, fz = f.unbind(dim=-3)
+    return torch.stack([116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)], dim=-3)
 
 
-def color_temp_to_gains(color_temp: float) -> torch.Tensor:
+def lab_to_linear(lab: torch.Tensor) -> torch.Tensor:
     """
-    Per-channel gains that retint a 6,500 K scene (REFERENCE_COLOR_TEMP) to `color_temp`.
+    CIELAB (D65 white) to linear sRGB, the inverse of `linear_to_lab`.
+
+    Not clamped: a* and b* that fall outside the sRGB gamut give channels below 0 or above 1, and
+    the caller clamps to [0, 1] (docs/conventions.md section 1).
 
     Args:
-        color_temp: Kelvin, within [COLOR_TEMP_MIN, COLOR_TEMP_MAX].
-
-    Returns:
-        (3,) float32 gains for linear R, G, B; all positive, green exactly 1.
+        lab: `(..., 3, H, W)` L*, a*, b*, float32.
 
     Raises:
-        ValueError: `color_temp` is outside the valid range, or NaN.
+        ValueError: The channel dimension (-3) is not 3.
     """
-    gains = color_temp_to_illuminant_rgb(color_temp) / color_temp_to_illuminant_rgb(
-        REFERENCE_COLOR_TEMP
-    )
-    return gains / gains[1]
+    _check_three_channels(lab)
+    _, to_rgb, white = _xyz_matrices(lab)
+    l_star, a_star, b_star = lab.unbind(dim=-3)
+    fy = (l_star + 16.0) / 116.0
+    f = torch.stack([fy + a_star / 500.0, fy, fy - b_star / 200.0], dim=-3)
+    cubed = f**3
+    linear = 3.0 * _LAB_DELTA**2 * (f - 4.0 / 29.0)
+    t = torch.where(f > _LAB_DELTA, cubed, linear)
+    return torch.einsum("ij,...jhw->...ihw", to_rgb, t * white.view(3, 1, 1))
 
 
 def srgb_gamma_slope(linear_val: torch.Tensor) -> torch.Tensor:

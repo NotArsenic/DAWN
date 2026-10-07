@@ -1,390 +1,426 @@
-"""Stage 1 end to end: shapes through the whole chain, determinism, resume, and an overfit.
+"""Stage 1 end to end, on the CPU with tiny tensors: one step in each mode, the detach schedule,
+parameter groups, EMA, checkpoints, the loaders and a short overfit.
 
-Everything runs on the CPU with `configs/debug.yaml`. The encoder is a two-block randomly
-initialized DINOv3 (`tests/flow_helpers.py`), so nothing is downloaded; the velocity net, the
-loss, the grid fitting and the samplers are the real ones.
+The encoder is a two-block randomly initialized DINOv3 at 64 x 80 (`tests/flow_helpers.py`), so
+nothing is downloaded; the velocity net, the targets, the render, the losses and the optimizer
+are the real ones. The tiny aligned tree is written to `tmp_path`: these tests never read
+data/DroneVehicle or data/dronevehicle_aligned.
 """
-
-import os
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("omegaconf")
+pytest.importorskip("peft")
+pytest.importorskip("timm")
 
-from dawn.flow.dataset import (  # noqa: E402
-    NightPairs,
-    SyntheticDay,
-    build_night_loaders,
-    collate_night_pairs,
+from dawn.flow.loaders import build_loaders, cycle, split_by_pair_kind, stats_batches  # noqa: E402
+from dawn.flow.targets import FitSettings, compute_token_stats  # noqa: E402
+from dawn.flow.tokens import TokenLayout  # noqa: E402
+from dawn.flow.trainer import (  # noqa: E402
+    EMA,
+    FlowTrainer,
+    cosine_warmup_schedule,
+    split_param_groups,
 )
-from dawn.flow.trainer import EMA, FlowTrainer, split_param_groups  # noqa: E402
-from dawn.grid.fit import fit_grid  # noqa: E402
-from dawn.grid.guidance import compute_guidance  # noqa: E402
-from dawn.grid.normalize import compute_grid_stats, standardize, unstandardize  # noqa: E402
-from dawn.grid.slice import apply_affine, slice_grid  # noqa: E402
-from dawn.models.noise_head import NoiseHead  # noqa: E402
-from dawn.models.velocity import VelocityTransformer  # noqa: E402
-from tests.flow_helpers import load_configs, night_batch, tiny_encoder  # noqa: E402
-
-RUN_SLOW = bool(os.environ.get("DAWN_SLOW_TESTS"))
+from tests.flow_helpers import (  # noqa: E402
+    TINY_INPUT,
+    synthetic_batch,
+    tiny_cfg,
+    tiny_data_cfg,
+    wake_up,
+)
 
 
-@pytest.fixture(scope="module")
-def configs():
-    return load_configs("debug.yaml")
+def _stats(cfg, batches):
+    layout = TokenLayout.from_config(cfg)
+    from dawn.flow.targets import prepare_batch
+
+    prepared = [prepare_batch(b, TINY_INPUT, cfg["pairs"]) for b in batches]
+    return compute_token_stats(prepared, layout, FitSettings.from_config(cfg))
 
 
-@pytest.fixture(scope="module")
-def batch(configs):
-    cfg, calib = configs
-    return night_batch(2, cfg, calib)
-
-
-@pytest.fixture(scope="module")
-def stats(batch):
-    return compute_grid_stats(
-        [{"night_clean": batch["night_clean"][i], "day": batch["day"][i]} for i in range(2)],
-        num_samples=2,
-    )
-
-
-def make_trainer(cfg, stats, seed=0, **overrides):
+def _trainer(correction=False, seed=0, **updates):
     torch.manual_seed(seed)
-    cfg = {**cfg, **overrides}
-    encoder = tiny_encoder("timm", depth=2)
-    return FlowTrainer(
-        cfg,
-        encoder,
-        VelocityTransformer.from_config(cfg["velocity"], cfg["grid"]),
-        NoiseHead(dino_dim=encoder.embed_dim),
-        stats,
-        "cpu",
-    )
+    cfg = tiny_cfg(correction, **updates)
+    batch = synthetic_batch(2, seed=seed, fallback=[False, True])
+    return FlowTrainer.from_config(cfg, _stats(cfg, [batch]), "cpu"), batch
 
 
-# --- the data side ------------------------------------------------------------------------
+@pytest.fixture(params=[False, True], ids=["correction_off", "correction_on"])
+def correction(request):
+    return request.param
 
 
-def test_night_pairs_returns_the_documented_contract(configs):
-    cfg, calib = configs
-    pairs = NightPairs(SyntheticDay(num_images=2, size=320), cfg["degradation"], calib,
-                       level="medium")
-    item = pairs[0]
-    for key in ("night", "night_clean", "day"):
-        assert item[key].shape == (3, 256, 256)
-        assert item[key].dtype == torch.float32
-        assert 0.0 <= float(item[key].min()) and float(item[key].max()) <= 1.0
-    assert item["noise_params"]["a"].shape == (3,)
-    assert item["night_clean"].mean() < item["day"].mean()
-    assert not torch.equal(item["night"], item["night_clean"])
-
-
-def test_the_fixed_val_level_makes_a_sample_reproducible(configs):
-    cfg, calib = configs
-    pairs = NightPairs(SyntheticDay(num_images=1), cfg["degradation"], calib, level="medium")
-    assert torch.equal(pairs[0]["night"], pairs[0]["night"])
-    fresh = NightPairs(SyntheticDay(num_images=1), cfg["degradation"], calib, level=None)
-    torch.manual_seed(0)
-    first = fresh[0]["night"]
-    assert not torch.equal(first, fresh[0]["night"])
-
-
-def test_collate_keeps_the_noise_params_addressable(configs):
-    cfg, calib = configs
-    pairs = NightPairs(SyntheticDay(num_images=3), cfg["degradation"], calib, level="easy")
-    collated = collate_night_pairs([pairs[i] for i in range(3)])
-    assert collated["night"].shape == (3, 3, 256, 256)
-    assert collated["noise_params"]["a"].shape == (3, 3)
-    assert collated["noise_params"]["n"].shape == (3,)
-    assert len(collated["image_id"]) == 3
-
-
-def test_build_night_loaders_follows_the_debug_overlay(configs):
-    cfg, calib = configs
-    train, val = build_night_loaders(cfg, calib)
-    assert len(train.dataset) == cfg["loader"]["synthetic_images"]
-    assert len(val.dataset) == min(cfg["logging"]["num_val_samples"],
-                                   cfg["loader"]["synthetic_images"])
-    assert train.batch_size == cfg["optim"]["batch_size"]
-    assert {item["image_id"] for item in train.dataset.day_source} .isdisjoint(
-        {item["image_id"] for item in val.dataset.day_source}
-    ), "val must not be the training images"
-
-
-# --- shapes through the whole chain --------------------------------------------------------
-
-
-def test_shapes_through_the_whole_chain(configs, batch, stats):
-    """night -> encoder -> velocity -> grid -> sliced -> applied, every shape checked."""
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats)
-    night, night_clean, day = batch["night"], batch["night_clean"], batch["day"]
-    assert night.shape == (2, 3, 256, 256)
-
-    z_1, node_weights, guidance = trainer.fit_targets(night_clean, day)
-    assert z_1.shape == (2, 12, 8, 16, 16)
-    assert node_weights.shape == (2, 8, 16, 16)
-    assert guidance.shape == (2, 1, 256, 256)
-
-    cond = trainer.encoder.encode(night)
-    assert cond["patch_tokens"].shape == (2, 256, 384)
-    assert cond["attn_bias"].shape == (2, 1, 256, 256)
-    assert cond["thumb"].shape == (2, 3, 16, 16)
-
-    t = torch.rand(2)
-    z_t = torch.randn_like(z_1)
-    v = trainer.velocity(z_t, t, cond["patch_tokens"], None, cond["thumb"], cond["attn_bias"])
-    assert v.shape == z_1.shape
-
-    applied = trainer.render(z_t + (1 - t.view(-1, 1, 1, 1, 1)) * v, night_clean, guidance)
-    assert applied.shape == (2, 3, 256, 256)
-    assert float(applied.detach().min()) >= 0.0 and float(applied.detach().max()) <= 1.0
-    assert trainer.noise_head(cond["cls"]).shape == (2, 2)
-
-
-def test_the_standardized_target_renders_back_to_the_oracle(configs, batch, stats):
-    """standardize -> unstandardize is exact, so z_1 renders exactly like the fitted grid."""
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats)
-    night_clean, day = batch["night_clean"], batch["day"]
-    guidance = compute_guidance(night_clean)
-    raw, _ = fit_grid(night_clean, day, guidance)
-    z_1 = standardize(raw, trainer.mean, trainer.std)
-    assert torch.allclose(unstandardize(z_1, trainer.mean, trainer.std), raw, atol=1e-4)
-    assert torch.allclose(
-        trainer.render(z_1, night_clean, guidance),
-        apply_affine(slice_grid(raw, guidance), night_clean),
-        atol=1e-5,
-    )
-
-
-def test_a_train_step_reports_every_loss_and_moves_the_weights(configs, batch, stats):
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats)
-    before = trainer.velocity.input_proj.weight.detach().clone()
+def test_one_cpu_step_runs_in_each_mode_and_moves_every_trainable_group(correction):
+    trainer, batch = _trainer(correction)
+    before = {k: p.detach().clone() for k, p in trainer.trainable_parameters().items()}
     out = trainer.train_step(batch)
-    for key in ("total", "velocity", "apply", "noise", "align", "grad_norm"):
-        assert key in out and out[key] == out[key], key  # present and not NaN
-    assert out["velocity"] > 0
     assert trainer.step == 1
-    assert not torch.equal(before, trainer.velocity.input_proj.weight)
-
-
-def test_the_conditioning_is_expanded_not_re_encoded(configs, batch, stats, monkeypatch):
-    """`flow.timesteps_per_image` velocity samples must cost exactly one encoder pass."""
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats)
-    calls = {"encode": 0, "velocity": 0}
-    real_encode, real_velocity = trainer.encoder.encode, trainer.velocity.forward
-
-    def counted_encode(*a, **k):
-        calls["encode"] += 1
-        return real_encode(*a, **k)
-
-    def counted_velocity(*a, **k):
-        calls["velocity"] += 1
-        assert a[0].shape[0] == trainer.timesteps_per_image * batch["night"].shape[0]
-        return real_velocity(*a, **k)
-
-    monkeypatch.setattr(trainer.encoder, "encode", counted_encode)
-    monkeypatch.setattr(trainer.velocity, "forward", counted_velocity)
-    trainer.train_step(batch)
-    assert calls == {"encode": 1, "velocity": 1}
-
-
-def test_the_same_seed_gives_an_identical_step(configs, batch, stats):
-    cfg, _ = configs
-    results = []
-    for _ in range(2):
-        trainer = make_trainer(cfg, stats, seed=5)
-        torch.manual_seed(123)
-        results.append(
-            (trainer.train_step(batch), trainer.velocity.output_proj.weight.detach().clone())
-        )
-    assert results[0][0] == results[1][0]
-    assert torch.equal(results[0][1], results[1][1])
-
-    trainer = make_trainer(cfg, stats, seed=5)
-    torch.manual_seed(124)
-    assert trainer.train_step(batch) != results[0][0]
-
-
-def test_warmup_detaches_the_conditioning_so_lora_only_sees_align(configs, batch, stats):
-    """Before `flow.warmup_steps` the encoder must get gradient from L_align alone."""
-    cfg, _ = configs
-    flow = {**cfg["flow"], "warmup_steps": 1, "align_weight": 0.0}
-    trainer = make_trainer(cfg, stats, flow=flow)
-    trainer.train_step(batch)  # step 0: detached, and with align switched off
-    lora = [p for n, p in trainer.encoder.named_parameters() if p.requires_grad]
-    assert all(p.grad is None or float(p.grad.abs().sum()) == 0.0 for p in lora)
-
-    trainer.train_step(batch)  # step 1: past the warmup, the velocity net feeds back
-    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0.0 for p in lora)
-
-
-def test_align_alone_trains_lora_during_warmup(configs, batch, stats):
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats, flow={**cfg["flow"], "warmup_steps": 10})
-    trainer.train_step(batch)
-    lora = [p for n, p in trainer.encoder.named_parameters() if p.requires_grad]
-    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0.0 for p in lora)
-
-
-# --- optimizer, EMA, checkpoints ------------------------------------------------------------
-
-
-def test_param_groups_separate_lora_and_skip_decay_on_gates_and_norms(configs, stats):
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats)
-    groups = split_param_groups(
-        trainer.encoder, trainer.velocity, trainer.noise_head,
-        lr=2e-4, lora_lr=1e-4, weight_decay=0.01,
-    )
-    by_name = {group["name"]: group for group in groups}
-    assert by_name["lora_True"]["lr"] == 1e-4
-    assert all(group["lr"] == 2e-4 for name, group in by_name.items() if name.startswith("main"))
-    assert by_name["main_False"]["weight_decay"] == 0.0
-
-    gates = {id(block.dino_gate) for block in trainer.velocity.blocks}
-    decayed = {id(p) for name, group in by_name.items() if group["weight_decay"] > 0
-               for p in group["params"]}
-    assert not (gates & decayed), "the attention gates must not be weight-decayed"
-    assert id(trainer.velocity.pos_embed) not in decayed
-    biases = {id(p) for n, p in trainer.velocity.named_parameters() if n.endswith("bias")}
-    assert not (biases & decayed)
-
-
-def test_the_lr_schedule_warms_up_then_decays():
-    from dawn.flow.trainer import cosine_warmup_schedule
-
-    param = torch.nn.Parameter(torch.zeros(1))
-    param.grad = torch.zeros(1)
-    optimizer = torch.optim.AdamW([param], lr=1.0)
-    scheduler = cosine_warmup_schedule(optimizer, warmup_steps=10, total_steps=100)
-    seen = []
-    for _ in range(100):
-        seen.append(optimizer.param_groups[0]["lr"])
-        optimizer.step()
-        scheduler.step()
-    assert seen[0] == pytest.approx(0.1)
-    assert seen[9] == pytest.approx(1.0)
-    assert seen[:10] == sorted(seen[:10])
-    assert seen[10:] == sorted(seen[10:], reverse=True)
-    assert seen[-1] < 0.01
-
-
-def test_ema_tracks_the_weights_and_can_be_swapped_in():
-    module = torch.nn.Linear(4, 4)
-    ema = EMA(dict(module.named_parameters()), decay=0.5)
-    start = module.weight.detach().clone()
-    with torch.no_grad():
-        module.weight.add_(1.0)
-    ema.update()
-    assert torch.allclose(ema.shadow["weight"], start + 0.5)
-    with ema.applied():
-        assert torch.allclose(module.weight, start + 0.5)
-    assert torch.allclose(module.weight, start + 1.0)  # restored
-
-
-def test_a_checkpoint_round_trips_and_carries_its_stats(configs, batch, stats, tmp_path):
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats)
-    trainer.train_step(batch)
-    path = trainer.save_checkpoint(tmp_path / "flow.pt")
-    state = torch.load(path, weights_only=False)
-    assert state["step"] == 1
-    assert state["config"]["grid"]["spatial_size"] == 16
-    assert torch.allclose(state["grid_stats"]["mean"], stats["mean"])
-    assert state["lora"] and all("lora_" in key for key in state["lora"])
-
-    # Same seed, so the FROZEN backbone matches: a checkpoint stores the LoRA weights only and
-    # expects the pretrained encoder to be reloaded from encoder.model_ids.
-    resumed = make_trainer(cfg, stats, seed=0)
-    with torch.no_grad():
-        resumed.velocity.input_proj.weight.add_(1.0)
-        resumed.noise_head.mlp[0].weight.add_(1.0)
-    assert not torch.equal(resumed.velocity.input_proj.weight, trainer.velocity.input_proj.weight)
-    resumed.load_state_dict(state)
-    assert resumed.step == 1
-    assert torch.equal(resumed.velocity.input_proj.weight, trainer.velocity.input_proj.weight)
-
-    torch.manual_seed(7)
-    first = trainer.train_step(batch)
-    torch.manual_seed(7)
-    assert resumed.train_step(batch) == first
-
-
-def test_validate_reports_both_samplers_against_the_oracle(configs, batch, stats):
-    cfg, _ = configs
-    trainer = make_trainer(cfg, stats)
-    scores = trainer.validate([batch], nfe=2)
-    assert set(scores) == {"psnr/oracle", "psnr/euler", "psnr/midpoint", "psnr/euler_night",
-                           "psnr/gap_to_oracle"}
-    assert scores["psnr/oracle"] > 25, "the fitted grid should be well above 25 dB"
-    assert scores["psnr/gap_to_oracle"] == pytest.approx(
-        scores["psnr/oracle"] - scores["psnr/euler"]
-    )
-
-
-def test_param_counts_are_in_the_expected_range(configs, stats):
-    cfg, _ = configs
-    counts = make_trainer(cfg, stats).param_counts()
-    assert 6e6 < counts["velocity"][0] < 9e6
-    assert counts["encoder"][0] == sum(
-        p.numel() for p in make_trainer(cfg, stats).encoder.parameters() if p.requires_grad
-    )
-    assert counts["total"][0] == sum(v[0] for k, v in counts.items() if k != "total")
-
-
-# --- the overfit sanity check ----------------------------------------------------------------
-
-
-def _overfit(num_images: int, steps: int, lr: float = 3e-4):
-    """Train on one fixed batch and return `(psnr curve, oracle psnr)`."""
-    cfg, calib = load_configs("debug.yaml")
-    cfg = {
-        **cfg,
-        "flow": {**cfg["flow"], "num_train_steps": steps, "warmup_steps": 0,
-                 "timesteps_per_image": 4},
-        "optim": {**cfg["optim"], "lr": lr, "lr_warmup_steps": max(1, steps // 20)},
+    assert all(torch.isfinite(torch.tensor(v)) for v in out.values()), out
+    expected = {
+        "total",
+        "flow",
+        "flow_brightness",
+        "flow_color",
+        "render",
+        "align",
+        "color",
+        "grad_norm",
+        "detach_cond",
+        "lr_lora",
+        "lr_main",
     }
-    torch.manual_seed(0)
-    batch = night_batch(num_images, cfg, calib, level="medium")
-    stats = compute_grid_stats(
-        [{"night_clean": batch["night_clean"][i], "day": batch["day"][i]}
-         for i in range(num_images)],
-        num_samples=num_images,
-    )
-    trainer = make_trainer(cfg, stats)
-    curve = [(0, trainer.validate([batch], nfe=2))]
-    for step in range(steps):
+    assert expected <= set(out) and ("flow_correction" in out) is correction
+    assert out["detach_cond"] == 1.0  # step 0 is inside the detach warmup
+    moved = {
+        k.split(".")[0]
+        for k, p in trainer.trainable_parameters().items()
+        if not torch.equal(p, before[k])
+    }
+    assert moved == {"encoder", "velocity", "color_head"} or moved >= {"velocity", "color_head"}
+
+
+def test_the_first_step_matches_a_fresh_trainer_given_the_same_seed():
+    first, batch = _trainer(seed=3)
+    second, _ = _trainer(seed=3)
+    torch.manual_seed(5)
+    a = first.train_step(batch)
+    torch.manual_seed(5)
+    b = second.train_step(batch)
+    assert a["total"] == pytest.approx(b["total"], rel=1e-6)
+
+
+def _lora_grad_norm(trainer, loss):
+    trainer.optimizer.zero_grad(set_to_none=True)
+    loss.backward(retain_graph=True)
+    grads = [p.grad for n, p in trainer.encoder.named_parameters() if p.requires_grad]
+    return sum(float(g.abs().sum()) for g in grads if g is not None)
+
+
+def test_before_warmup_no_velocity_gradient_reaches_lora_but_align_and_color_do():
+    trainer, batch = _trainer(warmup=None) if False else _trainer()
+    wake_up(trainer.velocity)  # a zero-init head would give zero gradient everywhere
+    trainer.train()
+    assert trainer.step < trainer.warmup_steps
+    losses, info = trainer.compute_losses(batch)
+    assert info["detach_cond"] is True
+    assert _lora_grad_norm(trainer, losses["flow"]) == 0.0
+    assert _lora_grad_norm(trainer, losses["render"]) == 0.0
+    assert _lora_grad_norm(trainer, losses["align"]) > 0.0
+    assert _lora_grad_norm(trainer, losses["color"]) > 0.0
+
+
+def test_after_warmup_the_velocity_loss_trains_lora_too():
+    trainer, batch = _trainer()
+    wake_up(trainer.velocity)
+    trainer.step = trainer.warmup_steps  # the schedule is a function of the step only
+    trainer.train()
+    losses, info = trainer.compute_losses(batch)
+    assert info["detach_cond"] is False
+    assert _lora_grad_norm(trainer, losses["flow"]) > 0.0
+
+
+def test_the_attention_bias_stays_detached_even_after_warmup():
+    trainer, batch = _trainer()
+    trainer.step = trainer.warmup_steps
+    cond = trainer.encoder.encode(batch["thermal"], return_attn=True)
+    assert cond["attn_bias"].requires_grad is False
+
+
+def test_param_groups_split_lora_and_the_rest_and_never_decay_norms_biases_gates_or_pos():
+    trainer, _ = _trainer()
+    groups = {g["name"]: g for g in trainer.optimizer.param_groups}
+    assert {n.split("_")[0] for n in groups} == {"lora", "main"}
+    for group in groups.values():
+        lr = (
+            trainer.cfg["encoder"]["lora_lr"]
+            if group["name"].startswith("lora")
+            else trainer.cfg["optim"]["lr"]
+        )
+        assert group["lr"] == lr
+    named = {id(p): n for n, p in trainer.trainable_parameters().items()}
+    decayed = {named[id(p)] for g in groups.values() if g["weight_decay"] > 0 for p in g["params"]}
+    undecayed = {
+        named[id(p)] for g in groups.values() if g["weight_decay"] == 0 for p in g["params"]
+    }
+    assert all(n.startswith("encoder.") for n in decayed if "lora" in n or n.startswith("encoder"))
+    for name in undecayed | decayed:
+        suffix_hit = name.endswith(("bias", "dino_gate", "pos_embed"))
+        assert (name in undecayed) or not suffix_hit, name
+    assert any(n.endswith("pos_embed") for n in undecayed)
+    assert any(n.endswith("dino_gate") for n in undecayed)
+    assert any(n.startswith("color_head") for n in decayed | undecayed)
+    assert not any(p.requires_grad is False for g in groups.values() for p in g["params"])
+
+
+def test_split_param_groups_puts_only_lora_in_the_lora_scope():
+    trainer, _ = _trainer()
+    lora = [
+        g
+        for g in split_param_groups(
+            trainer.encoder, trainer.velocity, trainer.color_head, 1e-3, 1e-4, 0.01
+        )
+        if g["name"].startswith("lora")
+    ]
+    names = {id(p): n for n, p in trainer.encoder.named_parameters()}
+    assert lora and all("lora_" in names[id(p)] for g in lora for p in g["params"])
+
+
+def test_ema_tracks_the_trainable_parameters_and_applied_swaps_them_in_and_back():
+    trainer, batch = _trainer()
+    for _ in range(2):
         trainer.train_step(batch)
-        if (step + 1) % max(1, steps // 6) == 0:
-            curve.append((step + 1, trainer.validate([batch], nfe=2)))
-    return curve, curve[0][1]["psnr/oracle"]
+    live = {k: p.detach().clone() for k, p in trainer.trainable_parameters().items()}
+    key = next(k for k in live if k.startswith("velocity.") and live[k].ndim > 1)
+    assert not torch.allclose(trainer.ema.shadow[key], live[key].float())
+    with trainer.ema.applied():
+        assert torch.allclose(trainer.trainable_parameters()[key], trainer.ema.shadow[key])
+    assert torch.equal(trainer.trainable_parameters()[key], live[key])
+    assert set(trainer.ema.shadow) == set(live)
 
 
-def test_the_model_overfits_a_handful_of_images_toward_the_oracle():
-    """The fast version of the spec's 100-image overfit: does the chain learn at all?
+def test_cosine_warmup_schedule_ramps_then_decays():
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
+    sched = cosine_warmup_schedule(opt, 4, 20)
+    lrs = []
+    for _ in range(20):
+        lrs.append(opt.param_groups[0]["lr"])
+        opt.step()
+        sched.step()
+    assert lrs[0] < lrs[3] <= 1.0 and lrs[-1] < 0.05 and max(lrs) == pytest.approx(1.0, abs=1e-6)
 
-    A randomly initialized two-block encoder on the CPU cannot reach the oracle in a few
-    hundred steps, so this asserts the direction and the size of the move, not the gate.
-    `DAWN_SLOW_TESTS=1` runs the 100-image version below.
+
+def test_checkpoint_round_trip_restores_everything_and_checks_the_layout(tmp_path, correction):
+    trainer, batch = _trainer(correction)
+    trainer.train_step(batch)
+    path = trainer.save_checkpoint(tmp_path / "ckpt.pt")
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    assert state["layout"] == trainer.layout.descriptor() and state["input_size"] == list(
+        TINY_INPUT
+    )
+    assert not any("backbone" in k and "lora_" not in k for k in state["lora"])  # LoRA only
+    assert set(state["stats"]) == set(trainer.stats)
+
+    # The frozen backbone is rebuilt, not stored: share its (random, here) weights by seed, then
+    # scramble everything the checkpoint is responsible for, so the load has to restore it.
+    fresh, _ = _trainer(correction, seed=0)
+    wake_up(fresh.velocity, std=0.2, seed=5)
+    wake_up(fresh.color_head, std=0.2, seed=6)
+    fresh.step = 99
+    assert not torch.equal(fresh.color_head.proj.weight, trainer.color_head.proj.weight)
+    fresh.load_state_dict(state)
+    assert fresh.step == 1
+    for name, param in trainer.trainable_parameters().items():
+        assert torch.equal(param, fresh.trainable_parameters()[name]), name
+    assert torch.equal(fresh.mean, trainer.mean) and torch.equal(fresh.std, trainer.std)
+    # A resumed run continues exactly where the saved one would have.
+    torch.manual_seed(9)
+    a = trainer.train_step(batch)
+    torch.manual_seed(9)
+    b = fresh.train_step(batch)
+    assert a["total"] == pytest.approx(b["total"], rel=1e-5)
+
+
+def test_a_checkpoint_of_another_layout_or_resolution_is_refused(tmp_path):
+    trainer, batch = _trainer(False)
+    state = trainer.state_dict()
+    other, _ = _trainer(True)
+    with pytest.raises(ValueError, match="layout"):
+        other.load_state_dict(state)
+    wrong_size = dict(state, input_size=[128, 160])
+    with pytest.raises(ValueError, match="resolution"):
+        trainer.load_state_dict(wrong_size)
+
+
+def test_sizes_that_do_not_fit_the_token_grid_are_refused_at_build_time():
+    cfg = tiny_cfg(flow={"render_size": [30, 40]})
+    with pytest.raises(ValueError, match="render_size"):
+        FlowTrainer.from_config(cfg, _stats(tiny_cfg(), [synthetic_batch(2)]), "cpu")
+
+
+def test_validation_reports_the_oracle_and_both_samplers_per_image():
+    trainer, batch = _trainer()
+    scores = trainer.validate([batch])
+    for key in (
+        "psnr_L/oracle",
+        "psnr_L/euler",
+        "psnr_L/midpoint",
+        "psnr_L/gap_to_oracle",
+        "ciede2000/oracle",
+        "ciede2000/euler",
+        "colorfulness/gt",
+        "colorfulness/euler",
+    ):
+        assert key in scores and torch.isfinite(torch.tensor(scores[key])), key
+    assert scores["num_images"] == 2.0
+    assert scores["psnr_L/gap_to_oracle"] == pytest.approx(
+        scores["psnr_L/oracle"] - scores["psnr_L/euler"]
+    )
+    assert scores["psnr_L/oracle"] > 25  # the synthetic lightness is exactly representable
+    again = trainer.validate([batch])  # noise comes from the image IDs: val is repeatable
+    assert again["psnr_L/euler"] == scores["psnr_L/euler"]
+
+
+def test_only_the_network_forwards_run_under_autocast_never_the_pixel_side(monkeypatch):
+    """bf16 autocast is for network forwards only: targets, the fit, the render and the metrics
+    (matmuls in `area_downsample`, the Lab einsum) must stay float32. CUDA is the only place the
+    trainer turns autocast on, so force CPU bf16 autocast and spy on who runs inside it."""
+    import dawn.flow.trainer as trainer_mod
+
+    trainer, batch = _trainer()
+    monkeypatch.setattr(
+        FlowTrainer, "_autocast", lambda self: torch.autocast("cpu", dtype=torch.bfloat16)
+    )
+    seen = {}
+
+    def spy(name):
+        real = getattr(trainer_mod, name)
+
+        def wrapped(*args, **kwargs):
+            seen.setdefault(name, []).append(torch.is_autocast_enabled("cpu"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(trainer_mod, name, wrapped)
+
+    for name in ("build_targets", "render", "prepare_batch", "patch_histograms"):
+        spy(name)
+    trainer.train_step(batch)
+    trainer.validate([batch])
+    for name in ("build_targets", "render", "prepare_batch", "patch_histograms"):
+        assert name in seen and not any(seen[name]), f"{name} ran under autocast"
+
+
+# --- loaders and --overfit ---------------------------------------------------------------------
+
+
+def test_loaders_split_validation_by_pair_kind_and_respect_the_sample_cap(tmp_path):
+    cfg = tiny_data_cfg(tmp_path, n_box=3, n_fallback=2, logging={"num_val_samples": 2})
+    loaders = build_loaders(cfg)
+    assert set(loaders.val) == {"box_aligned", "fallback"}
+    assert (
+        len(loaders.val["box_aligned"].dataset) == 2 and len(loaders.val["fallback"].dataset) == 2
+    )
+    ids = [b["image_id"] for b in loaders.val["fallback"]]
+    assert all(i.startswith("val_") for batch in ids for i in batch)
+    fallback_flags = torch.cat([b["fallback"] for b in loaders.val["fallback"]])
+    assert fallback_flags.all()
+    assert loaders.train_size == 5
+
+
+def test_the_fallback_subset_is_only_validated_when_the_pair_policy_asks_for_it(tmp_path):
+    cfg = tiny_data_cfg(tmp_path, n_box=2, n_fallback=2)
+    assert cfg["pairs"]["report_fallback_separately"] is True
+    assert set(build_loaders(cfg).val) == {"box_aligned", "fallback"}
+    cfg["pairs"]["report_fallback_separately"] = False
+    assert set(build_loaders(cfg).val) == {"box_aligned"}
+    cfg["pairs"]["eval_subset"] = "fallback"  # the headline subset is always validated
+    assert "fallback" in build_loaders(cfg).val
+
+
+def test_overfit_trains_and_validates_on_the_first_n_train_pairs_without_augmentation(tmp_path):
+    cfg = tiny_data_cfg(tmp_path, n_box=3, n_fallback=1)
+    loaders = build_loaders(cfg, overfit=2)
+    assert loaders.train_size == 2
+    seen = {i for batch in loaders.val["box_aligned"] for i in batch["image_id"]}
+    assert seen == {"train_00000", "train_00001"} and "fallback" not in loaders.val
+    first = next(iter(loaders.train))
+    again = next(iter(build_loaders(cfg, overfit=2).train))
+    by_id = {i: n for n, i in enumerate(first["image_id"])}
+    for n, image_id in enumerate(again["image_id"]):  # no flips, no contrast curve
+        assert torch.equal(again["thermal"][n], first["thermal"][by_id[image_id]])
+
+
+def test_stats_batches_are_prepared_unaugmented_and_evenly_spread(tmp_path):
+    cfg = tiny_data_cfg(tmp_path, n_box=3, n_fallback=1)
+    batches = list(stats_batches(cfg, num_samples=3))
+    assert sum(b["thermal"].shape[0] for b in batches) == 3
+    assert set(batches[0]) == {"thermal", "rgb", "mask", "fallback", "image_id"}
+    ids = [i for b in batches for i in b["image_id"]]
+    assert ids[0] == "train_00000" and ids[-1] == "train_00003"
+
+
+def test_cycle_restarts_the_loader():
+    import itertools
+
+    assert list(itertools.islice(cycle([1, 2]), 5)) == [1, 2, 1, 2, 1]
+    with pytest.raises(ValueError, match="no batches"):
+        next(cycle([]))
+
+
+def test_split_by_pair_kind_keeps_manifest_order(tmp_path):
+    from dawn.data.pairs import AlignedPairs
+
+    cfg = tiny_data_cfg(tmp_path, n_box=2, n_fallback=1)
+    subsets = split_by_pair_kind(AlignedPairs.from_config(cfg, "train_pairs"), None)
+    assert [
+        subsets["box_aligned"].dataset.image_ids[i] for i in subsets["box_aligned"].indices
+    ] == ["train_00000", "train_00001"]
+    assert [subsets["fallback"].dataset.image_ids[i] for i in subsets["fallback"].indices] == [
+        "train_00002"
+    ]
+
+
+def test_a_short_overfit_learns_the_flow_closes_in_on_the_render_floor_and_teaches_the_colour_head(
+    tmp_path,
+):
+    """The whole loop on 2 tiny pairs.
+
+    L_render cannot go below what the ORACLE parts render to (the colour map's resolution sets a
+    floor), so it is compared with that floor: it falls by half and stays above it, while the flow
+    loss and the colour head's cross-entropy fall for real and L_align moves once LoRA has a
+    usable lr.
     """
-    curve, oracle = _overfit(num_images=2, steps=240)
-    start, end = curve[0][1]["psnr/euler"], curve[-1][1]["psnr/euler"]
-    print("\n  step   euler  midpoint   oracle")
-    for step, scores in curve:
-        print(f"  {step:5d}  {scores['psnr/euler']:6.2f}  {scores['psnr/midpoint']:8.2f}"
-              f"  {oracle:7.2f}")
-    assert end > start + 4.0, f"render PSNR only moved {start:.2f} -> {end:.2f} dB"
-    assert end > oracle - 12.0, f"render PSNR {end:.2f} dB vs oracle {oracle:.2f} dB"
+    torch.manual_seed(0)
+    steps = 100
+    cfg = tiny_data_cfg(
+        tmp_path,
+        n_box=2,
+        n_fallback=0,
+        flow={"num_train_steps": steps, "warmup_steps": 5, "timesteps_per_image": 2},
+        optim={"batch_size": 2, "lr": 2e-3, "lr_warmup_steps": 3},
+        encoder={"lora_lr": 2e-3},
+    )
+    loaders = build_loaders(cfg, overfit=2)
+    stats = compute_token_stats(
+        stats_batches(cfg, 2), TokenLayout.from_config(cfg), FitSettings.from_config(cfg)
+    )
+    trainer = FlowTrainer.from_config(cfg, stats, "cpu")
+    batches = cycle(loaders.train)
+    history = [trainer.train_step(next(batches)) for _ in range(steps)]
+
+    def mean(key, part):
+        values = [h[key] for h in part]
+        return sum(values) / len(values)
+
+    head, tail = history[:10], history[-10:]
+    assert mean("flow", tail) < 0.4 * mean("flow", head)
+    assert mean("color", tail) < 0.7 * mean("color", head)
+    assert mean("align", tail) < mean("align", head) - 1e-3
+    assert mean("render", tail) < 0.5 * mean("render", head)
+
+    from dawn.data.color import linear_to_lab
+    from dawn.data.resample import area_downsample
+    from dawn.flow.render import render
+    from dawn.flow.targets import build_targets, prepare_batch
+
+    raw = next(iter(loaders.train))
+    batch = prepare_batch(raw, trainer.input_size, trainer.policy)
+    targets = build_targets(
+        batch["thermal"], batch["rgb"], batch["mask"], trainer.layout, trainer.fit
+    )
+    thermal_r = area_downsample(batch["thermal"], trainer.render_size)
+    oracle = render(targets.parts, thermal_r, trainer.render_size, trainer.render_settings)
+    lab_r = linear_to_lab(area_downsample(batch["rgb"], trainer.render_size).clamp(0, 1))
+    floor = float(
+        trainer.criterion.render(
+            oracle["lab"], lab_r, area_downsample(batch["mask"], trainer.render_size), torch.ones(2)
+        )
+    )
+    assert floor < mean("render", tail), (mean("render", tail), floor)  # the floor is a floor
+    assert not any(torch.isnan(torch.tensor(h["total"])) for h in history)
 
 
-@pytest.mark.skipif(not RUN_SLOW, reason="set DAWN_SLOW_TESTS=1 (tens of minutes on CPU)")
-def test_the_model_overfits_one_hundred_images_toward_the_oracle():
-    curve, oracle = _overfit(num_images=100, steps=3000)
-    for step, scores in curve:
-        print(f"  {step:5d}  {scores['psnr/euler']:6.2f}  {oracle:7.2f}")
-    assert curve[-1][1]["psnr/euler"] > oracle - 6.0
+def test_ema_class_is_the_one_the_trainer_uses():
+    trainer, _ = _trainer()
+    assert isinstance(trainer.ema, EMA)

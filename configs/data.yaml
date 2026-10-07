@@ -1,128 +1,156 @@
-# Dataset and degradation configuration.
+# Data configuration: DroneVehicle day thermal / RGB pairs.
+# Code: dawn/data/{dronevehicle,day_filter,align,dedup,pairs}.py, scripts/prepare_dronevehicle.py.
+# Every threshold says what it means and its unit. "STARTING VALUE" marks the ones the plan
+# gave or the maintainer picked before looking at the alignment audit: they are expected to be
+# revisited after it (docs/conventions.md section 10).
 
-visdrone:
-  # Layout: dawn/data/visdrone.py. Raw images: <root>/VisDrone2019-DET-<split>/{images,annotations}.
-  root: data/VisDrone_dataset
-  stats_csv: data/stats/visdrone_stats.csv  # prepare_visdrone.py stats: one row per raw image
-  labels_csv: data/labels/visdrone_labels.csv  # hand labels (committed): sequence or image -> label
-  manifest_dir: data/manifests       # prepare_visdrone.py split: <split>/{day,night,dusk}.txt
-  prepared_dir: data/visdrone_512    # prepare_visdrone.py resize: <split>/<image_id>.png
-  splits: [train, val, test-dev]
-  train_split: train
-  val_split: val
-  image_size: 512   # long side of the prepared PNG copies
-  crop_size: 256    # training crop size
-  max_images: null  # cap the dataset size (debug runs)
-  box_filter:       # eval-mode boxes; score-0 boxes are always dropped
-    drop_categories: [0, 11]  # 0 ignored regions, 11 "others"
-    min_size: 16              # px on either side, at the returned resolution
+dronevehicle:
+  # Raw layout: <root>/<split>/{<split>img, <split>imgr, <split>label, <split>labelr}/<stem>.*
+  # img = RGB JPEG, imgr = thermal JPEG, label = RGB XML, labelr = thermal XML.
+  root: data/DroneVehicle
+  splits: [train, val, test]
+  aligned_dir: data/dronevehicle_aligned  # `write`: <split>/<id>_{rgb,thermal,valid,moving}.png
+  stats_csv: data/stats/dronevehicle_stats.csv  # `stats`: one row per stem (regenerable)
+  manifest_dir: data/manifests            # {train,val,test}_pairs.txt and logs/ (committed)
+  outputs_dir: outputs/data               # histogram, contact sheets, audit sheets (not committed)
+  frame_size: [712, 840]  # raw frame (height, width), white border included; every image has it
+  border: 100             # px of white border on every side, cropped away -> 512 x 640
+  border_check:
+    min_value: 200        # 8-bit; every border pixel must be at least this. JPEG ringing next to the
+                          # content edge goes down to about 212 (measured on 750 random frames);
+                          # a real defect (content in the border) is far lower
+    max_ring_white: 0.5   # share of near-white (>= 250) pixels in the 1-px ring just inside the
+                          # crop; a wider border leaks white into the content and fills this ring
+  # Raw class name -> this project's name. null drops the box. The typos are in the dataset.
+  class_map:
+    car: car
+    truck: truck
+    bus: bus
+    van: van
+    freight_car: freight_car
+    feright_car: freight_car
+    feright car: freight_car
+    feright: freight_car
+    truvk: truck
+    "*": null
+  max_pairs: null         # cap the number of pairs per manifest read by AlignedPairs (debug runs)
 
-# Phase 2 of prepare_visdrone.py: hand labels -> the five manifests.
-# dawn/data/prepare.py. The hand labels are never edited; `label_map` is how their vocabulary
-# (day / night / dusk / exclude) becomes this project's (day / night / dropped).
-split:
-  label_map:
-    day: day
-    night: night
-    dusk: null        # neither a clean day source nor a real night test: dropped
-    exclude: null
-  # Of the 120 night-labelled frames, 20 are genuinely near-black (lum_median <= 0.005,
-  # highlight ratio 181-6,877, 18-75% of pixels at exactly code 0; sequences 0000109-0000114
-  # plus 0000056_00727_d_0000111 and 0000071_03136_d_0000003), and 100 are ordinary usable
-  # night (lum_median >= 0.0086, empirical gap between 0.0049 and 0.0086). Only the near-black
-  # frames go to hard_test; the rest go to the fifth manifest, night_normal.
-  night:
-    hard_test_max_lum: 0.005
-  # 99999xx still collections carry no hand label. They are auto-accepted as day when their
-  # median luminance is high enough and their highlight ratio low enough; the two cutoffs are
-  # chosen on the hand-labelled video frames to make zero false "day" calls there.
-  auto_day:
+day_filter:
+  # RGB median linear luminance of the cropped frame, at or above which a pair counts as day.
+  # The distribution has a bright day mode and a continuum of dusk and night below it with no
+  # clean gap, so this is a human decision. Checkpoint 1 (2026-10-06) chose 0.20 (log10 -0.70):
+  # at 0.10 the band just above the cutoff is street-lit night; at 0.20 none of it is. The
+  # maintainer lowered it to 0.18 for more data, saw that the 0.18-0.20 slice is about 15%
+  # dusk or night (orange sodium-lit roads, blue-lit parking lots) and put it back to 0.20.
+  min_lum_median: 0.20    # 5818 train / 532 val / 2184 test day pairs
+  histogram_bin_log10: 0.05   # histogram bin width in log10(luminance)
+  sheet_count: 100        # thumbnails on the random / band contact sheets
+  band_log10: 0.15        # the "just above / just below the cutoff" bands: cutoff +/- this, in log10
+
+align:
+  # Box matching (plan step 3)
+  max_match_dist_px: 40   # a gate the plan does not state: mutual nearest neighbours farther apart
+                          # than this (centre to centre, in the raw crop) are not matches
+  copy_tol_px: 0.5        # a box counts as copied when the class matches and all four vertices
+                          # are within this of an RGB box (decision 4 of the data handoff)
+  exclude_copied_boxes: true  # copied boxes are not alignment evidence; false = dry run only
+  # Fit (plan step 4)
+  ransac_inlier_px: 4     # a match is an inlier when its residual under the fit is within this
+  ransac_enumerate_max: 40    # up to this many matches: try every 2-match minimal set (no RNG)
+  ransac_iterations: 500  # above that, random minimal sets drawn from generator_for(id, "ransac")
+  homography:
     enabled: true
-    margin: 0.10          # shrink both cutoffs by this fraction of their span, away from the
-                          # nearest non-day frame, so the boundary is not a single image wide
-    min_recall: 0.20      # fail loudly if the zero-error cutoffs keep less than this share of
-                          # the hand-labelled day frames (the features would be useless)
-    contact_sheet: 200    # auto-day images exported for spot-checking
-  # Re-split train+val by group (sequence ID, or the collection ID for 99999xx stills).
-  regroup:
-    val_fraction: 0.10
-    seed: 20261003
-    test_split: test-dev  # left as is; its group IDs must not appear in train or val
+    min_matches: 10       # only tried when the similarity fails on the residual alone
+    ransac_iterations: 1000   # 4-match minimal sets, seeded from generator_for(id, "ransac")
+  # Acceptance (plan step 5), in this order; each failure has its own reason code
+  min_matches: 6          # STARTING VALUE: matches after copies are removed
+  min_inlier_ratio: 0.6   # STARTING VALUE: inliers / matches
+  max_median_residual_px: 2.0   # STARTING VALUE: median inlier residual; the one that binds
+  max_scale_deviation: 0.05     # STARTING VALUE: |scale - 1|
+  max_rotation_deg: 2.0         # STARTING VALUE: |rotation|, degrees
+  max_shift_px: 30.0            # STARTING VALUE: displacement of the frame centre under the fit
+  # Independent check (plan step 6): gradient-magnitude correlation before / after the warp.
+  # RELAXED by the maintainer (2026-10-06) for more training data. The plan's strict form (gain >= 0
+  # and best shift <= 1 px) rejected 1,898 pairs that had already passed the geometry: the two
+  # cameras are nearly co-registered, so the gain is noisy near the identity, and 1 px is the
+  # *modal* best shift (1,844 of 3,638 geometry-passing pairs). Zoomed crops show that pairs up to
+  # 3 px still have the warped thermal edges on the vehicle outlines (outputs/data/audit/
+  # edge_shift_zoom.jpg), which is under 20% of a 16-px DINO patch. A best shift of 4 is the edge of
+  # the search window (>= 4 px, or no usable edges), so it stays rejected, and a very negative gain
+  # (the warp is much worse than doing nothing) catches gross failures.
+  grad_check:
+    enabled: true
+    blur_sigma: 1.0       # px; Gaussian blur before the Sobel gradient
+    min_gain: -0.2        # RELAXED from 0.0: accept when correlation(after) - correlation(before) >= this
+    search_px: 4          # best integer shift of the warped pair is searched within +/- this
+    max_best_shift_px: 3  # RELAXED from 1: accept when that best shift is at most this (each axis)
+  # Edge-correlation fallback (plan step 7) for the pairs the boxes cannot judge: `labels_copied`
+  # (the thermal labels are copies of the RGB ones) and `few_matches`. Those ~4,900 day pairs are
+  # not known to be misaligned, there is just no evidence either way. The fallback estimates a
+  # global integer translation from the gradient-magnitude correlation of thermal and RGB, then
+  # again inside each image quadrant. Measured against box-fitted pairs (500 controls), accepted
+  # fallback pairs are within 2 px of the box fit 84% of the time and within 3 px 96% of the time,
+  # so they are noisier than box pairs. They have no moving mask (no boxes were matched) and are
+  # listed in `fallback_pairs.txt`; the loss code should keep them out of the pixel losses.
+  fallback:
+    enabled: true
+    search_px: 10         # shifts within +/- this are tried; a best shift ON this edge is "saturated"
+                          # (the true shift may be larger) and is rejected
+    min_prominence: 0.02  # the correlation peak must beat the best shift >= 2 px from it by this
+    max_quadrant_dev_px: 2    # each image quadrant's own best shift must be within this of the global
+  # Moving vehicles (plan step 10)
+  moving:
+    min_residual_px: 4    # a matched box whose own residual under the fit exceeds this moved
+    dilate_px: 3          # the mask (RGB polygon + warped thermal polygon) grows by this
 
-degradation:
-  # dawn/data/lighting.py: scene illumination -> relative scene radiance (ambient white = 1).
-  lighting:
-    # Mode weights. streetlit and starlight need a flat, overcast-looking source image; moonlit
-    # takes any. `overcast_ratio_range` is on p95/p05 of the linear luminance of the day image:
-    # at or below the first number the image counts as fully overcast, at or above the second
-    # it is never used for streetlit / starlight. Loosened to [10.0, 60.0] so streetlit is ~69%
-    # of renders on day frames.
-    mode_weights:
-      moonlit: 0.5
-      streetlit: 3.0
-      starlight: 0.3
-    overcast_only: [streetlit, starlight]
-    overcast_ratio_range: [10.0, 60.0]
-    # Ambient light: relative level 1, colour 3,800-4,300 K. Starlight sits slightly redder.
-    moonlight_temp_range: [3800, 4300]   # Kelvin; also the streetlit ambient
-    starlight_temp_range: [3800, 4050]   # Kelvin, slightly redder
-    # Spatially-varying ambient gain, renormalized to mean 1 so "ambient = 1" still holds.
-    illum_grid_size: 4
-    illum_range: [0.4, 1.5]
-    # Streetlit lamps. Illuminance on the ground from a lamp at height h, horizontal distance r,
-    # is proportional to h / (h^2 + r^2)^1.5; `light_peak_range` is the value at r = 0, relative
-    # to the ambient. Lengths are fractions of the image WIDTH, so aspect ratio is preserved.
-    num_lights_range: [1, 8]
-    light_height_range: [0.04, 0.30]
-    light_peak_range: [20.0, 400.0]      # LogUniform, x ambient
-    light_margin: 0.15                   # lamps may sit this far outside the frame
-    sodium_prob: 0.55
-    sodium_temp_range: [2000, 2200]      # Kelvin
-    led_temp_range: [3000, 4500]         # Kelvin
-    # Emitters: small additive points in scene radiance (ambient white = 1).
-    # Types: lit windows (facade grids), headlights/taillights (pairs), signs (saturated hues).
-    # Each has a bright core (LogUniform) and a soft glow halo.
-    emitter_brightness_range: [20.0, 1000.0]
-    emitter_halo_ratio_range: [0.02, 0.08]     # halo peak as fraction of core peak
-    emitter_halo_sigma_mult_range: [2.0, 4.0]  # halo sigma as multiple of core radius/half-size
-    emitter_counts:
-      streetlit:
-        windows: [2, 6]      # window clusters (facade grid)
-        headlights: [2, 8]   # headlight pairs (white)
-        taillights: [2, 8]   # taillight pairs (red)
-        signs: [1, 5]        # saturated colored signs
-      moonlit:
-        windows: [0, 2]
-        headlights: [0, 3]
-        taillights: [0, 3]
-        signs: [0, 2]
-      starlight:
-        windows: [0, 0]
-        headlights: [0, 0]
-        taillights: [0, 0]
-        signs: [0, 0]
-  # dawn/data/camera.py: sensor + ISP -> night. Noise model: Var[y | x] = a*x + b, docs 6.
-  camera:
-    # Outer bound on electrons from a white pixel at NATIVE resolution, LogUniform.
-    # The feasible photon window [T/(gain_max*L1), T/(gain_min*L1)] intersects with this range.
-    # Widened so the target exposure rarely binds against these bounds.
-    n_white_range:
-      moonlit: [2.0, 4000.0]
-      streetlit: [5.0, 6000.0]
-      starlight: [1.0, 2000.0]
-    # Fixed seeded val/test sets pick a quantile band of the real hard_test brightness
-    # distribution (target_log10_quantiles in camera_calib.yaml). 0 = darkest real frame,
-    # easy = brightest. Target T = 10**interp(u, linspace(0,1,21), quantiles).
-    darkness_levels:
-      easy: [0.667, 1.0]
-      medium: [0.333, 0.667]
-      hard: [0.0, 0.333]
-    read_noise_range: [1.0, 4.0]   # sigma_r, electrons per NATIVE pixel
-    gain_min: 1.0   # dark-scene AE never attenuates: maxes exposure first, then adds gain
-    white_balance_strength: [0.3, 0.8]  # 0 = keep the full colour cast, 1 = fully corrected
-    quant_bits: 12
-    jpeg_quality_range: [70, 95]
-    chroma:
-      sigma_range: [2.0, 6.0]      # Gaussian blur sigma for C1, C2 in native pixels
-      gain_range: [0.6, 1.0]       # chroma gain for washed-out colour
+dedup:
+  # Cross-split near-duplicates: a val / test pair is dropped when BOTH its RGB and its thermal
+  # 64-bit perceptual hashes are within this many bits of the same train pair that passed the day
+  # filter. Train keeps everything.
+  max_hamming: 6          # STARTING VALUE; `dedup` reports the counts at 4 / 6 / 8 / 10
+  report_hamming: [4, 6, 8, 10]
+  sheet_count: 24         # example cross-split pairs on the sheet just under / over the threshold
 
+masks:
+  # The vehicles mask (`<id>_vehicles.png`): every vehicle, wherever it may be, with a margin that
+  # is chosen PER VEHICLE (dawn/data/align.py: vehicle_mask). Built for every pair; the loss code
+  # uses `moving` for box-aligned pairs and `vehicles` for fallback pairs (which have no moving
+  # mask); eval uses it for vehicle-crop metrics.
+  #   1. the vehicle has a thermal box of its own (a matched box): both positions are known, so the
+  #      oriented RGB polygon and the warped thermal polygon get only `dilate_px`;
+  #   2. no thermal box of its own (copied labels, unmatched): a local shift search around the RGB
+  #      box (`static_test`) that agrees with the pair's warp and has a clear peak means it did not
+  #      move: `dilate_px` only;
+  #   3. the test says it moved, or cannot tell (weak peak, tiny box): the polygon is stretched
+  #      `extend_px` each way along its LONG axis (vehicles move along their heading), plus
+  #      `dilate_px` all round.
+  vehicles:
+    dilate_px: 3          # the fallback's alignment error, added round every polygon
+    # Sized from the data (`prepare_dronevehicle.py vehicle-dilation`, 2026-10-06, 3,013 box-aligned
+    # pairs): the 5,896 vehicles that moved between the two exposures were displaced by a median
+    # 6.5 px, p90 13.3, p95 17.4, p99 28.4 (max 57; vehicles beyond the 40 px match gate are not
+    # matched and so not counted). extend_px is that p95.
+    extend_px: 17.4
+    static_test:
+      window_margin_px: 12    # the window is the box plus this on every side
+      search_px: 6            # residual shifts within +/- this are tried
+      max_residual_px: 2      # the best shift must be within this of "none" to call it static
+      min_prominence: 0.02    # the correlation peak must beat the best shift >= 2 px away by this
+      min_window_px: 32       # a shorter window (a tiny box) is too small to trust: unsure
+    max_frame_fraction: 0.30  # frames masked over this much are flagged (dense parking lots) in
+                          # data/manifests/logs/vehicles.csv, to be checked, not silently dropped
+
+augment:
+  # Training only (dawn/data/pairs.py). Validation and test are never augmented.
+  hflip: 0.5              # probability, applied to thermal, rgb, valid and moving together
+  vflip: 0.5              # probability; hflip and vflip together are a 180 degree rotation
+  # 90 degree rotations would turn 640x512 into 512x640, which breaks batching and the velocity
+  # net's learned 40x32 position embedding. The plan lists them; this deviates on purpose.
+  rot90: false
+  # Random monotone contrast curve on thermal only (the camera rescales its gain frame by frame):
+  # y = ((x - black) / (white - black)) ** gamma, clipped to [0, 1].
+  thermal_contrast:
+    prob: 0.8             # probability that a curve is applied at all
+    black_point: [0.0, 0.10]  # uniform range of the input value mapped to 0
+    white_point: [0.90, 1.0]  # uniform range of the input value mapped to 1
+    gamma: [0.7, 1.4]     # log-uniform range of the exponent

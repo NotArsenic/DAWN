@@ -1,12 +1,12 @@
-"""Trilinear grid slicing and affine application.
+"""Trilinear grid slicing and gain/offset application.
 
-Given a bilateral grid (B, 12, K, gy, gx) and a per-pixel guidance map, interpolate the grid
-trilinearly at each pixel's (x, y, guidance) coordinate, then apply the resulting 3x4 affine
-to the pixel.
+Given a bilateral grid (B, C, K, gy, gx) and a per-pixel guidance map, interpolate the grid
+trilinearly at each pixel's (x, y, guidance) coordinate; `apply_gain_offset` then turns the
+resulting gain/offset maps into an image.
 
 Layout, coefficient order and the cell-center coordinate convention are defined in
 docs/conventions.md (sections 2 and 3). `trilinear_weights` is the only implementation of the
-corner nodes and weights; `fit.py` uses it too.
+corner nodes and weights; `fit.py` and `upsample.py` use it too.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from dawn.grid.layout import MATRIX, NUM_COEFFS, OFFSET
+from dawn.grid.layout import NUM_COEFFS
 
 
 def _axis_weights(
@@ -93,20 +93,20 @@ def slice_grid(
     The output resolution is the guidance resolution. Uses `F.grid_sample` with the image's own
     normalized pixel centers and `2g - 1`, which is the same cell-center convention as
     `trilinear_weights` (docs/conventions.md section 3; `tests/test_grid_rules.py` checks that
-    the two agree).
+    the two agree). Works for any channel count.
 
     Args:
-        grid: (B, 12, K, gy, gx) raw affine coefficients.
-        guidance: (B, 1, H, W) in [0, 1], from `compute_guidance`.
+        grid: (B, C, K, gy, gx) raw coefficients (C = 2 for the brightness grid).
+        guidance: (B, 1, H, W) in [0, 1], from `compute_guidance` (or a BGU's own guide).
 
     Returns:
-        coeffs: (B, 12, H, W) per-pixel affine coefficients, same channel order as the grid.
+        coeffs: (B, C, H, W) per-pixel coefficients, same channel order as the grid.
 
     Raises:
-        ValueError: `grid` is not 5-D with 12 channels, or `guidance` is not (B, 1, H, W).
+        ValueError: `grid` is not 5-D, `guidance` is not (B, 1, H, W), or the batches differ.
     """
-    if grid.ndim != 5 or grid.shape[1] != NUM_COEFFS:
-        raise ValueError(f"grid must be (B, 12, K, gy, gx), got {tuple(grid.shape)}")
+    if grid.ndim != 5:
+        raise ValueError(f"grid must be (B, C, K, gy, gx), got {tuple(grid.shape)}")
     if guidance.ndim != 4 or guidance.shape[1] != 1:
         raise ValueError(f"guidance must be (B, 1, H, W), got {tuple(guidance.shape)}")
     if grid.shape[0] != guidance.shape[0]:
@@ -126,35 +126,33 @@ def slice_grid(
     return sampled.squeeze(2)
 
 
-def apply_affine(
+def apply_gain_offset(
     coeffs: torch.Tensor,
-    image: torch.Tensor,
+    x: torch.Tensor,
+    clamp: bool = True,
 ) -> torch.Tensor:
-    """Apply per-pixel 3x4 affine transforms to an image.
-
-    out[i] = sum_j(M[i, j] * image[j]) + t[i]   for i in {R, G, B}
+    """Apply per-pixel gain and offset maps: `out_c = gain_c * x + offset_c`.
 
     Args:
-        coeffs: (B, 12, H, W) per-pixel affine coefficients.
-            Channels 0-8: M (3x3 matrix, row-major, row = output channel).
-            Channels 9-11: t (offsets).
-        image: (B, 3, H, W) linear RGB input.
+        coeffs: (B, 2C, H, W) per-pixel coefficients, output c at channels 2c (gain) and 2c + 1
+            (offset); C = 1 for the brightness grid.
+        x: (B, 1, H, W) the regressor (thermal for the brightness grid, the guide for a BGU).
+        clamp: Clamp the result to [0, 1]. The brightness render does (L is L*/100); a BGU's
+            a*b* output must not.
 
     Returns:
-        out: (B, 3, H, W) transformed linear RGB, clamped to [0, 1].
+        out: (B, C, H, W).
 
     Raises:
         ValueError: Shapes do not match the documented contract.
     """
-    if coeffs.ndim != 4 or coeffs.shape[1] != NUM_COEFFS:
-        raise ValueError(f"coeffs must be (B, 12, H, W), got {tuple(coeffs.shape)}")
-    if image.ndim != 4 or image.shape[1] != 3:
-        raise ValueError(f"image must be (B, 3, H, W), got {tuple(image.shape)}")
-    if coeffs.shape[0] != image.shape[0] or coeffs.shape[2:] != image.shape[2:]:
-        raise ValueError(
-            f"coeffs {tuple(coeffs.shape)} and image {tuple(image.shape)} disagree on B, H, W"
-        )
-    batch, _, height, width = image.shape
-    matrix = coeffs[:, MATRIX].reshape(batch, 3, 3, height, width)
-    out = (matrix * image.unsqueeze(1)).sum(dim=2) + coeffs[:, OFFSET]
-    return out.clamp(0.0, 1.0)
+    if coeffs.ndim != 4 or coeffs.shape[1] % NUM_COEFFS:
+        raise ValueError(f"coeffs must be (B, 2C, H, W), got {tuple(coeffs.shape)}")
+    if x.ndim != 4 or x.shape[1] != 1:
+        raise ValueError(f"x must be (B, 1, H, W), got {tuple(x.shape)}")
+    if coeffs.shape[0] != x.shape[0] or coeffs.shape[2:] != x.shape[2:]:
+        raise ValueError(f"coeffs {tuple(coeffs.shape)} and x {tuple(x.shape)} disagree on B, H, W")
+    batch, channels, height, width = coeffs.shape
+    pairs = coeffs.reshape(batch, channels // NUM_COEFFS, NUM_COEFFS, height, width)
+    out = pairs[:, :, 0] * x + pairs[:, :, 1]
+    return out.clamp(0.0, 1.0) if clamp else out

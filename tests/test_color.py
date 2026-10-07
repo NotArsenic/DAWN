@@ -1,5 +1,5 @@
 """
-dawn/data/color.py: sRGB <-> linear (docs/conventions.md section 1), luminance, color temp.
+dawn/data/color.py: sRGB <-> linear (docs/conventions.md section 1), luminance, CIELAB.
 """
 
 import pytest
@@ -7,11 +7,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from dawn.data.color import (  # noqa: E402
-    COLOR_TEMP_MAX,
-    COLOR_TEMP_MIN,
-    REFERENCE_COLOR_TEMP,
-    color_temp_to_gains,
-    color_temp_to_illuminant_rgb,
+    lab_to_linear,
+    linear_to_lab,
     linear_to_srgb,
     linear_to_srgb8,
     luminance,
@@ -142,111 +139,94 @@ def test_luminance_rejects_non_rgb_input(shape):
         luminance(torch.rand(shape))
 
 
-#  color temperature
-# Linear sRGB (D65) -> XYZ.
-SRGB_TO_XYZ = torch.tensor(
-    [
-        [0.4124564, 0.3575761, 0.1804375],
-        [0.2126729, 0.7151522, 0.0721750],
-        [0.0193339, 0.1191920, 0.9503041],
-    ],
-    dtype=torch.float64,
-)
+# --- CIELAB (linear sRGB primaries, D65 white) -------------------------------------------------
 
-# CIE 1931 chromaticity of a blackbody (Planckian locus); Kim et al. 2002 fits these to ~5e-4.
-PLANCKIAN_LOCUS = {
-    2000: (0.5267, 0.4133),
-    3000: (0.4369, 0.4041),
-    4000: (0.3805, 0.3768),
-    5000: (0.3451, 0.3516),
-    6500: (0.3135, 0.3237),
-    10000: (0.2807, 0.2884),
-}
-
-VALID_TEMPS = list(range(int(COLOR_TEMP_MIN), int(COLOR_TEMP_MAX) + 1, 50))
+LAB_RED = (53.2408, 80.0925, 67.2032)  # CIE reference value of linear sRGB (1, 0, 0), D65
 
 
-@pytest.mark.parametrize("kelvin, xy", PLANCKIAN_LOCUS.items())
-def test_illuminant_chromaticity_is_on_the_planckian_locus(kelvin, xy):
-    xyz = SRGB_TO_XYZ @ color_temp_to_illuminant_rgb(kelvin).double()
-    x, y = (xyz[:2] / xyz.sum()).tolist()
-    assert x == pytest.approx(xy[0], abs=1e-3)
-    assert y == pytest.approx(xy[1], abs=1e-3)
+def _flat(rgb):
+    return torch.tensor(rgb, dtype=torch.float32).view(3, 1, 1)
 
 
-@pytest.mark.parametrize("kelvin", [2000, 3000, 4500, 6500, 10000])
-def test_illuminant_has_unit_luminance(kelvin):
-    rgb = color_temp_to_illuminant_rgb(kelvin)
-    assert luminance(rgb.view(3, 1, 1)).item() == pytest.approx(1.0, abs=1e-3)
+def test_lab_of_white_is_100_0_0():
+    lab = linear_to_lab(torch.ones(3, 2, 2))
+    assert torch.allclose(lab, _flat([100.0, 0.0, 0.0]).expand(3, 2, 2), atol=1e-3)
 
 
-def test_illuminant_at_2000k_is_red_with_barely_any_blue():
-    r, g, b = color_temp_to_illuminant_rgb(2000).tolist()
-    assert r > g > b > 0
-    assert b < 0.05
+def test_lab_of_black_is_zero():
+    assert torch.allclose(linear_to_lab(torch.zeros(3, 2, 2)), torch.zeros(3, 2, 2), atol=1e-5)
 
 
-def test_illuminant_is_float32_with_three_channels():
-    rgb = color_temp_to_illuminant_rgb(4000)
-    assert rgb.shape == (3,)
-    assert rgb.dtype == torch.float32
+def test_lab_of_linear_red_matches_the_reference_value():
+    lab = linear_to_lab(_flat([1.0, 0.0, 0.0]))
+    assert lab.flatten().tolist() == pytest.approx(LAB_RED, abs=0.05)
 
 
-def test_illuminant_channels_are_floored_at_1e_4_across_the_valid_range():
-    # Below 1,904 K the blue primary goes negative (out of sRGB gamut) without the floor.
-    rgbs = torch.stack([color_temp_to_illuminant_rgb(k) for k in VALID_TEMPS])
-    assert torch.isfinite(rgbs).all()
-    assert (rgbs >= 1e-4).all()
+def test_lab_of_18_percent_grey_is_about_l_49_5_with_no_chroma():
+    lab = linear_to_lab(torch.full((3, 1, 1), 0.18))
+    assert lab[0].item() == pytest.approx(49.5, abs=0.1)
+    assert lab[1:].abs().max().item() < 1e-3
 
 
-@pytest.mark.parametrize("fn", [color_temp_to_illuminant_rgb, color_temp_to_gains])
-@pytest.mark.parametrize("kelvin", [1600.0, 1699.0, 12001.0, 20000.0, 0.0, -5.0, float("nan")])
-def test_color_temp_outside_the_valid_range_is_rejected(fn, kelvin):
-    with pytest.raises(ValueError, match="color_temp"):
-        fn(kelvin)
+def test_lab_uses_the_cie_linear_segment_below_the_threshold():
+    # Y <= (6/29)^3: L* = (29/3)^3 * Y = 903.2963 * Y, not the cube root (which would give 10.0).
+    lab = linear_to_lab(torch.full((3, 1, 1), 0.001))
+    assert lab[0].item() == pytest.approx(903.2963 * 0.001, rel=1e-3)
 
 
-@pytest.mark.parametrize("fn", [color_temp_to_illuminant_rgb, color_temp_to_gains])
-@pytest.mark.parametrize("kelvin", [COLOR_TEMP_MIN, COLOR_TEMP_MAX])
-def test_valid_range_endpoints_are_accepted(fn, kelvin):
-    out = fn(kelvin)
-    assert torch.isfinite(out).all()
-    assert (out > 0).all()
+def test_lab_cube_root_and_linear_segments_meet():
+    y = (6 / 29) ** 3
+    below = linear_to_lab(torch.full((3, 1, 1), y * (1 - 1e-4)))[0].item()
+    above = linear_to_lab(torch.full((3, 1, 1), y * (1 + 1e-4)))[0].item()
+    assert abs(above - below) < 1e-2
 
 
-def test_gains_at_the_reference_temperature_are_exactly_one():
-    assert torch.equal(color_temp_to_gains(REFERENCE_COLOR_TEMP), torch.ones(3))
+def test_lab_round_trip_over_the_unit_cube():
+    rgb = torch.rand(2, 3, 16, 16)
+    assert torch.allclose(lab_to_linear(linear_to_lab(rgb)), rgb, atol=1e-4)
 
 
-@pytest.mark.parametrize("kelvin", VALID_TEMPS[::10])
-def test_gains_keep_green_at_one_so_brightness_is_untouched(kelvin):
-    assert color_temp_to_gains(kelvin)[1].item() == 1.0
+def test_lab_round_trip_through_the_linear_segment():
+    rgb = torch.rand(3, 16, 16) * 0.01  # almost black: the segment below (6/29)^3
+    assert torch.allclose(lab_to_linear(linear_to_lab(rgb)), rgb, atol=1e-5)
 
 
-def test_gains_at_2000k_are_several_times_red_and_a_few_percent_blue():
-    r, g, b = color_temp_to_gains(2000).tolist()
-    assert r > g > b
-    assert r >= 3.0 * g  # "several times green"
-    assert 0.0 < b <= 0.05 * g  # "a few percent of green"
+def test_l_star_stays_within_0_100_on_the_unit_cube():
+    lab = linear_to_lab(torch.rand(4, 3, 32, 32))
+    assert lab[:, 0].min() >= 0.0
+    assert lab[:, 0].max() <= 100.0 + 1e-3
 
 
-def test_gains_above_the_reference_shift_toward_blue():
-    r, g, b = color_temp_to_gains(10000).tolist()
-    assert r < g < b
+def test_lab_gradients_are_finite_including_at_black_and_white():
+    rgb = torch.cat([torch.zeros(3, 1, 1), torch.ones(3, 1, 1), torch.rand(3, 1, 8)], dim=-1)
+    rgb.requires_grad_()
+    linear_to_lab(rgb).sum().backward()
+    assert torch.isfinite(rgb.grad).all()
+
+    lab = torch.cat([torch.zeros(3, 1, 1), _flat([100.0, 0.0, 0.0])], dim=-1).requires_grad_()
+    lab_to_linear(lab).sum().backward()
+    assert torch.isfinite(lab.grad).all()
 
 
-def test_red_to_blue_ratio_increases_steadily_as_temperature_drops():
-    ratios = []
-    for kelvin in reversed(VALID_TEMPS):  # 12,000 K down to 1,700 K
-        r, _, b = color_temp_to_gains(kelvin).tolist()
-        ratios.append(r / b)
-    assert all(later > earlier for earlier, later in zip(ratios, ratios[1:]))
+@pytest.mark.parametrize("shape", [(3, 8, 8), (2, 3, 8, 8)])
+@pytest.mark.parametrize("fn", [linear_to_lab, lab_to_linear])
+def test_lab_conversions_keep_shape_and_float32(fn, shape):
+    out = fn(torch.rand(shape))
+    assert out.shape == shape
+    assert out.dtype == torch.float32
 
 
-def test_gains_are_float32_with_three_channels():
-    gains = color_temp_to_gains(3000)
-    assert gains.shape == (3,)
-    assert gains.dtype == torch.float32
+def test_lab_conversions_work_per_image_in_a_batch():
+    batch = torch.rand(3, 3, 6, 6)
+    out = linear_to_lab(batch)
+    for i in range(3):
+        assert torch.allclose(out[i], linear_to_lab(batch[i]), atol=1e-4)
+
+
+@pytest.mark.parametrize("fn", [linear_to_lab, lab_to_linear])
+def test_lab_conversions_reject_non_three_channel_input(fn):
+    with pytest.raises(ValueError, match="3"):
+        fn(torch.rand(1, 4, 4))
 
 
 # --- 8-bit sRGB (file boundary) ----------------------------------------------------------------

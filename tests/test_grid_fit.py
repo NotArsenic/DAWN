@@ -1,158 +1,175 @@
-"""Grid slicing and fitting against cases with a known answer.
+"""Fitting the one-input affine grid against cases with a known answer.
 
-`test_grid_rules.py` pins the conventions (coordinates, one trilinear implementation). This
-file asks the harder question: does the fit actually recover a transform, measured where it
-matters -- on the rendered image, not on the coefficients. Two different coefficient fields can
-render identically wherever the data does not constrain them, so comparing renders is the only
-test that fails for the right reason.
+`test_grid_rules.py` pins the conventions (coordinates, one trilinear implementation). This file
+asks the harder question: does the fit recover a transform, measured where it matters -- on the
+rendered image, not on the coefficients. Two different coefficient fields can render identically
+wherever the data does not constrain them, so comparing renders is the only test that fails for
+the right reason.
 """
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from dawn.grid.fit import fit_grid  # noqa: E402
+from dawn.grid.fit import fit_affine_grid  # noqa: E402
 from dawn.grid.guidance import compute_guidance  # noqa: E402
-from dawn.grid.layout import IDENTITY_COEFFS  # noqa: E402
-from dawn.grid.slice import apply_affine, slice_grid  # noqa: E402
+from dawn.grid.slice import apply_gain_offset, slice_grid  # noqa: E402
 
-K, GY, GX = 8, 16, 16
-
-
-def _constant_grid(coeffs, batch=1):
-    """A (B, 12, K, gy, gx) grid holding the same 12 coefficients at every node."""
-    return torch.tensor(coeffs, dtype=torch.float32).view(1, 12, 1, 1, 1).expand(
-        batch, 12, K, GY, GX
-    ).contiguous()
+K, GY, GX = 8, 6, 8
+SIZE = (K, GY, GX)
 
 
-def _render(grid, image):
-    return apply_affine(slice_grid(grid, compute_guidance(image)), image)
+def _render(grid, x, guidance, clamp=True):
+    return apply_gain_offset(slice_grid(grid, guidance), x, clamp=clamp)
 
 
-def _psnr(a, b):
-    return float(-10 * torch.log10((a - b).pow(2).mean().clamp(min=1e-20)))
+def _psnr(a, b, peak=1.0):
+    return float(10 * torch.log10(peak**2 / (a - b).pow(2).mean().clamp(min=1e-20)))
 
 
-def test_identity_grid_returns_the_input():
-    image = torch.rand(2, 3, 64, 96)
-    out = _render(_constant_grid(IDENTITY_COEFFS, batch=2), image)
-    assert torch.allclose(out, image, atol=1e-6)
+def _smooth_grid(seed=0, cycles=1.0, gain=0.6, offset=0.2, channels=1):
+    """Gain and offset with a low-frequency ripple over (bin, row, col), for `channels` outputs.
 
-
-def test_constant_five_times_grid_returns_five_times_the_input():
-    image = torch.rand(2, 3, 64, 96) * 0.15  # stays under 1/5 so nothing clips
-    five = [5.0, 0, 0, 0, 5.0, 0, 0, 0, 5.0, 0, 0, 0]
-    out = _render(_constant_grid(five, batch=2), image)
-    assert torch.allclose(out, image * 5.0, atol=1e-6)
-
-
-def test_apply_affine_clamps_to_the_unit_interval():
-    image = torch.full((1, 3, 8, 8), 0.5)
-    five = [5.0, 0, 0, 0, 5.0, 0, 0, 0, 5.0, 0, 0, 0]
-    coeffs = slice_grid(_constant_grid(five), compute_guidance(image))
-    assert apply_affine(coeffs, image).max() == 1.0
-
-
-def _smooth_grid(seed=0, cycles=1.0, offset_base=0.12):
-    """Identity plus a low-frequency ripple on every coefficient.
-
-    Two things make this a fair test rather than an easy or an impossible one.
-
-    Smooth: a grid that jumps between neighbouring nodes is not something a trilinear fit can
-    represent from pixel data at all, so re-rendering it would fail for a reason that has
-    nothing to do with the fit being wrong.
-
-    In range: the twelve coefficients live on three different scales, and a ripple big enough
-    to push the rendered target outside [0, 1] would make the test unwinnable -- `apply_affine`
-    clamps, and no affine map reproduces a clamped target. So the diagonal gains swing widely
-    (+-0.25), the cross-channel terms gently (+-0.08), and the offsets sit on a positive lift
-    (0.12 +- 0.03) so that dark pixels cannot go negative. `_assert_unclipped` checks it.
+    Smooth: a grid that jumps between neighbouring nodes cannot be represented by a trilinear fit
+    from pixel data at all, so re-rendering it would fail for a reason that has nothing to do
+    with the fit being wrong. In range: the rendered target must stay inside [0, 1] or the fit
+    would chase a clamp (`_unclipped` checks it).
     """
     generator = torch.Generator().manual_seed(seed)
     k = torch.linspace(0, 1, K).view(1, K, 1, 1)
     y = torch.linspace(0, 1, GY).view(1, 1, GY, 1)
     x = torch.linspace(0, 1, GX).view(1, 1, 1, GX)
-    phase = torch.rand(12, 3, generator=generator) * 6.283
+    phase = torch.rand(2 * channels, 3, generator=generator) * 6.283
     ripple = (
-        torch.sin(cycles * 6.283 * k + phase[:, 0].view(12, 1, 1, 1))
-        + torch.sin(cycles * 6.283 * y + phase[:, 1].view(12, 1, 1, 1))
-        + torch.sin(cycles * 6.283 * x + phase[:, 2].view(12, 1, 1, 1))
+        torch.sin(cycles * 6.283 * k + phase[:, 0].view(-1, 1, 1, 1))
+        + torch.sin(cycles * 6.283 * y + phase[:, 1].view(-1, 1, 1, 1))
+        + torch.sin(cycles * 6.283 * x + phase[:, 2].view(-1, 1, 1, 1))
     ) / 3.0
-    diagonal = [0, 4, 8]
-    scale = torch.full((12,), 0.08)
-    scale[diagonal] = 0.25
-    scale[9:] = 0.03
-    base = torch.tensor(IDENTITY_COEFFS).clone()
-    base[9:] = offset_base
-    return (base.view(12, 1, 1, 1) + scale.view(12, 1, 1, 1) * ripple).unsqueeze(0)
+    base = torch.tensor([gain, offset] * channels).view(-1, 1, 1, 1)
+    scale = torch.tensor([0.15, 0.04] * channels).view(-1, 1, 1, 1)
+    return (base + scale * ripple).unsqueeze(0)
 
 
-def _assert_unclipped(grid, image, guidance):
-    """The rendered target must sit strictly inside [0, 1], or the fit is chasing a clamp."""
-    coeffs = slice_grid(grid, guidance)
-    batch, _, height, width = image.shape
-    raw = (coeffs[:, :9].reshape(batch, 3, 3, height, width) * image.unsqueeze(1)).sum(
-        dim=2
-    ) + coeffs[:, 9:12]
-    assert raw.min() > 0.0 and raw.max() < 1.0, (
-        f"target clips: range [{raw.min():.3f}, {raw.max():.3f}]"
-    )
+def _unclipped(grid, x, guidance):
+    raw = _render(grid, x, guidance, clamp=False)
+    assert raw.min() > 0.0 and raw.max() < 1.0, f"target clips: [{raw.min():.3f}, {raw.max():.3f}]"
 
 
-def test_fitting_a_known_smooth_grid_and_re_rendering_beats_45_db():
-    generator = torch.Generator().manual_seed(4)
-    night_clean = torch.rand(1, 3, 256, 256, generator=generator) * 0.28 + 0.02
+def _thermal(seed, size=(1, 1, 96, 128)):
+    return torch.rand(size, generator=torch.Generator().manual_seed(seed)) * 0.8 + 0.1
+
+
+def test_a_constant_gain_and_offset_is_recovered_exactly_at_every_node():
+    thermal = _thermal(1)
+    y = 0.7 * thermal + 0.1
+    grid, node_weights = fit_affine_grid(thermal, y, compute_guidance(thermal), grid_size=SIZE)
+    assert grid.shape == (1, 2, K, GY, GX) and node_weights.shape == (1, K, GY, GX)
+    # Starved nodes inherit their cell, and the cell the image: the same affine everywhere.
+    assert torch.allclose(grid[0, 0], torch.full((K, GY, GX), 0.7), atol=2e-3)
+    assert torch.allclose(grid[0, 1], torch.full((K, GY, GX), 0.1), atol=2e-3)
+
+
+def test_fitting_a_known_smooth_grid_and_re_rendering_beats_45_db_with_refine():
+    thermal = _thermal(4, (1, 1, 192, 256))
+    guidance = compute_guidance(thermal)
     truth = _smooth_grid(seed=1)
-
-    guidance = compute_guidance(night_clean)
-    _assert_unclipped(truth, night_clean, guidance)
-    day = apply_affine(slice_grid(truth, guidance), night_clean)
-
-    fitted, node_weights = fit_grid(night_clean, day, guidance)
-    assert fitted.shape == (1, 12, K, GY, GX)
-    assert node_weights.shape == (1, K, GY, GX)
-
-    rendered = apply_affine(slice_grid(fitted, guidance), night_clean)
-    psnr = _psnr(rendered, day)
-    assert psnr > 45, f"re-render PSNR {psnr:.1f} dB, expected > 45"
+    _unclipped(truth, thermal, guidance)
+    target = _render(truth, thermal, guidance)
+    fitted, _ = fit_affine_grid(
+        thermal, target, guidance, grid_size=SIZE, ridge_alpha=1e-3, refine_steps=2
+    )
+    assert _psnr(_render(fitted, thermal, guidance), target) > 45
 
 
-def test_the_fit_is_judged_on_renders_because_coefficients_are_underdetermined():
-    """A node no pixel lands on is free; only the render is pinned down."""
-    generator = torch.Generator().manual_seed(9)
-    night_clean = torch.rand(1, 3, 128, 128, generator=generator) * 0.25 + 0.03
-    truth = _smooth_grid(seed=2)
-    guidance = compute_guidance(night_clean)
-    _assert_unclipped(truth, night_clean, guidance)
-    day = apply_affine(slice_grid(truth, guidance), night_clean)
+def test_masked_pixels_have_no_influence():
+    thermal = _thermal(2)
+    guidance = compute_guidance(thermal)
+    target = _render(_smooth_grid(seed=3), thermal, guidance)
+    mask = torch.ones_like(thermal)
+    mask[..., :40, 20:90] = 0.0
+    corrupted = target.clone()
+    corrupted[..., :40, 20:90] = 1e3  # garbage under the mask
+    clean_fit, w_clean = fit_affine_grid(thermal, target, guidance, mask, SIZE, refine_steps=1)
+    dirty_fit, w_dirty = fit_affine_grid(thermal, corrupted, guidance, mask, SIZE, refine_steps=1)
+    assert torch.equal(clean_fit, dirty_fit) or torch.allclose(clean_fit, dirty_fit, atol=1e-5)
+    assert torch.allclose(w_clean, w_dirty)
+    assert torch.isclose(w_clean.sum(), mask.sum(), rtol=1e-4)  # each pixel hands out its weight
 
-    fitted, node_weights = fit_grid(night_clean, day, guidance)
-    empty = node_weights[0] < 1e-6
-    assert empty.any(), "this test needs at least one unvisited node to be meaningful"
-    rendered = apply_affine(slice_grid(fitted, guidance), night_clean)
-    assert _psnr(rendered, day) > 45
+
+def test_no_weights_means_every_pixel_counts_once():
+    thermal = _thermal(5)
+    target = 0.5 * thermal + 0.2
+    guidance = compute_guidance(thermal)
+    plain, w_plain = fit_affine_grid(thermal, target, guidance, None, SIZE)
+    ones, w_ones = fit_affine_grid(thermal, target, guidance, torch.ones_like(thermal), SIZE)
+    assert torch.allclose(plain, ones, atol=1e-6) and torch.allclose(w_plain, w_ones)
+    assert torch.isclose(w_plain.sum(), torch.tensor(float(thermal.numel())), rtol=1e-4)
 
 
-def test_an_empty_bin_inherits_its_cell_rather_than_the_identity():
-    """Ridge pulls a starved node onto its cell's fit: "no data" is not "do not brighten"."""
-    generator = torch.Generator().manual_seed(12)
-    night_clean = torch.rand(1, 3, 128, 128, generator=generator) * 0.05 + 0.01  # one bin only
-    day = (night_clean * 4.0).clamp(0, 1)
-    guidance = compute_guidance(night_clean)
-    grid, node_weights = fit_grid(night_clean, day, guidance)
+def test_refine_reduces_the_render_residual():
+    # A grid that varies quickly from node to node is where splat-and-solve is biased.
+    thermal = _thermal(6, (1, 1, 192, 256))
+    guidance = compute_guidance(thermal)
+    truth = _smooth_grid(seed=2, cycles=2.0)
+    target = _render(truth, thermal, guidance)
+    errors = []
+    for refine in (0, 1, 2):
+        grid, _ = fit_affine_grid(thermal, target, guidance, None, SIZE, refine_steps=refine)
+        errors.append(float((_render(grid, thermal, guidance) - target).pow(2).mean()))
+    assert errors[1] < errors[0] and errors[2] < errors[1], errors
 
+
+def test_output_channels_share_the_normal_equations_but_not_the_answer():
+    thermal = _thermal(7)
+    guidance = compute_guidance(thermal)
+    y = torch.cat([0.4 * thermal + 0.1, -0.3 * thermal + 0.6], dim=1)
+    both, w_both = fit_affine_grid(thermal, y, guidance, None, SIZE, refine_steps=1)
+    assert both.shape == (1, 4, K, GY, GX)  # channels 2c = gain, 2c + 1 = offset
+    for channel in range(2):
+        single, w_single = fit_affine_grid(
+            thermal, y[:, channel : channel + 1], guidance, None, SIZE, refine_steps=1
+        )
+        assert torch.allclose(both[:, 2 * channel : 2 * channel + 2], single, atol=1e-5)
+        assert torch.allclose(w_both, w_single)
+    assert both[0, 0].mean() > 0 > both[0, 2].mean()
+
+
+def test_an_empty_bin_inherits_its_cell_rather_than_zero():
+    """Ridge pulls a starved node onto its cell's fit: "no data" is not "gain zero"."""
+    thermal = torch.rand(1, 1, 96, 128, generator=torch.Generator().manual_seed(12)) * 0.05 + 0.01
+    target = 3.0 * thermal + 0.05  # all of it lands in the darkest bin
+    grid, node_weights = fit_affine_grid(thermal, target, compute_guidance(thermal), None, SIZE)
     starved = node_weights[0] < 1e-6
     assert starved.any()
-    gain = grid[0, 0][starved]  # M[0, 0] at the nodes no pixel reached
-    assert gain.mean() > 2.0, (
-        f"starved nodes fell back toward identity (mean M00 {gain.mean():.2f})"
+    assert grid[0, 0][starved].mean() > 2.0, "starved nodes fell back toward gain 0"
+
+
+def test_a_fully_masked_image_gives_a_finite_grid_and_zero_node_weights():
+    thermal = _thermal(8)
+    grid, node_weights = fit_affine_grid(
+        thermal, thermal, compute_guidance(thermal), torch.zeros_like(thermal), SIZE, refine_steps=1
     )
+    assert torch.isfinite(grid).all()
+    assert node_weights.abs().max() == 0
 
 
-def test_fit_grid_rejects_mismatched_shapes():
-    night = torch.rand(1, 3, 32, 32)
-    with pytest.raises(ValueError):
-        fit_grid(night, torch.rand(1, 3, 16, 16), compute_guidance(night))
-    with pytest.raises(ValueError):
-        fit_grid(night, night, torch.rand(1, 3, 32, 32))
+def test_fit_rejects_mismatched_shapes():
+    x = torch.rand(1, 1, 32, 32)
+    g = compute_guidance(x)
+    with pytest.raises(ValueError, match="y"):
+        fit_affine_grid(x, torch.rand(1, 1, 16, 16), g, None, SIZE)
+    with pytest.raises(ValueError, match="x"):
+        fit_affine_grid(torch.rand(1, 3, 32, 32), x, g, None, SIZE)
+    with pytest.raises(ValueError, match="guidance"):
+        fit_affine_grid(x, x, torch.rand(1, 3, 32, 32), None, SIZE)
+    with pytest.raises(ValueError, match="weights"):
+        fit_affine_grid(x, x, g, torch.ones(1, 1, 8, 8), SIZE)
+
+
+def test_apply_gain_offset_clamps_only_when_asked():
+    x = torch.full((1, 1, 4, 4), 0.5)
+    coeffs = torch.cat([torch.full((1, 1, 4, 4), 5.0), torch.full((1, 1, 4, 4), 0.5)], dim=1)
+    assert apply_gain_offset(coeffs, x).max() == 1.0
+    assert torch.allclose(apply_gain_offset(coeffs, x, clamp=False), torch.full_like(x, 3.0))
+    with pytest.raises(ValueError, match="coeffs"):
+        apply_gain_offset(torch.zeros(1, 3, 4, 4), x)

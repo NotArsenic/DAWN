@@ -1,11 +1,11 @@
-"""Log-luminance guidance computation for bilateral grid slicing.
+"""Thermal guidance for brightness-grid slicing.
 
-The guidance map determines which brightness bin each pixel falls into.
-Using log-space bins is critical: in linear space, nearly every night pixel
-falls into the bottom bin, collapsing the grid to one transform per cell.
+The guidance map says which thermal-intensity bin each pixel falls into: the thermal itself,
+smoothed. No log (thermal is not photon-starved like a dark photo) and no per-frame stretch (it
+measured +0.06 dB because thermal already spans most of [0, 1]).
 
-This is the ONLY guidance implementation: fitting, slicing, rendering, inference and the
-scripts all call `compute_guidance` (docs/conventions.md sections 4 and 8).
+This is the ONLY guidance implementation: fitting, slicing, rendering, inference and the scripts
+all call `compute_guidance` (docs/conventions.md sections 4 and 8).
 """
 
 from __future__ import annotations
@@ -14,43 +14,32 @@ import torch
 import torch.nn.functional as F
 
 GUIDANCE_BLUR_SIZE = 5
-GUIDANCE_FLOOR = 1e-4  # log10 -> -4 maps to guidance 0; 1.0 (log10 = 0) maps to 1
 
 
 def compute_guidance(
-    image_linear: torch.Tensor,
+    thermal: torch.Tensor,
     blur_kernel_size: int = GUIDANCE_BLUR_SIZE,
 ) -> torch.Tensor:
-    """Compute log-luminance guidance from a linear RGB image.
+    """Guidance from a thermal image: a replicate-padded box blur, clamped to [0, 1].
 
-    Steps:
-        1. Compute luminance: L = 0.2126*R + 0.7152*G + 0.0722*B
-        2. Blur with a box filter, replicate-padded (reduces noise in bin assignment;
-           zero padding would darken the borders)
-        3. Log-transform: log10(clamp(L, 1e-4, 1.0))
-        4. Normalize [-4, 0] to [0, 1]
+    Replicate padding matters: zero padding would darken the borders and put the border pixels
+    in the wrong bin.
 
     Args:
-        image_linear: (B, 3, H, W) linear RGB in [0, 1].
-        blur_kernel_size: Odd box filter size for luminance smoothing. Leave at the default
-            outside of experiments: the convention is a 5x5 box.
+        thermal: (B, 1, H, W) thermal, `code / 255`, at the resolution it will be indexed at.
+        blur_kernel_size: Odd box filter size. Leave at the default outside of experiments: the
+            convention is a 5x5 box.
 
     Returns:
         guidance: (B, 1, H, W) in [0, 1].
-    """
-    lum_weights = torch.tensor(
-        [0.2126, 0.7152, 0.0722],
-        device=image_linear.device,
-        dtype=image_linear.dtype,
-    )
-    luminance = (image_linear * lum_weights.view(1, 3, 1, 1)).sum(dim=1, keepdim=True)
 
+    Raises:
+        ValueError: `thermal` is not (B, 1, H, W).
+    """
+    if thermal.ndim != 4 or thermal.shape[1] != 1:
+        raise ValueError(f"thermal must be (B, 1, H, W), got {tuple(thermal.shape)}")
     if blur_kernel_size > 1:
         pad = blur_kernel_size // 2
-        luminance = F.pad(luminance, (pad, pad, pad, pad), mode="replicate")
-        luminance = F.avg_pool2d(luminance, kernel_size=blur_kernel_size, stride=1)
-
-    log_lum = torch.log10(luminance.clamp(min=GUIDANCE_FLOOR, max=1.0))
-    # log10(1e-4) = -4, log10(1.0) = 0 → normalize to [0, 1].
-    guidance = (log_lum + 4.0) / 4.0
-    return guidance.clamp(0.0, 1.0)
+        thermal = F.pad(thermal, (pad, pad, pad, pad), mode="replicate")
+        thermal = F.avg_pool2d(thermal, kernel_size=blur_kernel_size, stride=1)
+    return thermal.clamp(0.0, 1.0)

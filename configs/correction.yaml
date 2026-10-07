@@ -1,0 +1,10 @@
+# Overlay: turn the generated L correction ON (the token grows from 48 to 64 values).
+#
+#   python scripts/train_flow.py --config configs/flow.yaml --override configs/correction.yaml ...
+#
+# Off by default until the worst-10% oracle sheet and the GPU gate say it is needed; it is a
+# layout change, so a checkpoint trained with it only loads with it (the layout check refuses a
+# mismatch).
+
+brightness_correction:
+  enabled: true

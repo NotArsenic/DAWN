@@ -1,7 +1,7 @@
 [project]
 name = "dawn"
 version = "0.1.0"
-description = "Hallucination-free nighttime drone image enhancement via flow-matched bilateral grids"
+description = "Day thermal to color for drone imagery: flow matching on DINOv3 features, trained on aligned DroneVehicle pairs"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -12,10 +12,10 @@ dependencies = [
     "timm>=1.0.20",        # first release with the DINOv3 models
     "peft>=0.12",          # LoRA on the DINO encoder; disable_adapter() gives the L_align target
     "omegaconf>=2.3",
-    "Pillow>=10.0",        # PNG/JPEG I/O and the camera model's JPEG round trip
+    "Pillow>=10.0",        # JPEG decode, PNG I/O, polygon rasterization, contact sheets
     "numpy>=1.24",
     "scipy>=1.11",
-    "matplotlib>=3.7",     # dawn.eval.visualize / calibration plots
+    "matplotlib>=3.7",     # data-phase histograms; dawn.eval.visualize / calibration plots
     "tqdm>=4.65",
     "wandb>=0.16",
     "lpips>=0.1.4",

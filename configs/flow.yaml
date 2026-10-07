@@ -1,16 +1,56 @@
-# Stage 1: Flow model training configuration.
+# Stage 1: flow model training for day thermal -> RGB.
 # Layouts and conventions: docs/conventions.md
 
-# Grid specification.
+# How the loss code treats the two kinds of aligned pairs (docs/conventions.md section 10.2).
+# Decided by the maintainer; dawn/flow/trainer.py reads these keys.
+#   box-aligned pairs   aligned from the vehicle boxes; they have a `moving` mask.
+#   fallback pairs      aligned by edge correlation only (data/manifests/fallback_pairs.txt); no
+#                       `moving` mask, so the `vehicles` mask (every vehicle, dilated) stands in.
+pairs:
+  fallback_pixel_mask: vehicles     # fallback pairs: mask vehicles in L_flow targets and L_render
+  box_pixel_mask: moving            # box-aligned pairs: mask only vehicles that moved
+  fallback_render_weight: 0.5       # fallback pairs count half in L_render
+  eval_subset: box_aligned          # model selection and headline test metrics on box-aligned only
+  report_fallback_separately: true  # fallback val/test reported as a separate robustness number
+
+# Brightness grid: (gain, offset) per cell and thermal-intensity bin, mapping thermal to
+# L = L*/100. The cells are the DINO patches, so the cell grid is encoder.input_size / patch_size.
 grid:
-  spatial_size: 16       # 16x16 spatial cells
-  num_bins: 8            # brightness bins
-  coeffs_per_bin: 12     # 3x3 matrix (row-major) + 3 offsets, see docs/conventions.md section 2.2
-  # Ridge regularization for grid fitting.
+  num_bins: 8            # thermal-intensity bins (K)
+  # Ridge for the target fit (image -> cell -> node), in units of the mean node weight.
   ridge_alpha: 1.0e-3
-  # Normalization stats are computed once and cached.
-  stats_cache: data/grid_stats.pt
+  # Extra passes that fit the render residual and add it: +0.5 dB of oracle for one more fit.
+  refine_steps: 1
+  # Normalization stats are computed once and cached, keyed by the token layout and these fit
+  # settings (recomputed on a mismatch). A checkpoint embeds the stats it was trained with.
+  stats_cache: data/token_stats.pt
   stats_num_samples: 2000
+
+# Colour path: a generated a*b* map at `block` x the token grid (4 x (32, 40) = (128, 160)), brought
+# to full size by `upsample`.
+color:
+  block: 4               # colour pixels per token side
+  bin_step: 10           # a*b* bins: the occupied cells of a 10-unit grid over the sRGB gamut (261)
+  soft_k: 5              # Zhang et al.: the 5 nearest bins ...
+  soft_sigma: 5.0        # ... with a Gaussian of this width (a*b* units)
+  min_patch_fraction: 0.5  # L_color ignores patches whose kept (unmasked) share is below this
+  # How the colour map (and the correction) are upsampled: bilinear | bgu. BILINEAR by the
+  # maintainer's decision at Checkpoint A: on the real val pairs its colour ceiling is 0.87 mean
+  # |delta a*b*| against the BGU's 1.3 (best setting) to 2.1 (16 x 20 cells), and the assembled
+  # oracle CIEDE2000 is 3.25 against 3.91 (scripts/check_oracle.py, docs/conventions.md section 6.3).
+  upsample: bilinear
+  # BGU (only read when upsample is bgu): a bilateral grid of a*b* ~ gain * L + offset fit at the
+  # colour size and sliced at the output L. The best setting measured; ridge does not help.
+  bgu:
+    bins: 8
+    grid: [64, 80]       # (rows, cols) of the BGU grid cells: 2 x 2 colour pixels per cell
+    ridge_alpha: 1.0e-1
+    refine_steps: 2
+
+# A generated L correction at the colour-map size, for what the grid cannot express. OFF until the
+# worst-10% oracle sheet and the GPU gate say it is needed (CLAUDE.md, open decisions).
+brightness_correction:
+  enabled: false
 
 # Encoder: DINOv3 ViT-S+/16 with peft LoRA. One interface, two backends (dawn/models/encoder.py).
 encoder:
@@ -19,10 +59,12 @@ encoder:
     timm: vit_small_plus_patch16_dinov3.lvd1689m                 # needs timm>=1.0.20
     transformers: facebook/dinov3-vits16plus-pretrain-lvd1689m   # gated; needs the `transformers` extra
   patch_size: 16
-  input_size: 256          # 256 / 16 = 16x16 patch tokens, matching grid.spatial_size
+  # (H, W) of the thermal frame DINO sees. Everything else derives from it: 512 / 16 x 640 / 16 =
+  # 32 x 40 = 1,280 patch tokens = brightness cells. A checkpoint is tied to this resolution.
+  input_size: [512, 640]
   num_register_tokens: 4   # patch tokens start after CLS + registers (index 1 + 4)
   pretrained: true         # false gives a randomly initialized backbone (offline debug runs)
-  grad_checkpointing: false  # recompute DINO blocks in the backward pass (16 GB card)
+  grad_checkpointing: true # recompute DINO blocks in the backward pass (16 GB card at 640x512)
   lora_rank: 8
   lora_alpha: 16
   lora_dropout: 0.0
@@ -34,7 +76,7 @@ encoder:
     timm: '.*blocks\.\d+\.attn\.(qkv|proj)'
     transformers: [q_proj, k_proj, v_proj, o_proj]
 
-# Velocity transformer.
+# Velocity transformer. Token width, token count and position embedding come from the token layout.
 velocity:
   hidden_dim: 256
   num_heads: 4
@@ -47,22 +89,32 @@ velocity:
 
 # Flow matching.
 flow:
-  num_train_steps: 40000    # 30-50K on the 16 GB card (the original plan said 100K)
+  # 20K steps at batch 16 over ~3,660 train pairs is ~90 passes; 40K would be ~175, well into
+  # overfitting. Extend only if box-aligned validation is still improving.
+  num_train_steps: 20000
   num_inference_steps: 2    # NFE at inference
   timesteps_per_image: 4    # t samples per image per step: one encoder pass feeds 4 velocity passes
+  render_size: [256, 320]   # (H, W) where L_render is computed; at least the colour-map size
   # Loss weights.
   velocity_weight: 1.0      # L_flow
-  apply_weight: 0.1         # L_render: L1(applied grid, day image)
-  noise_weight: 1.0         # L_noise: MSE on (log a, log b)
-  align_weight: 0.5         # L_align: adapted vs frozen (adapters disabled) DINO features
-  # Bin-count weighting: scale loss per bin by pixel count.
+  render_weight: 0.1        # L_render: L1 of Lab/100 against the RGB
+  align_weight: 0.5         # L_align: adapted (thermal) vs frozen (adapters disabled, RGB) DINO tokens
+  color_weight: 0.2         # L_color: per-patch cross-entropy over the 261 a*b* bins
+  # Brightness values are weighted by node pixel counts (per cell and bin); colour and correction
+  # values by their mask fraction. Each segment is normalized to mean 1 per sample first.
   bin_count_weighting: true
-  # The "5K-step schedule": until this step the encoder's patch tokens and CLS are DETACHED
-  # before the velocity net and the noise head, so LoRA is trained by L_align alone. After it,
-  # everything trains jointly. This is not the optimizer's LR warmup (optim.lr_warmup_steps).
-  warmup_steps: 5000
+  # How the segments of L_flow are summed. A token is [brightness 16 | colour 32 | correction 16].
+  #   per_value    each segment counts in proportion to its number of values (a plain mean over the
+  #                token): colour (32) carries twice the weight of brightness (16). The default.
+  #   equal        each segment's own mean counts the same.
+  # L_flow is logged per segment either way (loss/flow_brightness, _color, _correction).
+  segment_balance: per_value
+  # The warmup schedule: until this step the encoder's patch tokens and CLS are DETACHED before the
+  # velocity net, so LoRA is trained by L_align and L_color alone. After it, everything trains
+  # jointly. ~15% of training. This is not the optimizer's LR warmup (optim.lr_warmup_steps).
+  warmup_steps: 3000
   # Render loss on a random subset of the batch_size x timesteps_per_image samples. null = all.
-  # Only a VRAM valve: 128 renders at 256^2 cost about 0.6 GB of activations.
+  # Only a VRAM valve.
   render_subset: null
 
 # Optimization.
@@ -71,20 +123,19 @@ optim:
   lr: 2.0e-4
   weight_decay: 0.01      # not applied to norms, biases, attention gates or the pos embedding
   betas: [0.9, 0.999]
-  batch_size: 32          # images per step (16 GB card); x flow.timesteps_per_image velocity samples each
+  batch_size: 16          # images per step x flow.timesteps_per_image velocity samples each; 8 if 16 GB is tight
   grad_clip: 1.0
+  # bf16 autocast wraps network forwards on CUDA only; on MPS and CPU the run is fp32 whatever this
+  # says (bf16 on MPS is patchy: silent slowdowns and errors that have nothing to do with the model).
   precision: bf16         # bf16 | fp32
   ema_decay: 0.999
   lr_warmup_steps: 1000   # linear LR warmup, then cosine decay over flow.num_train_steps
 
 # Dataloader.
 loader:
-  num_workers: 4          # workers run dawn/data/degrade.py on the CPU
+  num_workers: 4          # PNG decode and flips run on CPU workers
   pin_memory: true
-  val_level: medium       # fixed val set darkness (dawn/data/degrade.py: DARKNESS_LEVELS)
-  # Debug escape hatch: train on N procedurally generated images (dawn/flow/dataset.py:
-  # SyntheticDay) instead of a manifest, so the loop runs with no VisDrone on disk.
-  synthetic_images: null
+  val_batch_size: 4       # validation runs at the full input resolution: keep it small
 
 # Logging.
 logging:
@@ -93,5 +144,5 @@ logging:
   log_every: 100
   log_attn_gates: true    # log each block's learned DINO-attention gate every log_every steps
   save_every: 5000
-  val_every: 5000
-  num_val_samples: 64
+  val_every: 2500
+  num_val_samples: 64     # val pairs per subset (box-aligned, fallback) per validation

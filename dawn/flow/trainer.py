@@ -3,49 +3,54 @@
 `scripts/train_flow.py` is a thin CLI over this module. Everything that has to be testable
 lives here, so `tests/test_flow_train.py` can run the same step the script runs.
 
-What one step does (docs/conventions.md sections 4, 5 and 7):
+What one step does (docs/conventions.md sections 2 to 6):
 
-    1. Workers hand over `night`, `night_clean`, `day` at 256x256, linear, plus `noise_params`.
-    2. On the GPU, in float32: guidance = compute_guidance(night_clean), then
-       `fit_grid(night_clean, day, guidance)` -> the raw oracle grid and its node weights,
-       then `standardize` -> z_1.
-    3. The encoder runs ONCE per image on `night`, and once more with the adapters disabled on
-       `day` for the L_align target.
+    1. A batch from `AlignedPairs` (thermal, linear RGB, masks) is moved to the device and
+       area-downsampled to `encoder.input_size` if the stored frames are bigger; the pixel mask
+       becomes fractions (`prepare_batch`).
+    2. In float32 with no gradient (`build_targets`): guidance, L = L*/100 of the RGB, the
+       brightness fit (`grid.refine_steps`), the oracle brightness, the a*b* (and correction)
+       targets and the loss weights; then `pack` and `standardize` give z_1.
+    3. The encoder runs ONCE per image on the thermal, and once more with the adapters disabled
+       on the paired RGB for the L_align target. The colour head reads the adapted patch tokens.
     4. The conditioning is repeated `flow.timesteps_per_image` times; the encoder is not.
     5. Per (image, timestep): z_0 ~ N(0, I), t ~ U(0, 1), z_t = (1-t) z_0 + t z_1, v = net(...),
-       z1_hat = z_t + (1-t) v, un-standardize, slice, apply to night_clean -> applied_pred.
-    6. L_flow + 0.1 L_render + L_noise + 0.5 L_align, backward, clip, step, EMA.
+       z1_hat = z_t + (1-t) v, unstandardize, unpack, `render` at `flow.render_size`.
+    6. L_flow + 0.1 L_render + 0.5 L_align + 0.2 L_color, backward, clip, step, EMA.
 
-Precision: bf16 autocast wraps the network forward passes only. Grid fitting, slicing,
-`apply_affine` and standardization run in float32, and no module is ever cast with `.to(bf16)`
-(DINOv3's RoPE tables must stay fp32).
+Precision: bf16 autocast wraps the network forward passes on CUDA only. Target building, the fit,
+the render and the losses run in float32, and no module is ever cast with `.to(bf16)` (DINOv3's
+RoPE tables must stay fp32). On MPS and CPU the run is fp32 whatever `optim.precision` says.
 
-`flow.warmup_steps` gates the conditioning detach: until then the encoder's output is cut off
-from the velocity net and the noise head, so LoRA is trained by L_align alone. After it,
-everything trains jointly.
+`flow.warmup_steps` gates the conditioning detach: until then the encoder's patch tokens are cut
+off from the velocity net, so LoRA is trained by L_align and L_color alone. After it, everything
+trains jointly.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any
 
 import torch
 import torch.nn as nn
 
-from dawn.data.color import linear_to_srgb
-from dawn.eval.metrics import compute_psnr
-from dawn.flow.loss import FlowMatchingLoss
-from dawn.flow.sampler import sample_grid
-from dawn.grid.fit import fit_grid
-from dawn.grid.guidance import compute_guidance
+from dawn.data.color import linear_to_lab, linear_to_srgb
+from dawn.data.resample import area_downsample
+from dawn.eval.metrics import ciede2000, colorfulness, masked_mean, masked_psnr
+from dawn.flow.color_bins import patch_histograms, patch_mask_fraction
+from dawn.flow.loss import FlowLoss
+from dawn.flow.render import RenderSettings, render
+from dawn.flow.sampler import sample_parts
+from dawn.flow.targets import FitSettings, build_targets, prepare_batch
+from dawn.flow.tokens import TokenLayout
 from dawn.grid.normalize import standardize, unstandardize
-from dawn.grid.slice import apply_affine, slice_grid
+from dawn.models.color_head import ColorHead
 from dawn.models.encoder import DINOEncoder
-from dawn.models.noise_head import NoiseHead, log_noise_target
 from dawn.models.velocity import VelocityTransformer
 
 logger = logging.getLogger(__name__)
@@ -58,7 +63,7 @@ NO_DECAY_SUFFIXES = ("bias", "dino_gate", "pos_embed")
 class EMA:
     """Exponential moving average of the trainable parameters.
 
-    Tracks the velocity net, the LoRA adapters and the noise head (`optim.ema_decay`, 0.999).
+    Tracks the velocity net, the LoRA adapters and the colour head (`optim.ema_decay`, 0.999).
     The shadow is kept in float32 whatever the parameters are, and `applied()` swaps it in for
     validation and inference without touching the optimizer's view of the live weights.
     """
@@ -100,7 +105,7 @@ class EMA:
 def split_param_groups(
     encoder: nn.Module,
     velocity: nn.Module,
-    noise_head: nn.Module,
+    color_head: nn.Module,
     lr: float,
     lora_lr: float,
     weight_decay: float,
@@ -113,12 +118,16 @@ def split_param_groups(
     should stay 0, which is exactly the thing being learned.
     """
     groups = {
-        (scope, decay): {"params": [], "lr": lora_lr if scope == "lora" else lr,
-                         "weight_decay": weight_decay if decay else 0.0, "name": f"{scope}_{decay}"}
+        (scope, decay): {
+            "params": [],
+            "lr": lora_lr if scope == "lora" else lr,
+            "weight_decay": weight_decay if decay else 0.0,
+            "name": f"{scope}_{decay}",
+        }
         for scope in ("lora", "main")
         for decay in (True, False)
     }
-    for scope, module in (("lora", encoder), ("main", velocity), ("main", noise_head)):
+    for scope, module in (("lora", encoder), ("main", velocity), ("main", color_head)):
         for name, param in module.named_parameters():
             if not param.requires_grad:
                 continue
@@ -145,15 +154,21 @@ def cosine_warmup_schedule(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
-def build_models(cfg: Mapping, device: torch.device) -> tuple[DINOEncoder, VelocityTransformer,
-                                                              NoiseHead]:
-    """Encoder (+LoRA), velocity transformer and noise head, on `device`."""
+def build_models(
+    cfg: Mapping, layout: TokenLayout, device: torch.device
+) -> tuple[DINOEncoder, VelocityTransformer, ColorHead]:
+    """Encoder (+LoRA), velocity transformer and colour head, on `device`."""
     encoder = DINOEncoder.from_config(
         cfg["encoder"], detach_attn=cfg["velocity"]["detach_dino_attn"]
     ).to(device)
-    velocity = VelocityTransformer.from_config(cfg["velocity"], cfg["grid"]).to(device)
-    noise_head = NoiseHead(dino_dim=encoder.embed_dim).to(device)
-    return encoder, velocity, noise_head
+    if encoder.patch_grid != layout.grid:
+        raise ValueError(
+            f"the encoder's patch grid {encoder.patch_grid} and the token layout {layout.grid} "
+            "disagree: both derive from encoder.input_size"
+        )
+    velocity = VelocityTransformer.from_config(cfg["velocity"], layout).to(device)
+    color_head = ColorHead(dino_dim=encoder.embed_dim).to(device)
+    return encoder, velocity, color_head
 
 
 class FlowTrainer:
@@ -164,35 +179,58 @@ class FlowTrainer:
         cfg: Mapping,
         encoder: DINOEncoder,
         velocity: VelocityTransformer,
-        noise_head: NoiseHead,
-        stats: Mapping[str, torch.Tensor],
+        color_head: ColorHead,
+        stats: Mapping[str, Mapping[str, torch.Tensor]],
+        layout: TokenLayout | None = None,
         device: torch.device | str = "cpu",
     ) -> None:
         self.cfg = cfg
         self.device = torch.device(device)
+        self.layout = layout or TokenLayout.from_config(cfg)
         self.encoder = encoder.to(self.device)
         self.velocity = velocity.to(self.device)
-        self.noise_head = noise_head.to(self.device)
-        self.mean = stats["mean"].to(self.device)
-        self.std = stats["std"].to(self.device)
-        self.criterion = FlowMatchingLoss.from_config(cfg["flow"])
+        self.color_head = color_head.to(self.device)
+        self.set_stats(stats)
+        self.criterion = FlowLoss.from_config(cfg, self.layout)
+        self.fit = FitSettings.from_config(cfg)
+        self.render_settings = RenderSettings.from_config(cfg)
+        if self.render_settings.layout != self.layout:
+            self.render_settings = RenderSettings(
+                self.layout,
+                self.render_settings.bgu_grid,
+                self.render_settings.bgu_ridge,
+                self.render_settings.bgu_refine,
+            )
+        self.policy = cfg["pairs"]
 
-        grid = cfg["grid"]
-        self.grid_h = self.grid_w = int(grid["spatial_size"])
-        self.num_bins = int(grid["num_bins"])
-        self.ridge_alpha = float(grid["ridge_alpha"])
-
-        flow, optim = cfg["flow"], cfg["optim"]
+        flow, optim, color = cfg["flow"], cfg["optim"], cfg["color"]
+        self.input_size = tuple(int(v) for v in cfg["encoder"]["input_size"])
+        self.render_size = tuple(int(v) for v in flow["render_size"])
+        self._check_sizes()
+        self.render_patch = (
+            self.render_size[0] // self.layout.grid[0],
+            self.render_size[1] // self.layout.grid[1],
+        )
+        self.soft_k, self.soft_sigma = int(color["soft_k"]), float(color["soft_sigma"])
+        self.bin_count_weighting = bool(flow["bin_count_weighting"])
         self.timesteps_per_image = int(flow["timesteps_per_image"])
         self.warmup_steps = int(flow["warmup_steps"])
         self.render_subset = flow.get("render_subset") or None
         self.inference_nfe = int(flow["num_inference_steps"])
         self.grad_clip = float(optim["grad_clip"])
         self.precision = str(optim["precision"])
+        if self.precision == "bf16" and self.device.type != "cuda":
+            logger.warning(
+                "optim.precision is bf16 but the device is %s: running fp32 (bf16 autocast is "
+                "CUDA only; MPS/CPU bf16 is patchy)",
+                self.device.type,
+            )
 
         self.optimizer = torch.optim.AdamW(
             split_param_groups(
-                encoder, velocity, noise_head,
+                encoder,
+                velocity,
+                color_head,
                 lr=float(optim["lr"]),
                 lora_lr=float(cfg["encoder"]["lora_lr"]),
                 weight_decay=float(optim["weight_decay"]),
@@ -209,10 +247,40 @@ class FlowTrainer:
 
     @classmethod
     def from_config(
-        cls, cfg: Mapping, stats: Mapping[str, torch.Tensor], device: torch.device | str = "cpu"
-    ) -> "FlowTrainer":
+        cls,
+        cfg: Mapping,
+        stats: Mapping[str, Mapping[str, torch.Tensor]],
+        device: torch.device | str = "cpu",
+    ) -> FlowTrainer:
         device = torch.device(device)
-        return cls(cfg, *build_models(cfg, device), stats=stats, device=device)
+        layout = TokenLayout.from_config(cfg)
+        return cls(
+            cfg, *build_models(cfg, layout, device), stats=stats, layout=layout, device=device
+        )
+
+    def _check_sizes(self) -> None:
+        grid, color = self.layout.grid, self.layout.color_size
+        render = self.render_size
+        if render[0] % grid[0] or render[1] % grid[1]:
+            raise ValueError(
+                f"flow.render_size {render} must be a multiple of the token grid {grid}: "
+                "L_color builds one histogram per patch at render size"
+            )
+        if render[0] < color[0] or render[1] < color[1]:
+            raise ValueError(f"flow.render_size {render} is smaller than the colour map {color}")
+        if render[0] > self.input_size[0] or render[1] > self.input_size[1]:
+            raise ValueError(
+                f"flow.render_size {render} is larger than encoder.input_size {self.input_size}"
+            )
+
+    def set_stats(self, stats: Mapping[str, Mapping[str, torch.Tensor]]) -> None:
+        """Install per-segment stats (kept for checkpoints) and their `(D,)` vectors."""
+        self.stats = {
+            name: {key: value.detach().cpu() for key, value in segment.items()}
+            for name, segment in stats.items()
+        }
+        mean, std = self.layout.stats_vector(self.stats)
+        self.mean, self.std = mean.to(self.device), std.to(self.device)
 
     # --- bookkeeping ----------------------------------------------------------------------
 
@@ -226,7 +294,11 @@ class FlowTrainer:
         return out
 
     def modules(self) -> dict[str, nn.Module]:
-        return {"encoder": self.encoder, "velocity": self.velocity, "noise_head": self.noise_head}
+        return {
+            "encoder": self.encoder,
+            "velocity": self.velocity,
+            "color_head": self.color_head,
+        }
 
     def param_counts(self) -> dict[str, tuple[int, int]]:
         """`{module: (trainable, total)}`, plus a 'total' row."""
@@ -251,9 +323,9 @@ class FlowTrainer:
     def _autocast(self):
         """bf16 autocast for network forwards; a no-op unless CUDA bf16 was asked for.
 
-        Everything outside these blocks -- grid fitting, standardization, slicing,
-        `apply_affine` -- therefore runs in float32, which is what docs/conventions.md
-        section 1 requires. No module is ever cast with `.to(bfloat16)`.
+        Everything outside these blocks -- target building, the fit, the render, the losses --
+        therefore runs in float32, which docs/conventions.md section 1 requires. No module is ever
+        cast with `.to(bfloat16)`.
         """
         if self.precision == "bf16" and self.device.type == "cuda":
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -261,89 +333,92 @@ class FlowTrainer:
 
     # --- the step -------------------------------------------------------------------------
 
-    def fit_targets(
-        self, night_clean: torch.Tensor, day: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Oracle grid for one batch: `(z_1 standardized, node_weights, guidance)`, float32."""
-        guidance = compute_guidance(night_clean)
-        grid_raw, node_weights = fit_grid(
-            night_clean,
-            day,
-            guidance,
-            grid_h=self.grid_h,
-            grid_w=self.grid_w,
-            num_bins=self.num_bins,
-            ridge_alpha=self.ridge_alpha,
-        )
-        return standardize(grid_raw, self.mean, self.std), node_weights, guidance
+    def compute_losses(self, raw_batch: Mapping[str, Any]) -> tuple[dict, dict]:
+        """Every loss of one step for `raw_batch` (an `AlignedPairs` batch), with gradients.
 
-    def render(
-        self, grid_std: torch.Tensor, image: torch.Tensor, guidance: torch.Tensor
-    ) -> torch.Tensor:
-        """Standardized grid -> un-standardize -> slice -> apply. The ONLY render path."""
-        coeffs = slice_grid(unstandardize(grid_std.float(), self.mean, self.std), guidance)
-        return apply_affine(coeffs, image)
-
-    def train_step(self, batch: Mapping[str, Any]) -> dict[str, float]:
-        """One optimizer step. Returns every loss separately, plus the learning rate."""
-        self.train()
-        night, night_clean, day = (
-            batch[key].to(self.device, torch.float32, non_blocking=True)
-            for key in ("night", "night_clean", "day")
+        Returns:
+            `(losses, info)`: the `FlowLoss` dict (tensors, `total` first to backpropagate) and
+            `{"detach_cond": bool}`, whether the encoder was cut off from the velocity net.
+        """
+        batch = prepare_batch(raw_batch, self.input_size, self.policy, self.device)
+        thermal, rgb, mask, fallback = (
+            batch["thermal"],
+            batch["rgb"],
+            batch["mask"],
+            batch["fallback"],
         )
-        noise_gt = log_noise_target(batch["noise_params"]).to(self.device)
+        layout, repeats = self.layout, self.timesteps_per_image
 
         with torch.no_grad():
-            z_1, node_weights, guidance = self.fit_targets(night_clean, day)
+            targets = build_targets(thermal, rgb, mask, layout, self.fit)
+            node_weights = targets.node_weights
+            if not self.bin_count_weighting:
+                node_weights = torch.ones_like(node_weights)
+            z_1 = standardize(layout.pack(targets.parts), self.mean, self.std)
+            token_weights = layout.weights(node_weights, targets.fraction)
+            # Render-size targets: Lab of the area-downsampled linear RGB, and the colour
+            # histograms built from its a*b* (8x8 samples per 16-px patch at the defaults).
+            thermal_r = area_downsample(thermal, self.render_size)
+            lab_r = linear_to_lab(area_downsample(rgb, self.render_size).clamp(0.0, 1.0))
+            mask_r = area_downsample(mask, self.render_size)
+            histogram = patch_histograms(
+                lab_r[:, 1:], mask_r, self.render_patch, self.soft_k, self.soft_sigma
+            )
+            patch_weight = patch_mask_fraction(mask_r, self.render_patch)
+            sample_weight = self.criterion.sample_weight(fallback)
 
         detach_cond = self.step < self.warmup_steps
         with self._autocast():
-            cond = self.encoder.encode(night, return_attn=True)
-            feat_frozen = self.encoder.forward_frozen(day).patch_tokens
-
+            cond = self.encoder.encode(thermal, return_attn=True)
+            frozen = self.encoder.forward_frozen(rgb).patch_tokens
+            logits = self.color_head(cond["patch_tokens"])
         feat_adapted = cond["patch_tokens"]
         patch_tokens = feat_adapted.detach() if detach_cond else feat_adapted
-        cls_token = cond["cls"].detach() if detach_cond else cond["cls"]
 
-        repeats = self.timesteps_per_image
-        batch_size = night.shape[0]
+        batch_size = thermal.shape[0]
         features = _repeat(patch_tokens, repeats)
         thumb = _repeat(cond["thumb"], repeats)
         attn_bias = _repeat(cond.get("attn_bias"), repeats)
         z_1_rep = _repeat(z_1, repeats)
-        node_weights_rep = _repeat(node_weights, repeats)
 
         t = torch.rand(repeats * batch_size, device=self.device, dtype=torch.float32)
         z_0 = torch.randn_like(z_1_rep)
-        t_grid = t.view(-1, 1, 1, 1, 1)
-        z_t = (1.0 - t_grid) * z_0 + t_grid * z_1_rep
+        t_tok = t.view(-1, 1, 1)
+        z_t = (1.0 - t_tok) * z_0 + t_tok * z_1_rep
 
         with self._autocast():
             v_pred = self.velocity(z_t, t, features, None, thumb, attn_bias)
-            noise_pred = self.noise_head(cls_token)
         v_pred = v_pred.float()
 
-        z1_hat = z_t + (1.0 - t_grid) * v_pred
+        z1_hat = z_t + (1.0 - t_tok) * v_pred
         index = self._render_index(z1_hat.shape[0])
-        applied_pred = self.render(
-            z1_hat[index],
-            _repeat(night_clean, repeats)[index],
-            _repeat(guidance, repeats)[index],
+        parts = layout.unpack(unstandardize(z1_hat[index], self.mean, self.std))
+        rendered = render(
+            parts, _repeat(thermal_r, repeats)[index], self.render_size, self.render_settings
         )
 
         losses = self.criterion(
             v_pred=v_pred,
             z_0=z_0,
             z_1=z_1_rep,
-            t=t,
-            noise_pred=noise_pred.float(),
-            noise_gt=noise_gt,
-            applied_pred=applied_pred,
-            day_image=_repeat(day, repeats)[index],
-            node_weights=node_weights_rep,
+            token_weights=_repeat(token_weights, repeats),
+            lab_pred=rendered["lab"],
+            lab_target=_repeat(lab_r, repeats)[index],
+            pixel_weight=_repeat(mask_r, repeats)[index],
+            sample_weight=_repeat(sample_weight, repeats)[index],
             feat_adapted=feat_adapted,
-            feat_frozen=feat_frozen,
+            feat_frozen=frozen,
+            patch_weight=patch_weight,
+            color_logits=logits,
+            color_target=histogram,
+            color_patch_weight=patch_weight,
         )
+        return losses, {"detach_cond": detach_cond}
+
+    def train_step(self, batch: Mapping[str, Any]) -> dict[str, float]:
+        """One optimizer step. Returns every loss separately, plus the learning rates."""
+        self.train()
+        losses, info = self.compute_losses(batch)
 
         self.optimizer.zero_grad(set_to_none=True)
         losses["total"].backward()
@@ -357,7 +432,7 @@ class FlowTrainer:
 
         out = {name: float(value.detach()) for name, value in losses.items()}
         out["grad_norm"] = float(grad_norm)
-        out["detach_cond"] = float(detach_cond)
+        out["detach_cond"] = float(info["detach_cond"])
         for group in self.optimizer.param_groups:
             out[f"lr_{group['name'].split('_')[0]}"] = float(group["lr"])
         return out
@@ -377,78 +452,96 @@ class FlowTrainer:
         nfe: int | None = None,
         max_batches: int | None = None,
     ) -> dict[str, float]:
-        """Render PSNR at `nfe` for both samplers, next to the fitted-grid oracle.
+        """Full-resolution metrics at `nfe` for both samplers, next to the fitted-grid oracle.
 
-        PSNR is measured in display (sRGB) units on the same pixels the training render loss
-        uses, `night_clean`, so the oracle is a real ceiling for the model. `psnr/euler_night`
-        is the honest inference number: the same grid applied to the noisy `night` frame.
+        Everything is at the working resolution (`encoder.input_size`) on the pixels the losses
+        count (the pixel mask; images with no weight are skipped), so the oracle is a real ceiling:
+        the fitted target parts rendered by the very same `render`. Noise comes from each image's
+        ID, so a validation curve is comparable across runs and batchings.
+
+        Returns:
+            Means over images: `psnr_L/{oracle,euler,midpoint}` (L*, peak 100),
+            `psnr_L/gap_to_oracle` (oracle - euler), `ciede2000/{...}`, `colorfulness/{...,gt}` and
+            `num_images`.
         """
         self.eval()
         nfe = self.inference_nfe if nfe is None else nfe
         totals: dict[str, float] = {}
         count = 0
-        for index, batch in enumerate(loader):
+
+        def record(key: str, values: torch.Tensor, keep: torch.Tensor) -> None:
+            totals[key] = totals.get(key, 0.0) + float(values[keep].sum())
+
+        for index, raw in enumerate(loader):
             if max_batches is not None and index >= max_batches:
                 break
-            night, night_clean, day = (
-                batch[key].to(self.device, torch.float32) for key in
-                ("night", "night_clean", "day")
-            )
-            guidance = compute_guidance(night_clean)
-            grid_raw, _ = fit_grid(
-                night_clean, day, guidance, grid_h=self.grid_h, grid_w=self.grid_w,
-                num_bins=self.num_bins, ridge_alpha=self.ridge_alpha,
-            )
-            scores = {"psnr/oracle": _psnr(apply_affine(slice_grid(grid_raw, guidance),
-                                                        night_clean), day)}
+            batch = prepare_batch(raw, self.input_size, self.policy, self.device)
+            thermal, rgb, mask = batch["thermal"], batch["rgb"], batch["mask"]
+            targets = build_targets(thermal, rgb, mask, self.layout, self.fit)
+            keep = mask.sum(dim=(1, 2, 3)) > 0
+            if not keep.any():
+                continue
+            true_lab = targets.lab
+
+            def score(name: str, rendered: Mapping[str, torch.Tensor]) -> None:
+                psnr = masked_psnr(rendered["lab"][:, :1], true_lab[:, :1], mask, peak=100.0)
+                delta = masked_mean(ciede2000(rendered["lab"], true_lab), mask)
+                color = colorfulness(linear_to_srgb(rendered["rgb"]) * 255.0)
+                record(f"psnr_L/{name}", psnr, keep)
+                record(f"ciede2000/{name}", delta, keep)
+                record(f"colorfulness/{name}", color, keep)
+
+            score("oracle", render(targets.parts, thermal, self.input_size, self.render_settings))
+            record("colorfulness/gt", colorfulness(linear_to_srgb(rgb) * 255.0), keep)
+            # Only the network forwards run under autocast; the render and the metrics are float32.
             with self._autocast():
-                cond = self.encoder.encode(night, return_attn=True)
-            for method in ("euler", "midpoint"):
-                grids = sample_grid(
-                    self.velocity,
-                    cond["patch_tokens"].float(),
-                    self.mean,
-                    self.std,
-                    grid_h=self.grid_h,
-                    grid_w=self.grid_w,
-                    num_bins=self.num_bins,
-                    attn_bias=cond.get("attn_bias"),
-                    thumb=cond["thumb"].float(),
-                    method=method,
-                    nfe=nfe,
-                )[0]
-                coeffs = slice_grid(grids, guidance)
-                scores[f"psnr/{method}"] = _psnr(apply_affine(coeffs, night_clean), day)
-                if method == "euler":
-                    night_guidance = compute_guidance(night)
-                    scores["psnr/euler_night"] = _psnr(
-                        apply_affine(slice_grid(grids, night_guidance), night), day
+                cond = self.encoder.encode(thermal, return_attn=True)
+                sampled = {
+                    method: sample_parts(
+                        self.velocity,
+                        cond["patch_tokens"].float(),
+                        self.layout,
+                        self.mean,
+                        self.std,
+                        attn_bias=cond.get("attn_bias"),
+                        thumb=cond["thumb"].float(),
+                        method=method,
+                        nfe=nfe,
+                        image_ids=batch["image_id"],
                     )
-            for key, value in scores.items():
-                totals[key] = totals.get(key, 0.0) + value
-            count += 1
+                    for method in ("euler", "midpoint")
+                }
+            for method, parts in sampled.items():
+                parts = {name: value[0] for name, value in parts.items()}
+                score(method, render(parts, thermal, self.input_size, self.render_settings))
+            count += int(keep.sum())
         out = {key: value / max(count, 1) for key, value in totals.items()}
-        if "psnr/oracle" in out:
-            out["psnr/gap_to_oracle"] = out["psnr/oracle"] - out.get("psnr/euler", 0.0)
+        if "psnr_L/oracle" in out:
+            out["psnr_L/gap_to_oracle"] = out["psnr_L/oracle"] - out["psnr_L/euler"]
+        out["num_images"] = float(count)
         return out
 
     # --- checkpoints ----------------------------------------------------------------------
 
     def state_dict(self) -> dict:
-        """Everything a resume needs, plus the config and the grid stats it was trained with.
+        """Everything a resume needs, plus the config, the layout and the stats it was trained with.
 
         The frozen DINO backbone is NOT stored: peft never changes it, and a checkpoint that
         carried 29M frozen floats would be 30x bigger for nothing. A resume rebuilds it from
         `encoder.model_ids` and loads the LoRA weights on top, so the pretrained weights have
-        to be the ones the run started from. The grid stats, by contrast, ARE embedded, because
-        inference must never read them from the cache file (docs/conventions.md section 5).
+        to be the ones the run started from. The token stats and the layout descriptor, by
+        contrast, ARE embedded, because inference must never read stats from the cache file
+        (docs/conventions.md section 5) and a checkpoint is tied to its resolution.
         """
         return {
             "step": self.step,
             "config": _plain(self.cfg),
-            "grid_stats": {"mean": self.mean.cpu(), "std": self.std.cpu()},
+            "layout": self.layout.descriptor(),
+            "input_size": list(self.input_size),
+            "render_size": list(self.render_size),
+            "stats": self.stats,
             "velocity": self.velocity.state_dict(),
-            "noise_head": self.noise_head.state_dict(),
+            "color_head": self.color_head.state_dict(),
             "lora": {k: v for k, v in self.encoder.state_dict().items() if "lora_" in k},
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
@@ -456,9 +549,22 @@ class FlowTrainer:
         }
 
     def load_state_dict(self, state: Mapping, strict: bool = True) -> None:
+        """Restore a checkpoint.
+
+        Raises:
+            ValueError: the checkpoint's token layout or resolution is not this run's, or it
+                lacks LoRA weights this encoder expects.
+        """
+        self.layout.check(state["layout"])
+        if list(state["input_size"]) != list(self.input_size):
+            raise ValueError(
+                f"resolution mismatch: this run is {list(self.input_size)}, the checkpoint was "
+                f"trained at {list(state['input_size'])} (encoder.input_size)"
+            )
         self.step = int(state["step"])
+        self.set_stats(state["stats"])
         self.velocity.load_state_dict(state["velocity"])
-        self.noise_head.load_state_dict(state["noise_head"])
+        self.color_head.load_state_dict(state["color_head"])
         missing, unexpected = self.encoder.load_state_dict(state["lora"], strict=False)
         if unexpected:
             raise ValueError(f"checkpoint has unknown encoder keys: {unexpected[:4]}")
@@ -485,11 +591,6 @@ def _repeat(tensor: torch.Tensor | None, repeats: int) -> torch.Tensor | None:
     if tensor is None or repeats == 1:
         return tensor
     return tensor.repeat(repeats, *([1] * (tensor.ndim - 1)))
-
-
-def _psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """Mean PSNR in display units: both images go through `linear_to_srgb` first."""
-    return float(compute_psnr(linear_to_srgb(pred), linear_to_srgb(target)).mean())
 
 
 def _plain(value):

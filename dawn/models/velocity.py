@@ -1,22 +1,22 @@
-"""Velocity transformer for bilateral grid flow matching.
+"""Velocity transformer for flow matching on the token layout.
 
 6-block DiT that predicts the velocity field v(z_t, t, c) where:
-    z_t: noisy STANDARDIZED grid coefficients at time t, (B, 12, K, gy, gx).
+    z_t: noisy STANDARDIZED tokens at time t, (B, N, D): one token per DINO patch, D values each
+         (docs/conventions.md section 2.3: brightness grid, colour block, optional correction).
     t:   flow time in [0, 1] (0 = noise, 1 = data).
     c:   conditioning from the DINOv3 encoder.
 
 Uses adaLN-Zero for time conditioning and an optional additive bias from DINO attention.
 
-The grid is tokenized here and only here, with `dawn.grid.layout.grid_to_tokens` /
-`tokens_to_grid`: 256 tokens (one per spatial cell) of 96 values (K bins x 12 coefficients).
-Layout and token order: docs/conventions.md section 2.
+The net works on token tensors only; the token width D, the token count N and the (gy, gx) grid of
+the thumbnail all come from the `TokenLayout` it is built with, so a different resolution or
+`brightness_correction` setting changes nothing here. Token n of this transformer, DINO patch n,
+brightness cell n and thumbnail pixel n all cover the same image region, so the conditioning
+streams are added per token with no resampling anywhere:
 
-Token n of this transformer, DINO patch n and grid cell n all cover the same image region, so
-the three conditioning streams are added per token with no resampling anywhere:
-
-    x = Linear(96 -> D)(z_t tokens)
-      + Linear(384 -> D)(DINO patch tokens)
-      + Linear(3 -> D)(log thumbnail)
+    x = Linear(D -> 256)(z_t tokens)
+      + Linear(384 -> 256)(DINO patch tokens)
+      + Linear(1 -> 256)(thermal thumbnail)
       + learned positional embedding
 """
 
@@ -29,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from dawn.grid.layout import NUM_COEFFS, grid_to_tokens, tokens_to_grid
+from dawn.flow.tokens import TokenLayout
 from dawn.models.encoder import attention_to_bias
 
 
@@ -135,7 +135,7 @@ class DiTBlock(nn.Module):
         """Forward pass.
 
         Args:
-            x: (B, N, D) hidden states (N = grid_h * grid_w = 256 tokens, D = hidden_dim).
+            x: (B, N, D) hidden states (N = tokens, D = hidden_dim).
             t_emb: (B, D) time embedding.
             attn_bias: (B, 1, N, N) additive attention-logit bias from DINO, already in log
                 space; broadcast over heads and scaled by this block's `dino_gate` (optional).
@@ -153,24 +153,19 @@ class VelocityTransformer(nn.Module):
     """Predicts velocity v(z_t, t, c) for conditional flow matching.
 
     Architecture:
-        1. Tokenize the grid: (B, 12, K, gy, gx) → (B, 256, K*12) via `grid_to_tokens`,
-           then Linear(K*12 → D).
-        2. Add sinusoidal time embedding.
-        3. Add DINO features (Linear 384 → D) as conditioning and, optionally, DINO attention
-           as a per-block attention bias.
-        4. 6x DiTBlock with adaLN-Zero.
-        5. Linear proj back to K*12 values per token (zero-initialized).
-        6. `tokens_to_grid` back to (B, 12, K, gy, gx).
+        1. Linear(D -> hidden) of the tokens (D = layout.dim: 48, or 64 with the correction).
+        2. Add Linear(384 -> hidden) of the DINO patch tokens, Linear(1 -> hidden) of the thermal
+           thumbnail and a learned position embedding.
+        3. A sinusoidal time embedding enters every block through adaLN-Zero; DINO attention is a
+           per-block additive attention bias scaled by a learned gate initialized at 0.
+        4. 6x DiTBlock, then a final adaLN and a zero-initialized Linear(hidden -> D).
 
-    Total: ~7M params, ~1.2 GMACs/step.
+    About 7M parameters, about 10 GMACs per step at 1,280 tokens (estimate).
     """
 
     def __init__(
         self,
-        grid_h: int = 16,
-        grid_w: int = 16,
-        num_bins: int = 8,
-        coeffs: int = 12,
+        layout: TokenLayout,
         hidden_dim: int = 256,
         num_heads: int = 4,
         num_blocks: int = 6,
@@ -180,11 +175,10 @@ class VelocityTransformer(nn.Module):
         detach_dino_attn: bool = True,
     ):
         super().__init__()
-        self.grid_h = grid_h
-        self.grid_w = grid_w
-        self.num_bins = num_bins
-        self.num_tokens = grid_h * grid_w
-        self.token_dim = num_bins * coeffs
+        self.layout = layout
+        self.hidden_dim = hidden_dim
+        self.num_tokens = layout.num_tokens
+        self.token_dim = layout.dim
         self.detach_dino_attn = detach_dino_attn
 
         self.input_proj = nn.Linear(self.token_dim, hidden_dim)
@@ -193,7 +187,7 @@ class VelocityTransformer(nn.Module):
         nn.init.zeros_(self.output_proj.bias)
 
         self.dino_proj = nn.Linear(dino_dim, hidden_dim)
-        self.thumb_proj = nn.Linear(3, hidden_dim)
+        self.thumb_proj = nn.Linear(1, hidden_dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, hidden_dim))
         nn.init.normal_(self.pos_embed, std=0.02)
         self.time_mlp = nn.Sequential(
@@ -208,13 +202,10 @@ class VelocityTransformer(nn.Module):
         self.final_adaln = AdaLNFinal(hidden_dim, hidden_dim)
 
     @classmethod
-    def from_config(cls, cfg, grid_cfg) -> "VelocityTransformer":
-        """Build from the `velocity:` and `grid:` sections of configs/flow.yaml."""
+    def from_config(cls, cfg, layout: TokenLayout) -> "VelocityTransformer":
+        """Build from the `velocity:` section of configs/flow.yaml and the token layout."""
         return cls(
-            grid_h=grid_cfg["spatial_size"],
-            grid_w=grid_cfg["spatial_size"],
-            num_bins=grid_cfg["num_bins"],
-            coeffs=grid_cfg["coeffs_per_bin"],
+            layout,
             hidden_dim=cfg["hidden_dim"],
             num_heads=cfg["num_heads"],
             num_blocks=cfg["num_blocks"],
@@ -225,7 +216,7 @@ class VelocityTransformer(nn.Module):
         )
 
     def _sinusoidal_embedding(self, t: torch.Tensor, dim: int) -> torch.Tensor:
-        """Sinusoidal positional embedding for continuous time t ∈ [0, 1].
+        """Sinusoidal positional embedding for continuous time t in [0, 1].
 
         Args:
             t: (B,) time values.
@@ -257,41 +248,46 @@ class VelocityTransformer(nn.Module):
         thumb: torch.Tensor | None = None,
         attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict velocity field.
+        """Predict the velocity field.
 
         Args:
-            z_t: (B, 12, K, gy, gx) STANDARDIZED noisy grid at time t.
+            z_t: (B, N, D) STANDARDIZED noisy tokens at time t.
             t: (B,) time in [0, 1].
-            dino_features: (B, 256, dino_dim) patch tokens from the encoder.
-            dino_attn: (B, 256, 256) head-averaged patch-to-patch DINO attention for the
-                attention bias. Detached first when `detach_dino_attn` is set, then turned
-                into the additive bias `log(A + 1e-6)`.
-            thumb: (B, 3, gy, gx) log thumbnail of the night image (`DINOEncoder.thumbnail`).
-                Omitted means no thumbnail stream.
-            attn_bias: (B, 1, 256, 256) the bias already in log space, as `encode` returns it.
+            dino_features: (B, N, dino_dim) patch tokens from the encoder.
+            dino_attn: (B, N, N) head-averaged patch-to-patch DINO attention for the attention
+                bias. Detached first when `detach_dino_attn` is set, then turned into the
+                additive bias `log(A + 1e-6)`.
+            thumb: (B, 1, gy, gx) thermal thumbnail (`DINOEncoder.thumbnail`). Omitted means no
+                thumbnail stream.
+            attn_bias: (B, 1, N, N) the bias already in log space, as `encode` returns it.
                 Mutually exclusive with `dino_attn`.
 
         Returns:
-            v: (B, 12, K, gy, gx) predicted velocity, standardized.
+            v: (B, N, D) predicted velocity, standardized.
+
+        Raises:
+            ValueError: the shapes do not match the token layout this model was built for (a
+                different resolution, bin count or brightness_correction setting).
         """
-        if z_t.ndim != 5 or z_t.shape[1] != NUM_COEFFS:
-            raise ValueError(f"z_t must be (B, 12, K, gy, gx), got {tuple(z_t.shape)}")
-        if z_t.shape[2:] != (self.num_bins, self.grid_h, self.grid_w):
+        n, d = self.num_tokens, self.token_dim
+        if z_t.ndim != 3 or z_t.shape[1:] != (n, d):
             raise ValueError(
-                f"z_t grid is {tuple(z_t.shape[2:])}, this model was built for "
-                f"{(self.num_bins, self.grid_h, self.grid_w)}"
+                f"z_t must be (B, {n}, {d}) for this token layout, got {tuple(z_t.shape)}: "
+                "a different resolution, number of bins or brightness_correction setting?"
             )
         if t.ndim != 1 or t.shape[0] != z_t.shape[0]:
             raise ValueError(f"t must be (B,) with B = {z_t.shape[0]}, got {tuple(t.shape)}")
-        if dino_features.shape[:2] != (z_t.shape[0], self.num_tokens):
+        if dino_features.shape[:2] != (z_t.shape[0], n):
+            raise ValueError(f"dino_features must be (B, {n}, C), got {tuple(dino_features.shape)}")
+        if thumb is not None and thumb.shape != (z_t.shape[0], 1, *self.layout.grid):
             raise ValueError(
-                f"dino_features must be (B, {self.num_tokens}, C), got "
-                f"{tuple(dino_features.shape)}"
+                f"thumb must be (B, 1, {self.layout.grid[0]}, {self.layout.grid[1]}), "
+                f"got {tuple(thumb.shape)}"
             )
         if dino_attn is not None and attn_bias is not None:
             raise ValueError("pass dino_attn or attn_bias, not both")
 
-        x = self.input_proj(grid_to_tokens(z_t)) + self.dino_proj(dino_features) + self.pos_embed
+        x = self.input_proj(z_t) + self.dino_proj(dino_features) + self.pos_embed
         if thumb is not None:
             x = x + self.thumb_proj(rearrange(thumb, "b c y x -> b (y x) c"))
 
@@ -305,9 +301,8 @@ class VelocityTransformer(nn.Module):
 
         for block in self.blocks:
             x = block(x, t_emb, bias)
-        out = self.output_proj(self.final_adaln(x, t_emb))
-        return tokens_to_grid(out, self.grid_h, self.grid_w, self.num_bins)
+        return self.output_proj(self.final_adaln(x, t_emb))
 
     def num_params(self) -> int:
-        """Total parameter count (should be ~7M)."""
+        """Total parameter count (about 7M at the plan's size)."""
         return sum(p.numel() for p in self.parameters())

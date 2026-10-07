@@ -14,13 +14,20 @@ pretrained features (see `forward_frozen`).
 
 Backend libraries are imported lazily inside the loaders so this module imports without them.
 
-What the flow stage actually consumes is the dict from `encode`, which bundles the four
-conditioning tensors of docs/conventions.md section 7:
+The input is THERMAL, `(B, 1, H, W)` = code / 255 at `input_size = (H, W)` (640x512 in the plan,
+given as (512, 640)): it is copied to three channels and normalized with the ImageNet mean/std.
+Thermal is camera codes, not light, so it never goes through `linear_to_srgb` (docs/conventions.md
+section 1). The paired RGB goes through `forward_frozen` (adapters disabled) for the L_align
+target, and THAT path is linear -> sRGB -> ImageNet mean/std, because DINO was pretrained on sRGB.
 
-    patch_map   (B, 384, gy, gx)  patch tokens as a feature map, row-major like the grid cells
-    cls         (B, 384)          the CLS token, the noise head's input
+What the flow stage actually consumes is the dict from `encode`, which bundles the conditioning
+tensors of docs/conventions.md section 7:
+
+    patch_tokens (B, N, 384)      patch tokens, row-major: token n = y * gx + x
+    patch_map   (B, 384, gy, gx)  the same tokens as a feature map
+    cls         (B, 384)          the CLS token
     attn_bias   (B, 1, N, N)      log(A + 1e-6) of the last layer's patch-to-patch attention
-    thumb       (B, 3, gy, gx)    log(area_downsample(night_linear) + 1e-3)
+    thumb       (B, 1, gy, gx)    area_downsample(thermal, (gy, gx)): one value per patch
 
 RoPE position augmentation (random shift / jitter / rescale) is a pretraining augmentation and
 is switched OFF here on both backends. It would otherwise make two forward passes of the same
@@ -46,11 +53,11 @@ logger = logging.getLogger(__name__)
 Backend = Literal["timm", "transformers"]
 
 # DINO is pretrained on ImageNet-normalized sRGB (timm's pretrained_cfg for the DINOv3 models).
+# The thermal path uses the same mean/std but skips the sRGB encoding (thermal is not light).
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 ATTN_FLOOR = 1e-6  # attn_bias = log(attention + ATTN_FLOOR)
-THUMB_FLOOR = 1e-3  # thumb = log(area_downsample(linear) + THUMB_FLOOR)
 
 # Architecture of DINOv3 ViT-S+/16, for the `pretrained=False` path where no hub config is
 # downloaded. Matches timm's vit_small_plus_patch16_dinov3 (28.7M parameters).
@@ -70,7 +77,7 @@ VITS_PLUS = {
 class EncoderOutput(NamedTuple):
     """Backend-independent encoder result.
 
-    N = (H / 16) * (W / 16) patches in row-major (y, x) order; C = 384 for ViT-S+.
+    N = (H / 16) * (W / 16) patches in row-major (y, x) order (1,280 at 512 x 640); C = 384.
     CLS and register tokens are stripped from the patch outputs (layout: [CLS, 4 registers,
     patches]).
     """
@@ -95,7 +102,7 @@ class DINOEncoder(nn.Module):
         lora_dropout: float = 0.0,
         lora_targets: str | list[str] | None = None,
         pretrained: bool = True,
-        input_size: int = 256,
+        input_size: tuple[int, int] | int = (512, 640),
         patch_size: int = 16,
         num_register_tokens: int = 4,
         detach_attn: bool = True,
@@ -105,7 +112,7 @@ class DINOEncoder(nn.Module):
         super().__init__()
         self.backend = backend
         self.model_id = model_id
-        self.input_size = input_size
+        self.input_size = _as_size(input_size)
         self.patch_size = patch_size
         self.num_prefix_tokens = 1 + num_register_tokens  # CLS + registers
         self.detach_attn = detach_attn
@@ -152,7 +159,7 @@ class DINOEncoder(nn.Module):
             lora_dropout=cfg["lora_dropout"],
             lora_targets=targets if isinstance(targets, str) else list(targets),
             pretrained=cfg.get("pretrained", True),
-            input_size=cfg.get("input_size", 256),
+            input_size=cfg.get("input_size", (512, 640)),
             patch_size=cfg.get("patch_size", 16),
             num_register_tokens=cfg.get("num_register_tokens", 4),
             grad_checkpointing=cfg.get("grad_checkpointing", False),
@@ -170,14 +177,14 @@ class DINOEncoder(nn.Module):
         raise ValueError(f"Unknown encoder backend {backend!r}; expected 'timm' or 'transformers'.")
 
     def _load_timm(self, model_id: str, pretrained: bool) -> nn.Module:
-        """timm.create_model(model_id, pretrained=pretrained), 256x256 input, no classifier."""
+        """timm.create_model(model_id, ...) at `input_size` (H, W), no classifier head."""
         import timm
 
         model = timm.create_model(
             model_id,
             pretrained=pretrained,
             num_classes=0,
-            img_size=self.input_size,
+            img_size=tuple(self.input_size),
             **self._backbone_kwargs,
         )
         prefix = getattr(model, "num_prefix_tokens", None)
@@ -186,6 +193,11 @@ class DINOEncoder(nn.Module):
                 f"{model_id} has {prefix} prefix tokens, config says {self.num_prefix_tokens} "
                 "(1 CLS + encoder.num_register_tokens)"
             )
+        # The LAST block always computes explicit softmax attention (so a hook can capture it).
+        # It must not depend on whether this call asks for the attention: under gradient
+        # checkpointing the backward pass recomputes the block, and a different attention path
+        # there than in the forward raises a CheckpointError. The other 11 blocks stay fused.
+        model.blocks[-1].attn.fused_attn = False
         # timm's RotaryEmbeddingDinoV3 ships with the coordinate augmentation off; make sure.
         rope = getattr(model, "rope", None)
         for name in ("shift_coords", "jitter_coords", "rescale_coords"):
@@ -206,7 +218,9 @@ class DINOEncoder(nn.Module):
                 model_id, dtype=torch.float32, attn_implementation="sdpa", **overrides
             )
         else:
-            config = DINOv3ViTConfig(**{**VITS_PLUS, "image_size": self.input_size, **overrides})
+            config = DINOv3ViTConfig(
+                **{**VITS_PLUS, "image_size": max(self.input_size), **overrides}
+            )
             config._attn_implementation = "sdpa"
             model = DINOv3ViTModel(config)
         registers = getattr(model.config, "num_register_tokens", 0)
@@ -215,10 +229,12 @@ class DINOEncoder(nn.Module):
                 f"{model_id} has {registers} register tokens, config says "
                 f"{self.num_prefix_tokens - 1} (encoder.num_register_tokens)"
             )
-        # Give the last block's attention its own config object so it can switch to the eager
-        # path (the only one that materializes attention weights) without slowing the other 11.
+        # Give the last block's attention its own config object and keep it on the eager path (the
+        # only one that materializes attention weights) for good, without slowing the other 11:
+        # under gradient checkpointing the recompute must take the same path as the forward.
         last = self._transformers_layers(model)[-1].attention
         last.config = copy.deepcopy(last.config)
+        last.config._attn_implementation = "eager"
         return model
 
     def _apply_lora(
@@ -264,7 +280,7 @@ class DINOEncoder(nn.Module):
         return names
 
     def _enable_grad_checkpointing(self, backbone: nn.Module) -> None:
-        """Recompute block activations in the backward pass (16 GB card, batch 32).
+        """Recompute block activations in the backward pass (16 GB card, 1,280 tokens, batch 16).
 
         Non-reentrant checkpointing only. The frozen patch embedding produces an input that
         does not require grad, and reentrant checkpointing skips the backward of a block whose
@@ -290,21 +306,33 @@ class DINOEncoder(nn.Module):
 
     @property
     def patch_grid(self) -> tuple[int, int]:
-        """`(gy, gx)` patch tokens for the configured input size."""
-        side = self.input_size // self.patch_size
-        return side, side
+        """`(gy, gx)` patch tokens for the configured input size: (32, 40) at 512 x 640."""
+        return self.input_size[0] // self.patch_size, self.input_size[1] // self.patch_size
 
-    def _preprocess(self, image_linear: torch.Tensor) -> torch.Tensor:
-        """Linear RGB -> sRGB -> ImageNet mean/std, the only place DINO's input is built."""
-        if image_linear.ndim != 4 or image_linear.shape[1] != 3:
-            raise ValueError(f"image must be (B, 3, H, W), got {tuple(image_linear.shape)}")
-        if image_linear.shape[2:] != (self.input_size, self.input_size):
+    def _normalize(self, image: torch.Tensor) -> torch.Tensor:
+        return (image - self.imagenet_mean.to(image.dtype)) / self.imagenet_std.to(image.dtype)
+
+    def _check_size(self, image: torch.Tensor) -> None:
+        if tuple(image.shape[2:]) != self.input_size:
+            h, w = self.input_size
             raise ValueError(
-                f"encoder input must be {self.input_size}x{self.input_size}, got "
-                f"{tuple(image_linear.shape[2:])}: area-downsample it first"
+                f"encoder input must be {h}x{w} (H x W), got "
+                f"{image.shape[2]}x{image.shape[3]}: area-downsample it first"
             )
-        srgb = linear_to_srgb(image_linear.clamp(0.0, 1.0))
-        return (srgb - self.imagenet_mean.to(srgb.dtype)) / self.imagenet_std.to(srgb.dtype)
+
+    def _preprocess_thermal(self, thermal: torch.Tensor) -> torch.Tensor:
+        """Thermal -> three channels -> ImageNet mean/std. No sRGB: thermal is not light."""
+        if thermal.ndim != 4 or thermal.shape[1] != 1:
+            raise ValueError(f"thermal must be (B, 1, H, W), got {tuple(thermal.shape)}")
+        self._check_size(thermal)
+        return self._normalize(thermal.clamp(0.0, 1.0).expand(-1, 3, -1, -1))
+
+    def _preprocess_rgb(self, image_linear: torch.Tensor) -> torch.Tensor:
+        """Linear RGB -> sRGB -> ImageNet mean/std: the L_align target's input (DINO saw sRGB)."""
+        if image_linear.ndim != 4 or image_linear.shape[1] != 3:
+            raise ValueError(f"RGB image must be (B, 3, H, W), got {tuple(image_linear.shape)}")
+        self._check_size(image_linear)
+        return self._normalize(linear_to_srgb(image_linear.clamp(0.0, 1.0)))
 
     def _base_model(self) -> nn.Module:
         """The wrapped backbone itself (LoRA layers are substituted in place inside it)."""
@@ -319,41 +347,30 @@ class DINOEncoder(nn.Module):
 
     @contextmanager
     def _capture_attention(self) -> Iterator[dict[str, torch.Tensor]]:
-        """Make the last block compute explicit softmax attention, and capture it.
+        """Capture the last block's softmax attention with a hook.
 
-        Both backends default to a fused kernel that never materializes the attention matrix.
-        This switches the LAST block only (the other 11 keep the fast path) and restores it
-        afterwards, so `return_attn=False` costs nothing.
+        The last block computes explicit attention whether or not it is captured (set at load time:
+        a fused kernel never materializes the matrix, and the path must not change between a
+        forward and its checkpoint recompute), so asking for the attention only adds the hook.
         """
         captured: dict[str, torch.Tensor] = {}
         model = self._base_model()
         if self.backend == "timm":
-            attn = model.blocks[-1].attn
-            previous, attn.fused_attn = attn.fused_attn, False
 
             def pre_hook(_module, args):  # args[0] is the softmaxed attention
                 captured["attn"] = args[0]
 
-            handle = attn.attn_drop.register_forward_pre_hook(pre_hook)
-            try:
-                yield captured
-            finally:
-                handle.remove()
-                attn.fused_attn = previous
+            handle = model.blocks[-1].attn.attn_drop.register_forward_pre_hook(pre_hook)
         else:
-            attn = self._transformers_layers(model)[-1].attention
-            previous = attn.config._attn_implementation
-            attn.config._attn_implementation = "eager"
 
             def hook(_module, _args, output):  # (attn_output, attn_weights)
                 captured["attn"] = output[1]
 
-            handle = attn.register_forward_hook(hook)
-            try:
-                yield captured
-            finally:
-                handle.remove()
-                attn.config._attn_implementation = previous
+            handle = self._transformers_layers(model)[-1].attention.register_forward_hook(hook)
+        try:
+            yield captured
+        finally:
+            handle.remove()
 
     def _patch_attention(self, full_attn: torch.Tensor) -> torch.Tensor:
         """`(B, heads, T, T)` -> `(B, N, N)`: drop the prefix, average heads, renormalize rows.
@@ -370,27 +387,7 @@ class DINOEncoder(nn.Module):
         attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=torch.finfo(torch.float32).tiny)
         return attn.detach() if self.detach_attn else attn
 
-    def forward(
-        self,
-        image_linear: torch.Tensor,
-        return_attn: bool = False,
-    ) -> EncoderOutput:
-        """Extract patch features (and optionally attention) from a linear-RGB image.
-
-        Converts to sRGB and applies ImageNet mean/std internally, because DINO is pretrained
-        on sRGB. Callers pass linear RGB like everywhere else in the pipeline
-        (docs/conventions.md section 1).
-
-        Args:
-            image_linear: (B, 3, 256, 256) linear RGB in [0, 1], already resized by the caller.
-            return_attn: Also return the last-layer patch-to-patch attention, head-averaged,
-                with CLS and register rows/columns stripped (needs an eager attention path).
-
-        Returns:
-            EncoderOutput with patch_tokens (B, 256, 384), cls_token (B, 384) and
-            patch_attn (B, 256, 256) or None.
-        """
-        pixel_values = self._preprocess(image_linear)
+    def _run(self, pixel_values: torch.Tensor, return_attn: bool) -> EncoderOutput:
         if return_attn:
             with self._capture_attention() as captured:
                 tokens = self._tokens(pixel_values)
@@ -401,34 +398,59 @@ class DINOEncoder(nn.Module):
         prefix = self.num_prefix_tokens
         return EncoderOutput(tokens[:, prefix:], tokens[:, 0], patch_attn)
 
+    def forward(
+        self,
+        thermal: torch.Tensor,
+        return_attn: bool = False,
+    ) -> EncoderOutput:
+        """Extract patch features (and optionally attention) from a thermal frame.
+
+        Args:
+            thermal: (B, 1, H, W) = code / 255 in [0, 1] at `input_size`, already resized by the
+                caller (area averaging). Copied to 3 channels, ImageNet mean/std; no sRGB.
+            return_attn: Also return the last-layer patch-to-patch attention, head-averaged,
+                with CLS and register rows/columns stripped.
+
+        Returns:
+            EncoderOutput with patch_tokens (B, N, 384), cls_token (B, 384) and
+            patch_attn (B, N, N) or None.
+        """
+        return self._run(self._preprocess_thermal(thermal), return_attn)
+
     def forward_frozen(
         self,
         image_linear: torch.Tensor,
         return_attn: bool = False,
     ) -> EncoderOutput:
-        """Same network with the LoRA adapters disabled: the pretrained features.
+        """The paired RGB through the same network with the LoRA adapters disabled.
 
-        This is the L_align target. No gradients.
+        The pretrained features of the daylight image are the L_align target. DINO is pretrained
+        on sRGB, so the linear RGB is converted to sRGB plus ImageNet mean/std here and callers
+        never pre-convert (docs/conventions.md section 1). No gradients.
+
+        Args:
+            image_linear: (B, 3, H, W) linear RGB in [0, 1] at `input_size`.
         """
+        pixel_values = self._preprocess_rgb(image_linear)
         with torch.no_grad(), self.backbone.disable_adapter():
-            return self.forward(image_linear, return_attn)
+            return self._run(pixel_values, return_attn)
 
     def encode(
         self,
-        image_linear: torch.Tensor,
+        thermal: torch.Tensor,
         return_attn: bool = True,
     ) -> dict[str, torch.Tensor]:
         """The conditioning bundle the flow stage consumes (module docstring).
 
         Args:
-            image_linear: (B, 3, 256, 256) linear RGB night image in [0, 1].
+            thermal: (B, 1, H, W) thermal in [0, 1] at `input_size`.
             return_attn: Compute `attn_bias`. `False` leaves it out of the dict.
 
         Returns:
             dict with 'patch_tokens' (B, N, C), 'patch_map' (B, C, gy, gx), 'cls' (B, C),
-            'thumb' (B, 3, gy, gx) and, if asked for, 'attn_bias' (B, 1, N, N).
+            'thumb' (B, 1, gy, gx) and, if asked for, 'attn_bias' (B, 1, N, N).
         """
-        out = self.forward(image_linear, return_attn=return_attn)
+        out = self.forward(thermal, return_attn=return_attn)
         grid_h, grid_w = self.patch_grid
         batch, num_patches, channels = out.patch_tokens.shape
         if num_patches != grid_h * grid_w:
@@ -437,38 +459,36 @@ class DINOEncoder(nn.Module):
             "patch_tokens": out.patch_tokens,
             "patch_map": out.patch_tokens.transpose(1, 2).reshape(batch, channels, grid_h, grid_w),
             "cls": out.cls_token,
-            "thumb": self.thumbnail(image_linear),
+            "thumb": self.thumbnail(thermal),
         }
         if out.patch_attn is not None:
             bundle["attn_bias"] = attention_to_bias(out.patch_attn)
         return bundle
 
-    def thumbnail(self, image_linear: torch.Tensor) -> torch.Tensor:
-        """`log(area_downsample(image, patch_grid) + 1e-3)`, `(B, 3, gy, gx)`.
+    def thumbnail(self, thermal: torch.Tensor) -> torch.Tensor:
+        """`area_downsample(thermal, patch_grid)`, `(B, 1, gy, gx)`: one value per patch.
 
-        Area averaging is the project's only downsample (docs/conventions.md section 4a); at
-        256 -> 16 it is exactly a 16x16 average pool. The log is what makes a lamp and a dark
-        road comparable numbers. Autocast is switched off: averaging a dark night frame in
-        bf16 loses the small values the log is there to resolve.
+        Area averaging is the project's only downsample (docs/conventions.md section 4a). One
+        channel, no log: thermal is not photon-starved. Autocast is switched off so the average
+        is exact.
         """
-        linear = image_linear.to(torch.float32).clamp(0.0, 1.0)
-        with torch.autocast(device_type=linear.device.type, enabled=False):
-            small = area_downsample(linear, self.patch_grid)
-        return torch.log(small + THUMB_FLOOR)
+        thermal = thermal.to(torch.float32).clamp(0.0, 1.0)
+        with torch.autocast(device_type=thermal.device.type, enabled=False):
+            return area_downsample(thermal, self.patch_grid)
 
-    def last_layer_attention(self, image_linear: torch.Tensor) -> torch.Tensor:
+    def last_layer_attention(self, thermal: torch.Tensor) -> torch.Tensor:
         """Raw per-head attention of the last block, `(B, heads, T, T)`, `T = prefix + N`.
 
         Rows sum to 1 here; `forward(return_attn=True)` is this, sliced to patches, averaged
         over heads and renormalized. Exposed for tests and for attention visualizations.
         """
-        pixel_values = self._preprocess(image_linear)
+        pixel_values = self._preprocess_thermal(thermal)
         with self._capture_attention() as captured:
             self._tokens(pixel_values)
         return captured["attn"]
 
     def num_trainable_params(self) -> int:
-        """Return count of trainable parameters (~0.2M: rank 8 on qkv + proj, 12 blocks)."""
+        """Return count of trainable parameters (0.22M: rank 8 on qkv + proj, 12 blocks)."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
@@ -482,3 +502,11 @@ def attention_to_bias(patch_attn: torch.Tensor, floor: float = ATTN_FLOOR) -> to
     if patch_attn.ndim != 3:
         raise ValueError(f"patch_attn must be (B, N, N), got {tuple(patch_attn.shape)}")
     return torch.log(patch_attn.to(torch.float32) + floor).unsqueeze(1)
+
+
+def _as_size(size: tuple[int, int] | list[int] | int) -> tuple[int, int]:
+    """`(H, W)` from a pair, or a square from one int."""
+    if isinstance(size, int):
+        return size, size
+    height, width = size
+    return int(height), int(width)

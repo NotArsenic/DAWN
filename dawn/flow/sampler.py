@@ -1,30 +1,32 @@
 """ODE sampler for flow matching inference.
 
-Samples grid coefficients by integrating the velocity field from t=0 to t=1.
+Samples tokens by integrating the velocity field from t=0 to t=1.
 Uses Euler or midpoint method with 1-2 function evaluations (NFE).
 
-Works in STANDARDIZED grid space, (B, 12, K, gy, gx): the result must go through
-`unstandardize` once before slicing (docs/conventions.md section 5). `sample_grid` does that
-and hands back a RAW grid, which is what every pixel-side function expects.
+Works in STANDARDIZED token space, (B, N, D): the result must go through `unstandardize` once
+before rendering (docs/conventions.md section 5). `sample_parts` does that, unpacks the tokens
+with the layout and hands back RAW parts, which is what `render` expects.
 
 NFE is the number of velocity evaluations, not the number of integration steps: Euler spends
 one per step and midpoint two, so "2 NFE" is two Euler steps but a SINGLE midpoint step. Both
 cost the same and that is the comparison worth logging.
 
-The encoder runs once, outside the loop: `sample_grid` takes conditioning that is already
-computed and keeps it fixed across steps and across the K ensemble members.
+The encoder runs once, outside the loop: `sample_parts` takes conditioning that is already
+computed and keeps it fixed across steps and across the K ensemble members. The noise of an image
+can come from its ID (`noise_for_ids`), so validation curves are comparable across runs and
+independent of how the loader batches.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Callable, Literal
 
 import torch
 
-from dawn.grid.guidance import compute_guidance
-from dawn.grid.layout import NUM_COEFFS
+from dawn.data.seeding import generator_for
+from dawn.flow.tokens import TokenLayout
 from dawn.grid.normalize import unstandardize
-from dawn.grid.slice import apply_affine, slice_grid
 
 Method = Literal["euler", "midpoint"]
 EVALS_PER_STEP = {"euler": 1, "midpoint": 2}
@@ -42,11 +44,11 @@ def euler_sample(
 
     Args:
         velocity_fn: Callable(z_t, t) -> v. Should capture conditioning internally.
-        z_0: (B, 12, K, gy, gx) initial noise sample.
+        z_0: (B, N, D) initial noise sample.
         num_steps: Number of Euler steps (NFE = num_steps).
 
     Returns:
-        z_1: (B, 12, K, gy, gx) predicted grid coefficients, standardized.
+        z_1: (B, N, D) predicted tokens, standardized.
     """
     dt = 1.0 / num_steps
     z_t = z_0.clone()
@@ -67,11 +69,11 @@ def midpoint_sample(
 
     Args:
         velocity_fn: Callable(z_t, t) -> v.
-        z_0: (B, 12, K, gy, gx) initial noise.
+        z_0: (B, N, D) initial noise.
         num_steps: Number of midpoint steps.
 
     Returns:
-        z_1: (B, 12, K, gy, gx) predicted grid coefficients, standardized.
+        z_1: (B, N, D) predicted tokens, standardized.
     """
     dt = 1.0 / num_steps
     z_t = z_0.clone()
@@ -128,26 +130,46 @@ def integrate(
 
     Args:
         velocity_fn: Callable(z_t, t) -> v, conditioning captured.
-        z_0: (B, 12, K, gy, gx) standardized noise.
+        z_0: (B, N, D) standardized noise.
         method: "euler" or "midpoint".
         nfe: Velocity evaluations (see the module docstring).
 
     Returns:
-        z_1: (B, 12, K, gy, gx), still standardized.
+        z_1: (B, N, D), still standardized.
     """
     return SAMPLERS[method](velocity_fn, z_0, steps_for_nfe(method, nfe))
 
 
+def noise_for_ids(
+    image_ids: Sequence[str],
+    num_tokens: int,
+    dim: int,
+    salt: str = "val_z0",
+    sample: int = 0,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """`(B, N, D)` standard normal noise, image `i` drawn from `generator_for(id_i, salt)`.
+
+    The same ID gives the same noise on any machine, in any batch composition and order
+    (docs/conventions.md section 10.3). Ensemble member `sample > 0` adds its index to the salts;
+    member 0 is exactly `generator_for(id, salt)`.
+    """
+    salts = (salt,) if sample == 0 else (salt, sample)
+    noise = [
+        torch.randn(num_tokens, dim, generator=generator_for(image_id, *salts))
+        for image_id in image_ids
+    ]
+    return torch.stack(noise).to(device)
+
+
 @torch.no_grad()
-def sample_grid(
+def sample_parts(
     velocity_model,
     dino_features: torch.Tensor,
+    layout: TokenLayout,
     mean: torch.Tensor,
     std: torch.Tensor,
     *,
-    grid_h: int = 16,
-    grid_w: int = 16,
-    num_bins: int = 8,
     dino_attn: torch.Tensor | None = None,
     attn_bias: torch.Tensor | None = None,
     thumb: torch.Tensor | None = None,
@@ -155,31 +177,34 @@ def sample_grid(
     nfe: int = 2,
     num_samples: int = 1,
     generator: torch.Generator | None = None,
-) -> torch.Tensor:
-    """Sample RAW bilateral grids for a batch of already-encoded images.
+    image_ids: Sequence[str] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Sample RAW parts for a batch of already-encoded images.
 
     The encoder has run before this call and its outputs are reused for every step and every
     ensemble member, so the cost is `nfe * num_samples` velocity passes and no DINO passes.
-    The K members are stacked into one batch and integrated together.
+    The K members are stacked into one batch and integrated together; the tokens are
+    unstandardized ONCE, at the end.
 
     Args:
         velocity_model: `VelocityTransformer` (or anything with the same call signature).
         dino_features: (B, N, C) patch tokens.
-        mean: (12, K) grid stats, from the checkpoint.
-        std: (12, K) grid stats, from the checkpoint.
-        grid_h: gy.
-        grid_w: gx.
-        num_bins: K.
+        layout: The token layout, to unpack the sampled tokens.
+        mean: (D,) stats, from the checkpoint.
+        std: (D,) stats, from the checkpoint.
         dino_attn: (B, N, N) head-averaged attention, or None.
         attn_bias: (B, 1, N, N) the same thing already in log space, or None.
-        thumb: (B, 3, gy, gx) log thumbnail, or None.
+        thumb: (B, 1, gy, gx) thermal thumbnail, or None.
         method: "euler" or "midpoint".
         nfe: Velocity evaluations per sample.
         num_samples: K ensemble members, drawn from independent noise.
-        generator: RNG for z_0, so a sample can be reproduced.
+        generator: RNG for z_0, so a sample can be reproduced. Ignored with `image_ids`.
+        image_ids: One ID per image: z_0 is then drawn from `noise_for_ids` (member `s` of image
+            `i` from its ID), independent of the batch, for comparable validation curves.
 
     Returns:
-        grids: (num_samples, B, 12, K, gy, gx) RAW coefficients, ready for `slice_grid`.
+        raw parts, each with a leading `(num_samples, B)`: `grid (S, B, 2, K, gy, gx)`,
+        `ab (S, B, 2, hc, wc)` and, with the correction, `corr (S, B, 1, hc, wc)`.
     """
     if num_samples < 1:
         raise ValueError(f"num_samples must be at least 1, got {num_samples}")
@@ -197,52 +222,23 @@ def sample_grid(
         expand(attn_bias),
         expand(thumb),
     )
-    z_0 = torch.randn(
-        num_samples * batch,
-        NUM_COEFFS,
-        num_bins,
-        grid_h,
-        grid_w,
-        device=device,
-        dtype=dtype,
-        generator=generator,
-    )
+    shape = (layout.num_tokens, layout.dim)
+    if image_ids is not None:
+        if len(image_ids) != batch:
+            raise ValueError(f"{len(image_ids)} image_ids for a batch of {batch}")
+        z_0 = torch.cat(
+            [noise_for_ids(image_ids, *shape, sample=s, device=device) for s in range(num_samples)]
+        )
+    else:
+        z_0 = torch.randn(
+            num_samples * batch, *shape, device=device, dtype=dtype, generator=generator
+        )
 
     def velocity_fn(z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return velocity_model(z_t, t, features, attn, thumbs, bias).to(z_t.dtype)
 
     z_1 = integrate(velocity_fn, z_0, method=method, nfe=nfe)
-    raw = unstandardize(z_1, mean, std)
-    return raw.reshape(num_samples, batch, NUM_COEFFS, num_bins, grid_h, grid_w)
-
-
-@torch.no_grad()
-def render_spread(
-    grids: torch.Tensor,
-    image: torch.Tensor,
-    guidance: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply K sampled grids to one image and report the per-pixel mean and spread.
-
-    Flow sample diversity is the model's own statement about colour ambiguity: where the K
-    members disagree, the affine map was underdetermined by the night pixels. This is a
-    separate quantity from the sensor-noise propagation in `dawn.uncertainty`.
-
-    Args:
-        grids: (K, B, 12, bins, gy, gx) RAW grids, from `sample_grid`.
-        image: (B, 3, H, W) linear RGB the grids are applied to (the night image).
-        guidance: (B, 1, H, W); computed from `image` when omitted.
-
-    Returns:
-        mean: (B, 3, H, W) average enhanced image over the K samples.
-        spread: (B, 3, H, W) per-pixel standard deviation over the K samples (zero for K = 1).
-    """
-    if grids.ndim != 6:
-        raise ValueError(f"grids must be (K, B, 12, bins, gy, gx), got {tuple(grids.shape)}")
-    if guidance is None:
-        guidance = compute_guidance(image)
-    rendered = torch.stack(
-        [apply_affine(slice_grid(grid, guidance), image) for grid in grids.unbind(0)]
-    )
-    spread = rendered.std(dim=0, unbiased=False) if grids.shape[0] > 1 else torch.zeros_like(image)
-    return rendered.mean(dim=0), spread
+    parts = layout.unpack(unstandardize(z_1, mean, std))
+    return {
+        name: value.reshape(num_samples, batch, *value.shape[1:]) for name, value in parts.items()
+    }

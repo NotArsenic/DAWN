@@ -1,59 +1,21 @@
-"""Canonical bilateral-grid layout: constants and token reshapes.
+"""Brightness-grid coefficient order.
 
-Defined in docs/conventions.md (section 2); this module is its single implementation, so
-nothing else re-derives the coefficient order or the token reshape.
+Defined in docs/conventions.md (section 2); this module is its single implementation, so nothing
+else re-derives which channel is the gain. The token packing lives in `dawn/flow/tokens.py`,
+which imports these constants; grid code never imports from `flow/`.
 
-    Grid:   (B, 12, K, gy, gx)   coefficient, bin, cell row, cell column
-    Tokens: (B, gy*gx, K*12)     token n = y*gx + x, value v = k*12 + c
+    Grid:   (B, 2C, K, gy, gx)   coefficient, bin, cell row, cell column
+            output channel c has its gain at channel 2c and its offset at 2c + 1, so the brightness
+            grid (one output, C = 1) is (B, 2, K, gy, gx) with channel 0 = gain, 1 = offset.
 """
 
 from __future__ import annotations
 
-import torch
-from einops import rearrange
-
-NUM_COEFFS = 12
-
-# Coefficient order: out_i = sum_j M[i, j] * x_j + t_i.
-MATRIX = slice(0, 9)  # M[i, j] at 3*i + j (row-major, i = output channel)
-OFFSET = slice(9, 12)  # t[i] at 9 + i
-IDENTITY_COEFFS = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+GAIN = 0
+OFFSET = 1
+NUM_COEFFS = 2  # coefficients per output channel: out = gain * x + offset
 
 
-def grid_to_tokens(grid: torch.Tensor) -> torch.Tensor:
-    """Flatten a grid into velocity-transformer tokens.
-
-    Args:
-        grid: (B, 12, K, gy, gx), raw or standardized.
-
-    Returns:
-        tokens: (B, gy*gx, K*12).
-    """
-    return rearrange(grid, "b c k y x -> b (y x) (k c)")
-
-
-def tokens_to_grid(
-    tokens: torch.Tensor,
-    grid_h: int,
-    grid_w: int,
-    num_bins: int,
-) -> torch.Tensor:
-    """Inverse of `grid_to_tokens`.
-
-    Args:
-        tokens: (B, gy*gx, K*12).
-        grid_h: gy.
-        grid_w: gx.
-        num_bins: K.
-
-    Returns:
-        grid: (B, 12, K, gy, gx).
-    """
-    return rearrange(
-        tokens,
-        "b (y x) (k c) -> b c k y x",
-        y=grid_h,
-        x=grid_w,
-        k=num_bins,
-        c=NUM_COEFFS,
-    )
+def coeff_channels(output: int) -> tuple[int, int]:
+    """`(gain, offset)` channel indices of output channel `output` in a grid or coefficient map."""
+    return NUM_COEFFS * output + GAIN, NUM_COEFFS * output + OFFSET
