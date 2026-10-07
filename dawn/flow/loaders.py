@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from dawn.data import dronevehicle as dv
 from dawn.data.pairs import AlignedPairs, AugmentConfig
 from dawn.flow.targets import prepare_batch
+from dawn.progress import progress
 
 SUBSETS = ("box_aligned", "fallback")
 
@@ -117,7 +118,9 @@ def stats_batches(
     indices = np.unique(np.linspace(0, len(dataset) - 1, count).round().astype(int)).tolist()
     loader = DataLoader(Subset(dataset, indices), batch_size=8, num_workers=0)
     size = tuple(cfg["encoder"]["input_size"])
-    for raw in loader:
+    # This pass fits a grid per pair and runs before step 1 of every training run that misses the
+    # cache: minutes of silence otherwise (dawn/progress.py).
+    for raw in progress(loader, f"token stats ({count} pairs)"):
         yield prepare_batch(raw, size, cfg["pairs"], device)
 
 

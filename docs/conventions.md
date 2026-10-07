@@ -28,6 +28,7 @@ Notation: `B` batch, `H, W` image rows/columns, `K` brightness bins (8), `gy, gx
 | Colour bins | the 261 occupied cells of a 10-unit a\*b\* grid over the 8-bit sRGB gamut, sorted by a\* then b\* (§6) |
 | Render | `flow.render.render`: the one path from raw parts to L\*a\*b\* and linear RGB (§6.4) |
 | Flow time | `t = 0` noise, `t = 1` data |
+| Uncertainty | the spread of K samples, on rendered L\*a\*b\*: `l_std` in L\* units, `ab_std` = `sqrt(var(a*)+var(b*))` in a\*b\* units (§11) |
 
 ## 1. Color space
 
@@ -212,6 +213,7 @@ Both modes are differentiable with respect to `low`, which is how L_render reach
 | `soft_encode(ab)` / `patch_histograms(ab_map, mask, patch_size)` | `(...,2)` → `(...,Q)`; `(B,2,h,w)`, `(B,1,h,w)` → `(B,N,Q)` |
 | `euler_sample(velocity_fn, z_0, n)` | `(B,N,D)` → same, standardized |
 | `sample_parts(velocity_model, dino_features, layout, mean, std, …)` | `(B,N,384)`, `(D,)` stats → dict of **raw** parts, each with leading `(num_samples, B)` |
+| `spread_from_parts(parts, thermal, size, settings)` / `sample_with_spread(velocity_model, encoded, layout, mean, std, thermal, size, settings, …)` | parts with leading `(S,B)`, `(B,1,H,W)`, `(h,w)` → `SpreadResult`: `sample_rgb`, `rgb`, `lab` `(B,3,h,w)`, `l_std`, `ab_std` `(B,1,h,w)` in L\* and a\*b\* units, `num_samples` (§11) |
 | `area_downsample(img, (h, w))` | `(..., H, W)` float → `(..., h, w)`, same dtype and device |
 | `read_rgb8(path)` / `read_thermal8(path)` | JPEG path → `(3, 712, 840)` / `(1, 712, 840)` uint8 raw codes (thermal: one channel, after checking that a 3-channel file's channels are identical) |
 | `crop_border(img)` | `(..., 712, 840)` → `(..., 512, 640)` |
@@ -292,3 +294,14 @@ Every random draw that belongs to one image derives its seed from that image's I
 - Salts separate independent draws for the same image: the darkness level, the stage name. Use one rather than reusing a generator across purposes.
 - `generator_for(...)` returns a seeded `torch.Generator`. Pass it explicitly into every sampling call; never reseed the global RNG inside a dataset or a transform, which would make the result depend on how the loader happened to interleave workers.
 - A fresh draw is requested by passing no ID, not by passing a changing one.
+
+## 11. Uncertainty: the spread of K samples
+
+The flow is stochastic in `z_0`, so K draws for one frame give K renders. Their spread is the whole uncertainty story: there is no variance head, no analytic propagation and no calibration target in the model. `dawn/uncertainty/spread.py` is the only place it is computed.
+
+- **Both maps are CIELAB.** `l_std` is the standard deviation of `L*` across members, in `L*` units (the image spans 0–100). `ab_std` is `sqrt(var(a*) + var(b*))`, the RMS distance from the mean colour **in the a\*b\* plane**, in a\*b\* units, so it is a chroma distance on the same scale as a CIEDE2000 and can be ranked against one. Never report a per-channel a\* or b\* spread as "the colour uncertainty".
+- **The spread is on rendered L\*a\*b\*, never on tokens.** A token's variance says nothing about how much of it survives the grid slice and the colour upsampling, so the members are rendered and then reduced (Welford, so peak memory is two renders whatever K is).
+- **Unbiased (n − 1).** With `num_samples == 1` both maps are **zeros**, not NaN.
+- **A spread is a disagreement, not an error bar.** A region the model is confidently wrong about has a small spread. How well the two actually rank together is measured, not assumed: `dawn/eval/calibration.py` reports the rank correlation of each map against its realized error, and until that number exists the maps are "generated, not measured".
+- **One encoder pass.** `sample_parts` batches the K members, so K samples cost `nfe · K` velocity passes and **one** DINO pass. `sample_with_spread` is the composed path and the only thing inference and evaluation call.
+- The point estimate to **display** is one member (`sample_rgb`), not the ensemble mean (`rgb`): the mean of K colourings is smoother and less colourful, which is the averaging the flow exists to avoid. Score whichever the evaluation states.

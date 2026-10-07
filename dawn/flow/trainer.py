@@ -154,6 +154,143 @@ def cosine_warmup_schedule(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
+def one_cycle_schedule(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    pct_start: float = 0.2,
+    div_factor: float = 25.0,
+    final_div_factor: float = 1.0e4,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Smith's one cycle: cosine up to each group's configured LR, then cosine down to nearly 0.
+
+    The difference from `cosine_warmup_schedule` is not the shape of the tail but the length of
+    the ramp (20-30% of the run, against the 5% of `lr_warmup_steps`) and the floor it starts
+    from (`lr / div_factor`). A group's configured LR is the **peak**, not the plateau, so
+    `optim.lr` and `encoder.lora_lr` keep their ratio and neither is exceeded.
+
+    This is a **fixed-budget** schedule: the anneal lands at `total_steps`, and most of the gain
+    is in the last low-LR stretch, so a run stopped early gets a worse model than a shorter cycle
+    would have. Decide the budget before starting, do not early-stop a cycle.
+
+    Like `cosine_warmup_schedule` the factor clamps past `total_steps` rather than raising (what
+    `torch.optim.lr_scheduler.OneCycleLR` does), so an extra step on resume is not fatal.
+
+    Args:
+        optimizer: its groups' `lr` values are the per-group peaks.
+        total_steps: the whole budget, `flow.num_train_steps`.
+        pct_start: fraction of the budget spent ramping up.
+        div_factor: the ramp starts at `peak / div_factor`.
+        final_div_factor: the anneal ends at `peak / final_div_factor`.
+
+    Raises:
+        ValueError: `pct_start` is not in (0, 1), or a divisor is not positive.
+    """
+    if not 0.0 < pct_start < 1.0:
+        raise ValueError(f"one_cycle.pct_start must be in (0, 1), got {pct_start}")
+    if div_factor <= 0 or final_div_factor <= 0:
+        raise ValueError("one_cycle div factors must be positive")
+    warm = max(1, int(round(pct_start * total_steps)))
+    start, end = 1.0 / div_factor, 1.0 / final_div_factor
+
+    def factor(step: int) -> float:
+        if step < warm:
+            progress = step / warm
+            return start + (1 - start) * 0.5 * (1 - math.cos(math.pi * progress))
+        span = max(1, total_steps - warm)
+        progress = min(1.0, (step - warm) / span)
+        return end + (1 - end) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+class MomentumCycler:
+    """The other half of one cycle: AdamW's beta1, cycled opposite to the learning rate.
+
+    High momentum while the LR is small, low momentum while it is large, so the two never push
+    hard at once. Stepped beside the LR scheduler; a no-op when `enabled` is false, which is the
+    default for the plain cosine schedule.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        total_steps: int,
+        pct_start: float = 0.2,
+        max_beta1: float = 0.95,
+        min_beta1: float = 0.85,
+        enabled: bool = True,
+    ):
+        self.optimizer = optimizer
+        self.total_steps = int(total_steps)
+        self.warm = max(1, int(round(pct_start * total_steps)))
+        self.max_beta1, self.min_beta1 = float(max_beta1), float(min_beta1)
+        self.enabled = bool(enabled)
+        self.step_count = 0
+        if self.enabled:
+            self._apply(self.max_beta1)
+
+    def _apply(self, beta1: float) -> None:
+        for group in self.optimizer.param_groups:
+            if "betas" in group:
+                group["betas"] = (beta1, group["betas"][1])
+
+    def beta1(self, step: int) -> float:
+        if step < self.warm:
+            progress = step / self.warm
+            span = self.max_beta1 - self.min_beta1
+            return self.max_beta1 - span * 0.5 * (1 - math.cos(math.pi * progress))
+        span_steps = max(1, self.total_steps - self.warm)
+        progress = min(1.0, (step - self.warm) / span_steps)
+        span = self.max_beta1 - self.min_beta1
+        return self.min_beta1 + span * 0.5 * (1 - math.cos(math.pi * progress))
+
+    def step(self) -> None:
+        self.step_count += 1
+        if self.enabled:
+            self._apply(self.beta1(self.step_count))
+
+    def state_dict(self) -> dict:
+        return {"step_count": self.step_count, "enabled": self.enabled}
+
+    def load_state_dict(self, state: Mapping) -> None:
+        self.step_count = int(state["step_count"])
+        self.enabled = bool(state.get("enabled", self.enabled))
+        if self.enabled:
+            self._apply(self.beta1(self.step_count))
+
+
+def build_schedule(
+    optimizer: torch.optim.Optimizer, cfg: Mapping
+) -> tuple[torch.optim.lr_scheduler.LambdaLR, MomentumCycler]:
+    """The LR schedule and its momentum cycler, from `optim.schedule` (`cosine` | `one_cycle`)."""
+    optim, flow = cfg["optim"], cfg["flow"]
+    total = int(flow["num_train_steps"])
+    name = str(optim.get("schedule", "cosine"))
+    if name == "cosine":
+        scheduler = cosine_warmup_schedule(optimizer, int(optim.get("lr_warmup_steps", 0)), total)
+        return scheduler, MomentumCycler(optimizer, total, enabled=False)
+    if name == "one_cycle":
+        one = dict(optim.get("one_cycle", {}) or {})
+        pct_start = float(one.get("pct_start", 0.2))
+        scheduler = one_cycle_schedule(
+            optimizer,
+            total,
+            pct_start=pct_start,
+            div_factor=float(one.get("div_factor", 25.0)),
+            final_div_factor=float(one.get("final_div_factor", 1.0e4)),
+        )
+        cycler = MomentumCycler(
+            optimizer,
+            total,
+            pct_start=pct_start,
+            max_beta1=float(one.get("max_beta1", 0.95)),
+            min_beta1=float(one.get("min_beta1", 0.85)),
+            enabled=bool(one.get("cycle_momentum", True)),
+        )
+        return scheduler, cycler
+    raise ValueError(f"optim.schedule must be 'cosine' or 'one_cycle', got {name!r}")
+
+
 def build_models(
     cfg: Mapping, layout: TokenLayout, device: torch.device
 ) -> tuple[DINOEncoder, VelocityTransformer, ColorHead]:
@@ -215,6 +352,8 @@ class FlowTrainer:
         self.bin_count_weighting = bool(flow["bin_count_weighting"])
         self.timesteps_per_image = int(flow["timesteps_per_image"])
         self.warmup_steps = int(flow["warmup_steps"])
+        self.num_train_steps = int(flow["num_train_steps"])
+        self._warn_if_warmup_eats_the_run()
         self.render_subset = flow.get("render_subset") or None
         self.inference_nfe = int(flow["num_inference_steps"])
         self.grad_clip = float(optim["grad_clip"])
@@ -237,11 +376,7 @@ class FlowTrainer:
             ),
             betas=tuple(optim["betas"]),
         )
-        self.scheduler = cosine_warmup_schedule(
-            self.optimizer,
-            int(optim.get("lr_warmup_steps", 0)),
-            int(flow["num_train_steps"]),
-        )
+        self.scheduler, self.momentum = build_schedule(self.optimizer, cfg)
         self.ema = EMA(self.trainable_parameters(), decay=float(optim["ema_decay"]))
         self.step = 0
 
@@ -271,6 +406,32 @@ class FlowTrainer:
         if render[0] > self.input_size[0] or render[1] > self.input_size[1]:
             raise ValueError(
                 f"flow.render_size {render} is larger than encoder.input_size {self.input_size}"
+            )
+
+    def _warn_if_warmup_eats_the_run(self) -> None:
+        """A budget near its own warmup is almost never the run someone meant to start.
+
+        The way in is raising `optim.batch_size` without rescaling the step counts: the 3,662
+        train pairs over a batch of 128 are 29 steps an epoch, so a 100-epoch budget is 2,900
+        steps, under `flow.warmup_steps`. The conditioning detach would then never lift and the
+        velocity net would train on frozen features for the whole run -- a wrong result that
+        looks like a healthy one (docs/training_budget_and_changes.md section 1).
+
+        A warning, not an error: short deliberate runs (the overfit and debug overlays) scale
+        `warmup_steps` down with the budget and are fine.
+        """
+        total, warmup = int(self.num_train_steps), int(self.warmup_steps)
+        if warmup and total < warmup * 2:
+            verdict = (
+                "the detach NEVER lifts" if total <= warmup else "under half the run trains jointly"
+            )
+            logger.warning(
+                "flow.num_train_steps (%d) is close to flow.warmup_steps (%d): %s. If you raised "
+                "optim.batch_size, rescale the step counts with it "
+                "(docs/training_budget_and_changes.md).",
+                total,
+                warmup,
+                verdict,
             )
 
     def set_stats(self, stats: Mapping[str, Mapping[str, torch.Tensor]]) -> None:
@@ -427,6 +588,7 @@ class FlowTrainer:
         )
         self.optimizer.step()
         self.scheduler.step()
+        self.momentum.step()
         self.ema.update()
         self.step += 1
 
@@ -435,6 +597,8 @@ class FlowTrainer:
         out["detach_cond"] = float(info["detach_cond"])
         for group in self.optimizer.param_groups:
             out[f"lr_{group['name'].split('_')[0]}"] = float(group["lr"])
+        if self.momentum.enabled:
+            out["beta1"] = float(self.optimizer.param_groups[0]["betas"][0])
         return out
 
     def _render_index(self, total: int) -> torch.Tensor:
@@ -545,6 +709,7 @@ class FlowTrainer:
             "lora": {k: v for k, v in self.encoder.state_dict().items() if "lora_" in k},
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
+            "momentum": self.momentum.state_dict(),
             "ema": self.ema.state_dict(),
         }
 
@@ -572,6 +737,8 @@ class FlowTrainer:
             raise ValueError("checkpoint is missing LoRA weights this encoder expects")
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
+        if "momentum" in state:
+            self.momentum.load_state_dict(state["momentum"])
         self.ema.load_state_dict(state["ema"])
 
     def save_checkpoint(self, path: str | Path) -> Path:
@@ -608,7 +775,10 @@ def _plain(value):
 __all__ = [
     "EMA",
     "FlowTrainer",
+    "MomentumCycler",
     "build_models",
+    "build_schedule",
     "cosine_warmup_schedule",
+    "one_cycle_schedule",
     "split_param_groups",
 ]

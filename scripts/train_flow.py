@@ -38,6 +38,7 @@ from dawn.flow.loaders import build_loaders, cycle, load_config, stats_batches  
 from dawn.flow.targets import FitSettings, compute_token_stats, load_or_compute_stats  # noqa: E402
 from dawn.flow.tokens import TokenLayout  # noqa: E402
 from dawn.flow.trainer import FlowTrainer  # noqa: E402
+from dawn.progress import format_duration  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -61,6 +62,40 @@ class WandbRun:
     def log(self, values: dict, step: int) -> None:
         if self.run is not None:
             self.run.log(values, step=step)
+
+    SCOPES = {"none": (), "velocity": ("velocity",), "all": ("velocity", "encoder", "color_head")}
+
+    def watch(self, trainer, cfg) -> None:
+        """Weight and gradient histograms through `wandb.watch`'s hooks.
+
+        `wandb.watch` takes whole modules, not parameters, so the scope is the unit of choice:
+
+            velocity  the 7M-parameter net that learns the field. The default.
+            all       plus the encoder and the colour head. The encoder is 29M parameters of
+                      FROZEN DINO backbone around ~0.5M of LoRA, and watching it means hooking
+                      all of them; use it to debug LoRA, not for a normal run.
+            none      off.
+
+        `watch_freq` throttles the logging, not the hooks: those run on every backward pass
+        whatever it says, which is why the scope matters more than the frequency.
+
+        Raises:
+            ValueError: `logging.watch_scope` is not one of the three.
+        """
+        scope = str(cfg["logging"].get("watch_scope", "none"))
+        if scope not in self.SCOPES:
+            raise ValueError(
+                f"logging.watch_scope must be one of {sorted(self.SCOPES)}, got {scope!r}"
+            )
+        if self.run is None or scope == "none":
+            return
+        import wandb
+
+        freq = int(cfg["logging"].get("watch_freq", 500))
+        wandb.watch(
+            [getattr(trainer, name) for name in self.SCOPES[scope]], log="all", log_freq=freq
+        )
+        logger.info("  wandb.watch: %s, histograms every %d steps", scope, freq)
 
     def finish(self) -> None:
         if self.run is not None:
@@ -170,6 +205,7 @@ def main():
         logger.info("  Resumed from %s at step %d", args.resume, trainer.step)
 
     run, jsonl = WandbRun(cfg), JsonlLog(out_dir / "train_log.jsonl")
+    run.watch(trainer, cfg)
     log_cfg = cfg["logging"]
     total_steps = cfg["flow"]["num_train_steps"]
     headline = cfg["pairs"]["eval_subset"]  # which validation subset selects the best checkpoint
@@ -210,10 +246,15 @@ def main():
                     for name in sorted(losses)
                     if name.startswith("flow_")
                 )
+                # An ETA on every logged line, because a 20K-step run on a remote box is watched
+                # through `tail -f` and "is this finishing tonight?" should not need arithmetic.
+                left = (total_steps - step) * losses["sec_per_step"]
                 logger.info(
-                    "step %6d | total %.4f | flow %.4f (%s) | render %.4f | align %.4f | "
-                    "color %.4f | %.2fs",
+                    "step %6d/%d (%2.0f%%) | total %.4f | flow %.4f (%s) | render %.4f | "
+                    "align %.4f | color %.4f | %.2fs/step | ETA %s",
                     step,
+                    total_steps,
+                    100 * step / total_steps,
                     losses["total"],
                     losses["flow"],
                     segments,
@@ -221,6 +262,7 @@ def main():
                     losses["align"],
                     losses["color"],
                     losses["sec_per_step"],
+                    format_duration(left),
                 )
                 run.log(values, step=step)
                 jsonl.write(step, "train", losses)

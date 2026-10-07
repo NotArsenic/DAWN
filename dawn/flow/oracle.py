@@ -35,6 +35,7 @@ from dawn.flow.render import RenderSettings, render
 from dawn.flow.targets import FitSettings, build_targets, prepare_batch
 from dawn.flow.tokens import TokenLayout
 from dawn.grid.upsample import upsample_map
+from dawn.progress import progress
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,8 @@ def run_oracle(
     rows: list[dict] = []
     sweeps: dict[tuple, list[float]] = {}
     swept = 0
-    for batch_index, raw in enumerate(_loader(dataset, indices, batch_size, workers)):
+    loader = _loader(dataset, indices, batch_size, workers)
+    for batch_index, raw in enumerate(progress(loader, "oracle")):
         batch = prepare_batch(raw, size, cfg["pairs"], device)
         measured = measure_batch(batch, cfg)
         for n, image_id in enumerate(batch["image_id"]):

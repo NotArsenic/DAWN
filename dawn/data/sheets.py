@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import multiprocessing
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -36,15 +37,25 @@ def run_parallel(fn: Callable, jobs: Sequence, workers: int, desc: str = "") -> 
 
     Results come back in job order. Each worker runs torch single-threaded, so `workers` equal
     to the number of cores uses every core without oversubscribing them. `fn` and the jobs must
-    be picklable (a module-level function). Logs progress every 5% when `desc` is given.
+    be picklable (a module-level function). Logs progress with a rate and an ETA every 5% when
+    `desc` is given; always as lines, never a bar, because these passes are run once and their
+    output is the record of what was done (`dawn/progress.py`).
     """
+    from dawn.progress import eta_line, format_duration
+
     jobs = list(jobs)
     total, results = len(jobs), []
     every = max(1, total // 20)
+    start = time.perf_counter()
 
     def progress(done: int) -> None:
-        if desc and (done % every == 0 or done == total):
-            logger.info(f"{desc}: {done}/{total}")
+        if not desc:
+            return
+        elapsed = time.perf_counter() - start
+        if done == total:
+            logger.info(f"{desc}: {total} done in {format_duration(elapsed)}")
+        elif done % every == 0:
+            logger.info(eta_line(desc, done, total, elapsed))
 
     if workers <= 1 or total <= 1:
         for done, job in enumerate(jobs, 1):

@@ -130,6 +130,24 @@ optim:
   precision: bf16         # bf16 | fp32
   ema_decay: 0.999
   lr_warmup_steps: 1000   # linear LR warmup, then cosine decay over flow.num_train_steps
+  # cosine    | the plan's schedule: lr_warmup_steps of linear ramp, then cosine to 0.
+  # one_cycle | Smith's one cycle: a long cosine ramp to each group's `lr` as the PEAK, then
+  #             cosine down to lr / final_div_factor, with beta1 cycled the other way.
+  #             `lr_warmup_steps` is ignored; `one_cycle.pct_start` sets the ramp instead.
+  # A one cycle is a FIXED BUDGET: the anneal lands on flow.num_train_steps and most of the gain
+  # is in the last low-LR stretch, so do not early-stop one. Pick the budget in EPOCHS first
+  # (steps = epochs * len(train_pairs) / optim.batch_size) and set num_train_steps from it.
+  schedule: cosine
+  one_cycle:
+    # 0.2 of 20K steps peaks at 4,000: 1,000 steps after flow.warmup_steps hands LoRA its
+    # velocity gradients, so the features settle before the LR is hottest. Keep the peak after
+    # that gate if either number moves.
+    pct_start: 0.2
+    div_factor: 25.0        # the ramp starts at lr / 25
+    final_div_factor: 1.0e4 # the anneal ends at lr / 10,000
+    cycle_momentum: true    # beta1 max -> min -> max, opposite the LR
+    max_beta1: 0.95
+    min_beta1: 0.85
 
 # Dataloader.
 loader:
@@ -143,6 +161,12 @@ logging:
   wandb_mode: online      # online | offline | disabled
   log_every: 100
   log_attn_gates: true    # log each block's learned DINO-attention gate every log_every steps
+  # wandb.watch: weight and gradient histograms, through hooks on the parameters. wandb.watch
+  # takes whole MODULES, so watching the encoder means hooking all 29M frozen DINO parameters
+  # for the sake of the ~0.5M LoRA ones inside it: use `all` to debug LoRA, not for a real run.
+  #   none | velocity | all     (all = velocity + encoder + colour head)
+  watch_scope: velocity
+  watch_freq: 500         # throttles the LOGGING; the hooks fire on every backward either way
   save_every: 5000
   val_every: 2500
   num_val_samples: 64     # val pairs per subset (box-aligned, fallback) per validation
