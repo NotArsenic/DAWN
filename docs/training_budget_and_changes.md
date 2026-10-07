@@ -249,9 +249,10 @@ the inference/eval phase, plus the two training knobs above.
 
 | file | what it is |
 |---|---|
+| `dawn/progress.py` | progress reporting: a tqdm bar on a TTY, lines with rate and ETA in a log |
 | `dawn/uncertainty/spread.py` | sample-spread uncertainty: K rendered members → one image and two maps. `docs/conventions.md` §11 |
 | `dawn/flow/inference.py` | `load_checkpoint` → encoder (+LoRA), velocity net, layout, stats, render settings, sizes |
-| `tests/test_spread.py`, `test_inference_load.py`, `test_infer_script.py`, `test_schedule.py` | 47 tests |
+| `tests/test_spread.py`, `test_inference_load.py`, `test_infer_script.py`, `test_schedule.py`, `test_wandb_logging.py`, `test_progress.py` | 79 tests |
 
 ### Rewritten
 
@@ -259,7 +260,10 @@ the inference/eval phase, plus the two training knobs above.
   now runs the plan's inference path: read thermal → DINO once → K samples at 2 NFE → render each →
   reduce → write.
 - **`dawn/flow/trainer.py`** gained `one_cycle_schedule`, `MomentumCycler` and `build_schedule`.
-- **`scripts/train_flow.py`** gained `WandbRun.watch`.
+- **`scripts/train_flow.py`** gained `WandbRun.watch` and an ETA on every logged step.
+- **`dawn/flow/trainer.py`** warns when `num_train_steps` is within 2x of `warmup_steps` (§1).
+- **`dawn/data/sheets.py`** `run_parallel` gained a rate and an ETA; `dawn/flow/loaders.py` and
+  `dawn/flow/oracle.py` report progress on their previously silent passes.
 - **`configs/flow.yaml`** gained `optim.schedule`, `optim.one_cycle.*`, `logging.watch_scope`,
   `logging.watch_freq`.
 - **`docs/conventions.md`** gained §11 (uncertainty), an at-a-glance row and a §7 shapes row.
