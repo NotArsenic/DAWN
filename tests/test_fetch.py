@@ -225,3 +225,37 @@ def test_an_unreadable_jpeg_is_reported_rather_than_raising(tmp_path):
 
 def test_the_splits_are_the_three_the_dataset_ships():
     assert SPLITS == ("train", "val", "test")
+
+
+def test_one_corrupt_member_does_not_destroy_the_whole_extraction(tmp_path):
+    """`extractall` aborts the archive on the first bad CRC: a 14 GB unpack thrown away over
+    one unreadable JPEG out of 56,878. The pair it belongs to drops out later instead."""
+    archive = tmp_path / "train.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("train/trainimg/00001.jpg", "good")
+        handle.writestr("train/trainimgr/04991.jpg", "AAAACORRUPTMEAAAA")
+        handle.writestr("train/trainimg/00002.jpg", "also good")
+    # Flip a byte of the stored data so its CRC no longer matches -- a bad download.
+    raw = bytearray(archive.read_bytes())
+    raw[raw.index(b"CORRUPTME")] = ord("X")
+    archive.write_bytes(bytes(raw))
+
+    out = safe_extract(archive, tmp_path / "work")
+    assert (out / "train" / "trainimg" / "00001.jpg").exists(), "files before the bad one"
+    assert (out / "train" / "trainimg" / "00002.jpg").exists(), "and files after it"
+    assert not (out / "train" / "trainimgr" / "04991.jpg").exists()
+    assert "skipped train/trainimgr/04991.jpg" in (out / ".extracted").read_text(encoding="utf-8")
+
+
+def test_an_archive_that_is_corrupt_throughout_still_raises(tmp_path):
+    """One bad file is tolerable; a bad download is not, and must not look like success."""
+    archive = tmp_path / "train.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        for i in range(6):
+            handle.writestr(f"train/trainimg/{i:05d}.jpg", f"ROT{i}ROT")
+    raw = bytearray(archive.read_bytes())
+    for i in range(6):
+        raw[raw.index(f"ROT{i}ROT".encode())] = ord("Z")
+    archive.write_bytes(bytes(raw))
+    with pytest.raises(zipfile.BadZipFile, match="archive-level corruption"):
+        safe_extract(archive, tmp_path / "work", max_bad=2)

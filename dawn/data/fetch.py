@@ -39,6 +39,9 @@ SPLITS = ("train", "val", "test")
 FOLDER_SUFFIXES = ("img", "imgr", "label", "labelr")
 # What a correctly arranged split holds, roughly: 28,439 pairs over three splits.
 MIN_FILES_PER_FOLDER = 100
+# Corrupt members tolerated per archive before it counts as archive-level corruption rather
+# than one bad file. 56,878 images per the dataset card, so this is well under 0.1%.
+MAX_BAD_MEMBERS = 50
 ARRANGE_MODES = ("symlink", "copy", "move")
 
 
@@ -101,11 +104,25 @@ def safe_members(archive: zipfile.ZipFile, dest: Path) -> list[zipfile.ZipInfo]:
     return members
 
 
-def safe_extract(zip_path: Path, dest: Path, force: bool = False) -> Path:
+def safe_extract(
+    zip_path: Path, dest: Path, force: bool = False, max_bad: int = MAX_BAD_MEMBERS
+) -> Path:
     """Unpack one archive into its own directory under `dest`, with a completion marker.
 
     The marker (`.extracted`) is what makes re-running cheap: unpacking 14 GB again because a
     later step failed is an hour nobody has. `force` ignores it.
+
+    **A member with a bad CRC is skipped, not fatal.** `extractall` aborts the whole archive on
+    the first corrupt file, which threw away a 14 GB extraction over one unreadable JPEG out of
+    56,878. One missing frame costs nothing here -- its stem simply stops pairing across the
+    four folders, so `verify_split` reports it and the alignment stage drops that pair, out of
+    28,411. Whole-archive corruption is a different thing, so more than `max_bad` failures
+    still raises, and every skipped name is logged and written into the marker rather than
+    being quietly forgotten.
+
+    Raises:
+        zipfile.BadZipFile: more than `max_bad` members failed, i.e. the archive itself is bad
+            rather than one file in it.
     """
     out = dest / zip_path.stem
     marker = out / ".extracted"
@@ -114,9 +131,34 @@ def safe_extract(zip_path: Path, dest: Path, force: bool = False) -> Path:
         return out
     out.mkdir(parents=True, exist_ok=True)
     logger.info("extracting %s -> %s", zip_path.name, out)
+    bad: list[str] = []
     with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(out, members=safe_members(archive, out))
-    marker.write_text("ok\n", encoding="utf-8")
+        for member in safe_members(archive, out):
+            try:
+                archive.extract(member, out)
+            except (zipfile.BadZipFile, OSError) as error:
+                # The CRC is only checked once the member has been read to the end, so a
+                # truncated file is already on disk. Leaving it would be worse than leaving
+                # nothing: the stem would still pair across the four folders and the pipeline
+                # would decode a corrupt JPEG instead of dropping the pair.
+                partial = out / member.filename
+                partial.unlink(missing_ok=True)
+                bad.append(member.filename)
+                logger.warning("  skipping %s: %s", member.filename, error)
+                if len(bad) > max_bad:
+                    raise zipfile.BadZipFile(
+                        f"{zip_path.name}: {len(bad)} members failed to extract, the last "
+                        f"{member.filename!r}. That is archive-level corruption, not one bad "
+                        f"file: delete {zip_path} and re-run to download it again."
+                    ) from error
+    if bad:
+        logger.warning(
+            "%s: %d of its files were corrupt and were skipped; the pairs they belong to will "
+            "drop out at the alignment stage",
+            zip_path.name,
+            len(bad),
+        )
+    marker.write_text("ok\n" + "".join(f"skipped {name}\n" for name in bad), encoding="utf-8")
     return out
 
 
@@ -254,6 +296,7 @@ def verify(root: Path, splits: Sequence[str] = SPLITS, sample: int = 5) -> list[
 __all__ = [
     "ARRANGE_MODES",
     "FOLDER_SUFFIXES",
+    "MAX_BAD_MEMBERS",
     "MIN_FILES_PER_FOLDER",
     "REPO_ID",
     "SPLITS",
