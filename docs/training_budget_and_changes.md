@@ -244,10 +244,29 @@ is on.
 
 ---
 
-## 3. Weights & Biases: weight and gradient histograms
+## 3. Weights & Biases, and the local mirrors
 
-W&B itself was already wired (`WandbRun`, `logging.wandb_project`, `logging.wandb_mode`, and the
-per-step loss / LR / attention-gate logging). What is new is weight and gradient histograms:
+**Where this lives.** All of it is `dawn/runlog.py` — `WandbRun`, `JsonlLog`, `CsvLog`, `RunLog`
+and `write_run_config`. It started inside `scripts/train_flow.py` and moved out when
+`scripts/train_refiner.py` needed the same plumbing; `train_flow.py` re-exports the five names, so
+`from scripts.train_flow import RunLog` still resolves.
+
+### Which workspace a run goes to
+
+```yaml
+logging:
+  wandb_project: dawn     # stage 1. Stage 2 (the refiner) logs to dawn-refiner
+  wandb_entity: my-team # the W&B team or user; null omits it and uses the account default
+  wandb_mode: online      # online | offline | disabled
+```
+
+`wandb_entity: null`, `""` or no key at all means the `entity` kwarg is **not passed to
+`wandb.init` at all** — not `entity=None`, which some wandb versions treat differently. That is
+what lets a collaborator without access to `my-team` still run. The project and entity actually
+used are logged at INFO on init, so a run that silently went to the wrong workspace is visible in
+the log rather than only in the browser.
+
+### Weight and gradient histograms
 
 ```yaml
 logging:
@@ -268,8 +287,11 @@ parameters, so the scope is the only unit of choice available:
 | `all` | plus the encoder and the colour head. The encoder is 29M parameters of frozen DINO backbone wrapped around ~0.5M of LoRA, and watching it hooks all of them — for debugging LoRA, not for a real run |
 | `none` | off |
 
-A bad `watch_scope` raises at the start of the run rather than silently logging nothing for 20K
-steps, and it raises even when `wandb_mode` is `disabled`, so a typo cannot hide in a debug run.
+The scope map is a **parameter** of `watch`, defaulting to stage 1's `dawn.runlog.WATCH_SCOPES`;
+stage 2 passes its own, because `velocity` and `color_head` do not exist there. Two things raise
+at the start of the run rather than logging nothing for 20K steps, and both raise even when
+`wandb_mode` is `disabled` so a typo cannot hide in a debug run: a `watch_scope` that is not a key
+of the map, and a scope naming a module the trainer does not actually have.
 
 wandb is an optional dependency: if it is not installed, or `wandb_mode: disabled`, the run logs to
 the console and the local files below and nothing here fires. `tests/test_wandb_logging.py` covers
@@ -278,8 +300,8 @@ all of that with a fake `wandb` module, since CI has no real one.
 ### Every metric is also on disk
 
 W&B owns the live curves, but a plot has to be rebuildable months later by someone without the
-run. `RunLog` is now the single place a metric is recorded, and it writes three ways from one
-call, so they cannot drift:
+run. `RunLog` (`dawn/runlog.py`) is the single place a metric is recorded, and it writes three
+ways from one call, so they cannot drift:
 
 | file (under `--out-dir`) | what it holds |
 |---|---|

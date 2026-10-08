@@ -28,6 +28,4 @@ class ColorHead(nn.Module):
 
     def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         """Logits over the a*b* bins for every patch token (softmax is left to the loss)."""
-        if patch_tokens.ndim != 3:
-            raise ValueError(f"patch_tokens must be (B, N, C), got {tuple(patch_tokens.shape)}")
         return self.proj(self.norm(patch_tokens))

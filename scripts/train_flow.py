@@ -13,17 +13,15 @@ Usage:
     python scripts/train_flow.py --config configs/flow.yaml \
         --override configs/gpu_probe.yaml --device cuda --max-steps 50   # VRAM + sec/step probe
 
-The loop itself lives in `dawn.flow.trainer`; this file is configuration, logging and checkpoint
+The loop itself lives in `dawn.flow.trainer` and the run records (W&B, train_log.jsonl,
+metrics/<kind>.csv) in `dawn.runlog`; this file is configuration, logging and checkpoint
 plumbing. Token layout, raw vs standardized and the pixel masks: docs/conventions.md.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import logging
-import os
 import statistics
 import sys
 import time
@@ -42,6 +40,11 @@ from dawn.flow.tokens import TokenLayout  # noqa: E402
 from dawn.flow.trainer import FlowTrainer, budget_summary  # noqa: E402
 from dawn.progress import format_duration  # noqa: E402
 
+# The run-logging plumbing moved to dawn.runlog when stage 2 needed the same three records (W&B,
+# train_log.jsonl, metrics/<kind>.csv). Re-exported so `from scripts.train_flow import RunLog`
+# keeps resolving. `RunLog.watch` defaults to stage 1's scope map, so the call site is unchanged.
+from dawn.runlog import CsvLog, JsonlLog, RunLog, WandbRun, write_run_config  # noqa: E402, F401
+
 # How `logging.select_metric` picks the best checkpoint: (validation key, higher is better).
 SELECTION = {
     "ciede2000": ("ciede2000/euler", False),
@@ -50,150 +53,6 @@ SELECTION = {
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
-
-
-class WandbRun:
-    """wandb if it is installed and `logging.wandb_mode` is not 'disabled'; else a no-op."""
-
-    def __init__(self, cfg):
-        self.run = None
-        mode = cfg["logging"]["wandb_mode"]
-        if mode == "disabled":
-            return
-        try:
-            import wandb
-        except ImportError:
-            logger.warning("wandb is not installed; logging to the console only")
-            return
-        self.run = wandb.init(project=cfg["logging"]["wandb_project"], mode=mode, config=cfg)
-
-    def log(self, values: dict, step: int) -> None:
-        if self.run is not None:
-            self.run.log(values, step=step)
-
-    SCOPES = {"none": (), "velocity": ("velocity",), "all": ("velocity", "encoder", "color_head")}
-
-    def watch(self, trainer, cfg) -> None:
-        """Weight and gradient histograms through `wandb.watch`'s hooks.
-
-        `wandb.watch` takes whole modules, not parameters, so the scope is the unit of choice:
-
-            velocity  the 7M-parameter net that learns the field. The default.
-            all       plus the encoder and the colour head. The encoder is 29M parameters of
-                      FROZEN DINO backbone around ~0.5M of LoRA, and watching it means hooking
-                      all of them; use it to debug LoRA, not for a normal run.
-            none      off.
-
-        `watch_freq` throttles the logging, not the hooks: those run on every backward pass
-        whatever it says, which is why the scope matters more than the frequency.
-
-        Raises:
-            ValueError: `logging.watch_scope` is not one of the three.
-        """
-        scope = str(cfg["logging"].get("watch_scope", "none"))
-        if scope not in self.SCOPES:
-            raise ValueError(
-                f"logging.watch_scope must be one of {sorted(self.SCOPES)}, got {scope!r}"
-            )
-        if self.run is None or scope == "none":
-            return
-        import wandb
-
-        freq = int(cfg["logging"].get("watch_freq", 500))
-        wandb.watch(
-            [getattr(trainer, name) for name in self.SCOPES[scope]], log="all", log_freq=freq
-        )
-        logger.info("  wandb.watch: %s, histograms every %d steps", scope, freq)
-
-    def finish(self) -> None:
-        if self.run is not None:
-            self.run.finish()
-
-
-class JsonlLog:
-    """One JSON object per line under the output directory: curves without wandb."""
-
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = path.open("a", encoding="utf-8")
-
-    def write(self, step: int, kind: str, values: dict) -> None:
-        self.handle.write(json.dumps({"step": step, "kind": kind, **values}) + "\n")
-        self.handle.flush()
-
-    def close(self) -> None:
-        self.handle.close()
-
-
-class CsvLog:
-    """One CSV per kind of record, rewritten whole on every append.
-
-    W&B owns the live curves; these files exist so every plot can be rebuilt from disk months
-    later, by someone without the W&B run, in a spreadsheet. One file per kind keeps the columns
-    stable and dense -- a single wide file would be mostly empty, because train rows arrive every
-    `log_every` steps and validation rows every `val_every`.
-
-    Rewriting the whole file each time (rather than appending) costs nothing at this scale -- a
-    20K-step run writes about 200 train rows and 40 of each validation kind -- and buys two
-    things: a column that only appears later (`beta1`, `peak_vram_gb`) lands in the header
-    retroactively, and the file on disk is always complete, even if the run is killed.
-    """
-
-    def __init__(self, directory: Path):
-        self.directory = directory
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.rows: dict[str, list[dict]] = {}
-        self.columns: dict[str, list[str]] = {}
-
-    def write(self, step: int, kind: str, values: dict) -> None:
-        row = {"step": step, **{k: v for k, v in values.items()}}
-        rows = self.rows.setdefault(kind, [])
-        columns = self.columns.setdefault(kind, [])
-        rows.append(row)
-        columns.extend(key for key in row if key not in columns)
-        path = self.directory / f"{kind}.csv"
-        partial = path.with_suffix(".partial")
-        with partial.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns, restval="")
-            writer.writeheader()
-            writer.writerows(rows)
-        os.replace(partial, path)
-
-
-class RunLog:
-    """The one place a metric is recorded: W&B, a JSONL mirror and a CSV per kind.
-
-    Callers pass the final W&B key names, so the three records hold identical keys by
-    construction and the local files really can rebuild the W&B plots. Before this existed the
-    JSONL held the raw loss dict while W&B got the prefixed one plus the attention gates, so the
-    two quietly disagreed about what a run had recorded.
-    """
-
-    def __init__(self, cfg, out_dir: Path):
-        self.wandb = WandbRun(cfg)
-        self.jsonl = JsonlLog(out_dir / "train_log.jsonl")
-        self.csv = CsvLog(out_dir / "metrics") if cfg["logging"].get("metrics_csv", True) else None
-
-    def log(self, kind: str, step: int, values: dict) -> None:
-        self.wandb.log(values, step=step)
-        self.jsonl.write(step, kind, values)
-        if self.csv is not None:
-            self.csv.write(step, kind, values)
-
-    def watch(self, trainer, cfg) -> None:
-        self.wandb.watch(trainer, cfg)
-
-    def close(self) -> None:
-        self.wandb.finish()
-        self.jsonl.close()
-
-
-def write_run_config(cfg: dict, out_dir: Path) -> Path:
-    """The fully merged config beside the metrics, so a plot can be traced to its settings."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "run_config.json"
-    path.write_text(json.dumps(cfg, indent=2, default=str) + "\n", encoding="utf-8")
-    return path
 
 
 def token_stats(cfg: dict, layout: TokenLayout, device: torch.device):

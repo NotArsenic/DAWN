@@ -180,7 +180,11 @@ loader:
 
 # Logging.
 logging:
-  wandb_project: dawn
+  wandb_project: dawn     # stage 1. Stage 2 (the refiner) logs to dawn-refiner, same entity.
+  # The W&B team or user the run belongs to. `null` (or no key at all) omits the entity from
+  # wandb.init entirely and the account's own default is used, so a collaborator without access
+  # to this one can still run. The project and entity actually used are logged at INFO on init.
+  wandb_entity: my-team
   wandb_mode: online      # online | offline | disabled
   log_every: 100
   log_attn_gates: true    # log each block's learned DINO-attention gate every log_every steps

@@ -15,10 +15,23 @@ Usage:
     python scripts/infer.py --checkpoint checkpoints/run1/flow_last.pt --input frame.jpg
     python scripts/infer.py --checkpoint ... --input data/DroneVehicle/test/testimgr --limit 20
     python scripts/infer.py --checkpoint ... --input frames/ --samples 8 --method midpoint
+    python scripts/infer.py --checkpoint ... --refiner checkpoints/refiner/refiner_last.pt ...
 
 Inputs may be raw DroneVehicle frames (840x712 with the 100-px border, cropped here) or frames
-already at the checkpoint's input size. The local refiner of the plan's step 6 is not built yet;
-when it is, it goes between the render and the save.
+already at the checkpoint's input size. The local refiner of the plan's step 6 is optional
+(`--refiner`, a Stage 2 checkpoint) and runs between the render and the save: it sharpens the
+rendered brightness and leaves a* and b* alone. Without it the saved image is exactly what
+Stage 1 renders.
+
+**The refiner does not touch the uncertainty maps, by choice.** It is applied to the two images
+this script writes -- the displayed member and the ensemble mean -- and not to the K members, so
+`l_std` and `ab_std` stay the spread of the *unrefined* ensemble: the maps that come out of a
+`--refiner` run describe the unrefined ensemble, and should be read that way. The reasoning is
+that the refiner is deterministic given `L`, so it adds no disagreement between members; refining
+each member would move `l_std` only through the refiner's own nonlinearity, a change in the
+reported spread that no extra uncertainty in the model stands behind. And docs/conventions.md
+section 11 makes `dawn/uncertainty/spread.py` the single place the spread is computed, which this
+path leaves untouched rather than recomputing a second spread here.
 """
 
 from __future__ import annotations
@@ -27,6 +40,7 @@ import argparse
 import logging
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -39,7 +53,8 @@ if str(ROOT) not in sys.path:
 from dawn.data.color import linear_to_srgb8  # noqa: E402
 from dawn.data.dronevehicle import FRAME_SIZE, crop_border, read_thermal8  # noqa: E402
 from dawn.data.resample import area_downsample  # noqa: E402
-from dawn.flow.inference import InferenceBundle, load_checkpoint  # noqa: E402
+from dawn.flow.inference import InferenceBundle, load_checkpoint, load_refiner  # noqa: E402
+from dawn.models.refiner import LocalRefiner, apply_refiner  # noqa: E402
 from dawn.uncertainty.spread import SpreadResult, sample_with_spread  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -122,10 +137,21 @@ def write_outputs(out: SpreadResult, stem: str, directory: Path, args) -> None:
 
 
 @torch.no_grad()
-def run_one(bundle: InferenceBundle, path: Path, device: torch.device, args) -> SpreadResult:
+def run_one(
+    bundle: InferenceBundle,
+    path: Path,
+    device: torch.device,
+    args,
+    refiner: LocalRefiner | None = None,
+) -> tuple[SpreadResult, torch.Tensor]:
+    """One frame, end to end: read, one DINO pass, K members, render, then step 6.
+
+    Returns the result and the refiner's residual `(1, 1, h, w)` in `L = L*/100` units, so the
+    caller can report whether Stage 2 moved anything; with no refiner the residual is zeros.
+    """
     thermal = read_thermal(path, bundle.input_size).to(device)
     encoded = bundle.encoder.encode(thermal, return_attn=True)
-    return sample_with_spread(
+    out = sample_with_spread(
         bundle.velocity,
         encoded,
         bundle.layout,
@@ -139,6 +165,23 @@ def run_one(bundle: InferenceBundle, path: Path, device: torch.device, args) -> 
         nfe=args.nfe,
         image_ids=[path.stem] if args.seed_from_name else None,
     )
+    # Step 6, between the render and the save, on the two IMAGES only: the displayed member and
+    # the ensemble mean. `l_std` and `ab_std` are carried through untouched on purpose -- the
+    # refiner is deterministic given L, so it adds no member-to-member disagreement, and the
+    # spread stays the one dawn/uncertainty/spread.py computed over the unrefined members
+    # (docs/conventions.md section 11, and the module docstring above). `apply_refiner` with no
+    # refiner is an exact identity, so this costs the no-refiner run nothing but the Lab -> RGB
+    # it would have done anyway.
+    member = apply_refiner(out.sample_lab, thermal, refiner)
+    ensemble = apply_refiner(out.lab, thermal, refiner)
+    refined = replace(
+        out,
+        sample_lab=member["lab"],
+        sample_rgb=member["rgb"],
+        lab=ensemble["lab"],
+        rgb=ensemble["rgb"],
+    )
+    return refined, member["residual"]
 
 
 def main() -> None:
@@ -146,6 +189,12 @@ def main() -> None:
         description="Dawn inference: thermal -> day RGB + uncertainty maps"
     )
     parser.add_argument("--checkpoint", type=str, required=True, help="Trained flow checkpoint")
+    parser.add_argument(
+        "--refiner",
+        type=str,
+        default=None,
+        help="Stage 2 refiner checkpoint; without it the Stage 1 render is saved as it is",
+    )
     parser.add_argument("--input", type=str, required=True, help="Thermal image, or a directory")
     parser.add_argument("--output", type=str, default="outputs/infer", help="Where to write")
     parser.add_argument("--limit", type=int, default=None, help="Only the first N of a directory")
@@ -158,7 +207,9 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default="cpu", help="cpu | cuda | mps")
     parser.add_argument(
-        "--no-ema", action="store_true", help="Use the live weights, not the EMA average"
+        "--no-ema",
+        action="store_true",
+        help="Use the live weights of both stages, not their EMA averages",
     )
     parser.add_argument(
         "--seed-from-name",
@@ -186,6 +237,17 @@ def main() -> None:
         bundle.ema,
     )
 
+    refiner = None
+    if args.refiner:
+        refiner = load_refiner(args.refiner, device, use_ema=not args.no_ema)
+        logger.info(
+            "refiner: %d parameters, %d px receptive field, delta bounded to +/- %.1f L*; the "
+            "uncertainty maps stay those of the UNREFINED ensemble",
+            refiner.num_params(),
+            refiner.receptive_field,
+            100.0 * refiner.residual_scale,
+        )
+
     files = find_inputs(Path(args.input), args.limit)
     directory = Path(args.output)
     logger.info(
@@ -200,21 +262,27 @@ def main() -> None:
     times = []
     for index, path in enumerate(files, 1):
         start = time.perf_counter()
-        out = run_one(bundle, path, device, args)
+        out, residual = run_one(bundle, path, device, args, refiner)
         times.append(time.perf_counter() - start)
         write_outputs(out, path.stem, directory, args)
+        # The residual is in L = L*/100 units; report L*, the unit the maps and the metrics use,
+        # so "the refiner did nothing" is visible per frame rather than only in the images.
+        refined = (
+            "" if refiner is None else f", refiner |dL*| {100 * float(residual.abs().mean()):.2f}"
+        )
         if out.num_samples > 1:
             logger.info(
-                "[%d/%d] %s  mean L* spread %.2f, a*b* spread %.2f  (%.2f s)",
+                "[%d/%d] %s  mean L* spread %.2f, a*b* spread %.2f%s  (%.2f s)",
                 index,
                 len(files),
                 path.name,
                 float(out.l_std.mean()),
                 float(out.ab_std.mean()),
+                refined,
                 times[-1],
             )
         else:
-            logger.info("[%d/%d] %s  (%.2f s)", index, len(files), path.name, times[-1])
+            logger.info("[%d/%d] %s%s  (%.2f s)", index, len(files), path.name, refined, times[-1])
 
     logger.info(
         "done: %d frame(s), %.2f s/frame (this is not a latency benchmark: see "

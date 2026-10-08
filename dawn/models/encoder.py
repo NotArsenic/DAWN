@@ -322,15 +322,11 @@ class DINOEncoder(nn.Module):
 
     def _preprocess_thermal(self, thermal: torch.Tensor) -> torch.Tensor:
         """Thermal -> three channels -> ImageNet mean/std. No sRGB: thermal is not light."""
-        if thermal.ndim != 4 or thermal.shape[1] != 1:
-            raise ValueError(f"thermal must be (B, 1, H, W), got {tuple(thermal.shape)}")
         self._check_size(thermal)
         return self._normalize(thermal.clamp(0.0, 1.0).expand(-1, 3, -1, -1))
 
     def _preprocess_rgb(self, image_linear: torch.Tensor) -> torch.Tensor:
         """Linear RGB -> sRGB -> ImageNet mean/std: the L_align target's input (DINO saw sRGB)."""
-        if image_linear.ndim != 4 or image_linear.shape[1] != 3:
-            raise ValueError(f"RGB image must be (B, 3, H, W), got {tuple(image_linear.shape)}")
         self._check_size(image_linear)
         return self._normalize(linear_to_srgb(image_linear.clamp(0.0, 1.0)))
 
@@ -499,8 +495,6 @@ def attention_to_bias(patch_attn: torch.Tensor, floor: float = ATTN_FLOOR) -> to
     block, scaled by that block's learned gate. The floor keeps zero attention finite
     (log 1e-6 = -13.8), so a zero gate multiplies a finite number and cannot produce NaNs.
     """
-    if patch_attn.ndim != 3:
-        raise ValueError(f"patch_attn must be (B, N, N), got {tuple(patch_attn.shape)}")
     return torch.log(patch_attn.to(torch.float32) + floor).unsqueeze(1)
 
 

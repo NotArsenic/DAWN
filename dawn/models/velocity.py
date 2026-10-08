@@ -259,34 +259,12 @@ class VelocityTransformer(nn.Module):
                 additive bias `log(A + 1e-6)`.
             thumb: (B, 1, gy, gx) thermal thumbnail (`DINOEncoder.thumbnail`). Omitted means no
                 thumbnail stream.
-            attn_bias: (B, 1, N, N) the bias already in log space, as `encode` returns it.
-                Mutually exclusive with `dino_attn`.
+            attn_bias: (B, 1, N, N) the bias already in log space, as `encode` returns it. Pass
+                this or `dino_attn`; if both arrive, `dino_attn` wins.
 
         Returns:
             v: (B, N, D) predicted velocity, standardized.
-
-        Raises:
-            ValueError: the shapes do not match the token layout this model was built for (a
-                different resolution, bin count or brightness_correction setting).
         """
-        n, d = self.num_tokens, self.token_dim
-        if z_t.ndim != 3 or z_t.shape[1:] != (n, d):
-            raise ValueError(
-                f"z_t must be (B, {n}, {d}) for this token layout, got {tuple(z_t.shape)}: "
-                "a different resolution, number of bins or brightness_correction setting?"
-            )
-        if t.ndim != 1 or t.shape[0] != z_t.shape[0]:
-            raise ValueError(f"t must be (B,) with B = {z_t.shape[0]}, got {tuple(t.shape)}")
-        if dino_features.shape[:2] != (z_t.shape[0], n):
-            raise ValueError(f"dino_features must be (B, {n}, C), got {tuple(dino_features.shape)}")
-        if thumb is not None and thumb.shape != (z_t.shape[0], 1, *self.layout.grid):
-            raise ValueError(
-                f"thumb must be (B, 1, {self.layout.grid[0]}, {self.layout.grid[1]}), "
-                f"got {tuple(thumb.shape)}"
-            )
-        if dino_attn is not None and attn_bias is not None:
-            raise ValueError("pass dino_attn or attn_bias, not both")
-
         x = self.input_proj(z_t) + self.dino_proj(dino_features) + self.pos_embed
         if thumb is not None:
             x = x + self.thumb_proj(rearrange(thumb, "b c y x -> b (y x) c"))

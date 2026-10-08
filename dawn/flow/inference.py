@@ -14,6 +14,12 @@ render size and the upsampling settings all come out of it too, rather than out 
 The frozen DINO backbone is not in the checkpoint (`FlowTrainer.state_dict`): it is rebuilt from
 `encoder.model_ids` and the LoRA weights are loaded on top, so the pretrained weights have to be
 the ones the run started from, and loading needs the DINOv3 license the same way training did.
+
+**Stage 2 loads separately.** `load_refiner` reads the local refiner's own checkpoint, written by
+a different training run (`scripts/train_refiner.py`) with its own config section and its own EMA.
+It is deliberately not a field of `InferenceBundle`: the refiner is optional -- the plan's first
+cut -- and a flow checkpoint knows nothing about which refiner, if any, was trained on top of it.
+`infer.py` composes the two, and a run without a refiner never calls `load_refiner` at all.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from torch import nn
 from dawn.flow.render import RenderSettings
 from dawn.flow.tokens import TokenLayout
 from dawn.flow.trainer import build_models
+from dawn.models.refiner import LocalRefiner
 
 
 @dataclass(frozen=True)
@@ -148,3 +155,61 @@ def load_checkpoint(
         config=cfg,
         ema=use_ema,
     )
+
+
+def load_refiner(
+    path: str | Path,
+    device: torch.device | str = "cpu",
+    *,
+    use_ema: bool = True,
+) -> LocalRefiner:
+    """Rebuild the Stage 2 local refiner from its own checkpoint and load its weights.
+
+    The architecture comes out of the checkpoint's `refiner_config`, not out of
+    `configs/refiner.yaml`, for the same reason the stats do in `load_checkpoint`: a width or a
+    kernel size edited since the run would otherwise load silently into the wrong shape, or load
+    into a shape that fits and is not the one that was trained.
+
+    Args:
+        path: a checkpoint written by `scripts/train_refiner.py`.
+        device: where to put the model.
+        use_ema: apply the EMA shadow over the live weights. As in `load_checkpoint`, the average
+            is what validation measured and what should be reported; `False` gives the raw
+            last-step weights and is for debugging a run that looks wrong.
+
+    Returns:
+        A `LocalRefiner` on `device`, in eval mode with gradients disabled, ready for
+        `dawn.models.refiner.apply_refiner`.
+
+    Raises:
+        FileNotFoundError: no such checkpoint.
+        ValueError: the file is not a Dawn refiner checkpoint (a Stage 1 flow checkpoint is the
+            likely mistake), or `use_ema` was asked for and the checkpoint carries no EMA shadow
+            for the refiner's parameters.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"no checkpoint at {path}")
+    # Our own training checkpoint: it carries the run's config dict, not only tensors.
+    state = torch.load(path, map_location=device, weights_only=False)
+    missing = {"config", "refiner", "refiner_config"} - set(state)
+    if missing:
+        raise ValueError(
+            f"{path} is not a Dawn refiner checkpoint: it has no {sorted(missing)} "
+            "(expected one written by scripts/train_refiner.py)"
+        )
+
+    device = torch.device(device)
+    refiner = LocalRefiner.from_config(state["refiner_config"]).to(device)
+    refiner.load_state_dict(state["refiner"])
+
+    if use_ema:
+        if "ema" not in state or not state["ema"].get("shadow"):
+            raise ValueError(f"{path} carries no EMA shadow; pass use_ema=False to use it anyway")
+        # The shadow is keyed `refiner.<param>`: the trainer's `module.param` convention
+        # (`FlowTrainer.trainable_parameters`), which Stage 2 shares. Passing the model under
+        # that prefix keeps `_apply_ema` the one place the mapping lives for both stages.
+        if _apply_ema(state, {"refiner": refiner}) == 0:
+            raise ValueError(f"{path}'s EMA shadow matched none of the refiner's parameters")
+
+    return refiner.eval().requires_grad_(False)

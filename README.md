@@ -16,7 +16,7 @@ It treats thermal as a one-channel image and splits the job in two. Brightness i
 | Brightness / colour oracle (`scripts/check_oracle.py`) | **Measured** on all 345 val pairs; the ceiling is in the next section |
 | Inference and the uncertainty maps | **Works, untested on a trained model.** `scripts/infer.py`, `dawn/uncertainty/spread.py` (the spread of K samples, in L\* and a\*b\* units) and `dawn/flow/inference.py` are implemented and tested against random weights |
 | Evaluation, calibration, latency | **Works, untested on a trained model.** `scripts/{evaluate,benchmark_latency}.py`, `configs/eval.yaml` and `dawn/eval/{metrics,calibration,visualize}.py`: L\* PSNR and SSIM, CIEDE2000, colorfulness, LPIPS, the uncertainty rank correlation, comparison sheets and per-component GMACs. See [`docs/inference_eval_phase.md`](docs/inference_eval_phase.md) |
-| The optional refiner (the plan's stage 2) | **Not started** — the plan lists it first in its own cut order |
+| The optional refiner (the plan's stage 2) | **Built and tested; nothing trained.** `dawn/models/refiner.py` (2,545 parameters, a 9×9 field, bounded at ±10 L\*), `scripts/train_refiner.py`, `configs/refiner.yaml`, and `--refiner` in `scripts/infer.py`. Whether it earns its place is one number, `psnr_L/improvement`; the plan still lists it first in its own cut order |
 | Results | None. No trained-model number is claimed here; the only measured numbers are the oracle ceilings below |
 
 Few pairs survive the filter: of the 28,411 DroneVehicle pairs, about 8,500 are daytime and 5,385 pass alignment and dedup (3,662 train, 345 val, 1,378 test; `data/manifests/logs/summary.md`). 2,374 of them were aligned by the edge-correlation fallback instead of by boxes, so they are less trustworthy and have no moving mask (`data/manifests/fallback_pairs.txt`); for those a per-vehicle `vehicles` mask (every vehicle, stretched along its heading where it may have moved) stands in for it. Without the fallback it is 3,011. A small training set is the largest risk the plan names, and the audit exists to decide what else to loosen.
@@ -131,6 +131,28 @@ python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_5
 Use the probe's seconds/step to sanity-check `logging.val_every` (500 by default): validation
 should stay a few percent of wall-clock.
 
+### Stage 2: the optional refiner
+
+```bash
+python scripts/train_refiner.py --device cuda --out-dir checkpoints/refiner   # 8K steps, ~35 epochs
+python scripts/infer.py --checkpoint checkpoints/run1/flow_best.pt \
+    --refiner checkpoints/refiner/refiner_best.pt --input frame.jpg
+```
+
+A 2,545-parameter depthwise-separable CNN on `L` only (inputs: the brightness grid's `L` and the
+thermal), bounded as `L + 0.1·tanh(residual)` so it can sharpen but not invent, with a 9×9
+receptive field — far smaller than a vehicle, which is the point. Colour is untouched.
+
+Validation answers one question, and the run prints the verdict in words: `psnr_L/improvement`,
+refined minus unrefined on the same val pairs. **If it is not positive the refiner has not earned
+its place**, and the plan lists it first in its own cut order.
+
+One honest caveat, which `docs/proposals_review.md` §8 expands: it trains on the *fitted* (oracle)
+brightness grid but at inference meets the *generated* one, which is worse. That is what the plan
+specifies, and it is what makes stage 2 trainable before stage 1 has ever run. Without `--refiner`,
+inference is byte-identical to stage 1 alone; the uncertainty maps always describe the unrefined
+ensemble.
+
 ## Project structure
 
 ```
@@ -153,12 +175,15 @@ dawn/
 │   │                        # grid), upsample (bilinear | BGU), normalize (token standardization)
 │   ├── flow/                # tokens (the one token layout), targets, render (the one render path),
 │   │                        # color_bins (261 bins), loss, sampler, trainer, loaders, oracle
-│   ├── models/              # encoder (DINOv3 + LoRA, thermal in), velocity (DiT), color_head
+│   ├── models/              # encoder (DINOv3 + LoRA, thermal in), velocity (DiT), color_head,
+│   │                        # refiner (stage 2: bounded local sharpener on L)
+│   ├── runlog.py            # W&B + the JSONL / CSV mirrors, shared by both training scripts
 │   ├── eval/metrics.py      # masked L* PSNR, CIEDE2000, colorfulness (the rest is parked)
 │   └── uncertainty/         # parked: sample-spread maps land with the inference phase
 ├── scripts/
 │   ├── prepare_dronevehicle.py, audit_alignment.py   # data
-│   ├── check_oracle.py, smoke_dino.py, train_flow.py # model phase
+│   ├── check_oracle.py, smoke_dino.py, train_flow.py # model phase (stage 1)
+│   ├── train_refiner.py                              # stage 2
 │   └── infer.py, evaluate.py, benchmark_latency.py   # parked
 └── tests/                   # CPU, offline; tiny tensors, a tiny fake aligned tree, random-weight DINO
 ```

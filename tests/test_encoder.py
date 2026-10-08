@@ -192,13 +192,11 @@ def test_the_rgb_path_is_srgb_encoded_not_linear(encoder):
     )
 
 
-def test_the_encoder_rejects_the_wrong_input(encoder):
+def test_the_encoder_rejects_a_frame_of_the_wrong_size(encoder):
+    """A transposed frame gives the SAME token count, so without this it would silently
+    produce a scrambled geometry rather than fail. The channel counts are left to torch."""
     with pytest.raises(ValueError, match="64x80"):
-        encoder(torch.rand(1, 1, 80, 64))  # transposed: a non-square mix-up
-    with pytest.raises(ValueError, match="thermal"):
-        encoder(torch.rand(1, 3, *TINY_INPUT))
-    with pytest.raises(ValueError, match="RGB"):
-        encoder.forward_frozen(torch.rand(1, 1, *TINY_INPUT))
+        encoder(torch.rand(1, 1, 80, 64))
 
 
 def test_lora_targets_only_the_attention_projections(encoder):

@@ -290,6 +290,51 @@ comparable. Validation is now order 4–8% of wall-clock at `val_every: 500`; th
 real number, and `val_retrieval: false` is the first dial if it is too much.
 
 **Still not done.** Proposal 2's vehicle-crop metrics (`metrics.vehicle_region`) remain the open
-decision in `docs/inference_eval_phase.md`, and the plan's stage-2 refiner
-(`dawn/models/refiner.py`, `scripts/train_refiner.py`, `configs/refiner.yaml`) does not exist —
-it is first in the plan's own cut order.
+decision in `docs/inference_eval_phase.md`.
+
+---
+
+## 8. Stage 2: the local refiner
+
+Built after the review above, so it is recorded here rather than in a note of its own.
+`dawn/models/refiner.py`, `scripts/train_refiner.py`, `configs/refiner.yaml`,
+`dawn/flow/inference.py: load_refiner`, `--refiner` in `scripts/infer.py`.
+
+It is the plan's design unchanged: inputs `L` and thermal, two depthwise-separable 5×5 blocks of
+width 24, output `L + 0.1·tanh(residual)`, trained on random 256×256 crops against
+`L1 + 0.01·|residual|`, masked. **2,545 parameters and a 9×9 receptive field** — far smaller than
+any vehicle, which is the point: it can sharpen an edge the thermal already implies and it cannot
+draw one that is not there. It touches **L only**; a\*b\* pass through bit-identical, so nothing
+here addresses the colour-bleeding question of §3.B.
+
+Three things worth knowing, in descending order of how easy they are to get wrong:
+
+1. **The train/inference mismatch.** It trains on the **fitted (oracle)** brightness grid and at
+   inference meets the **generated** one, which is worse — the fitted grid is the best the
+   parametrization can do (24.6–25.1 dB). So the refiner learns a correction for an input it will
+   not meet. This is what the plan specifies, and it is what makes stage 2 trainable *before
+   stage 1 has ever run*, which was the situation. The follow-up, if the gate comes out marginal,
+   is to generate the input grid from a stage-1 checkpoint instead; that is deliberately not
+   implemented. It is an open decision in `CLAUDE.md`.
+2. **The gate is one number.** `psnr_L/improvement` = refined − unrefined on the same val pairs,
+   with the run printing the verdict in words at every validation. An untrained refiner scores
+   exactly 0 by construction (the output 1×1 is zero-initialized, so it is the exact identity).
+   If the number is not positive, cut it — the plan lists the refiner first in its own cut order,
+   and nothing else depends on it.
+3. **The uncertainty maps describe the unrefined ensemble.** `apply_refiner` runs on the displayed
+   member and on the ensemble mean, after `sample_with_spread`; `l_std` and `ab_std` come out of
+   `spread.py` untouched. The refiner is deterministic given `L`, so it adds no member-to-member
+   disagreement — refining per member would move the spread only through its own nonlinearity, with
+   no extra model uncertainty behind the change, and `conventions.md` §11 keeps `spread.py` the one
+   place the spread is computed. Without `--refiner`, inference output is byte-identical to stage 1
+   alone, which is pinned by a test rather than asserted here.
+
+**One cross-stage bug this shook out.** The trainer first keyed its EMA shadow with bare parameter
+names while `_apply_ema` — the helper both stages share — resolves `f"{prefix}.{name}"`. `EMA` is
+self-consistent in whatever keys it is given, so every stage-2 test passed and
+`load_refiner(..., use_ema=True)` — the **default**, and the weights validation selects on — would
+have raised on every checkpoint the script writes. Nothing on either side of the seam could catch
+it alone; the regression test that does
+(`test_the_ema_shadow_is_keyed_the_way_the_inference_loader_reads_it`) loads a checkpoint the real
+trainer wrote, and asserts the loaded weights are the shadow *and* differ from the live ones, so it
+cannot pass vacuously.

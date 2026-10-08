@@ -229,6 +229,42 @@ def test_the_correction_overlay_widens_the_token_and_the_overfit_overlay_keeps_t
     assert gate["flow"]["warmup_steps"] < gate["flow"]["num_train_steps"]
 
 
+def test_the_refiner_config_adds_one_section_and_otherwise_only_overrides():
+    """`refiner.yaml` is a stage-2 CONFIG, not an overlay, so it is not in `OVERLAYS`.
+
+    It is merged as `flow.yaml + data.yaml + refiner.yaml`, so the same trap applies: a key that
+    exists nowhere else is a typo that silently does nothing. The one thing it may legitimately
+    add is its own `refiner:` section.
+    """
+    base = {**_load("flow.yaml"), **_load("data.yaml")}
+    stray = [
+        ".".join(p)
+        for p in _leaf_paths(_load("refiner.yaml"))
+        if p[0] != "refiner" and not _has(base, p)
+    ]
+    assert not stray, f"refiner.yaml sets keys that exist nowhere: {stray}"
+    assert "refiner" not in base, "the refiner section belongs to stage 2 only"
+
+
+def test_the_refiner_config_matches_the_plans_architecture_and_loss():
+    """The plan: two depthwise-separable 5x5 blocks, width 24, L + 0.1 tanh(residual),
+    256x256 crops, L1 + 0.01 * |residual|."""
+    refiner = _load("refiner.yaml")["refiner"]
+    assert (refiner["hidden_channels"], refiner["num_blocks"]) == (24, 2)
+    assert refiner["kernel_size"] == 5
+    assert 1 + refiner["num_blocks"] * (refiner["kernel_size"] - 1) == 9  # the 9x9 field
+    assert refiner["residual_scale"] == 0.1  # +/- 10 L* units
+    assert refiner["crop_size"] == 256 and refiner["residual_penalty"] == 0.01
+
+
+def test_the_two_stages_log_to_different_projects_under_one_entity():
+    flow, refiner = _load("flow.yaml")["logging"], _load("refiner.yaml")["logging"]
+    assert flow["wandb_entity"] == "my-team"
+    assert (flow["wandb_project"], refiner["wandb_project"]) == ("dawn", "dawn-refiner")
+    # The entity is inherited through the merge, never repeated: one place to change it.
+    assert "wandb_entity" not in refiner
+
+
 def test_the_5090_overlay_spends_its_headroom_on_timesteps_not_on_the_batch():
     """32 GB buys velocity samples per optimizer step, not fewer optimizer steps.
 

@@ -1,0 +1,117 @@
+# Stage 2: the local refiner, the plan's optional sharpener on brightness.
+# Model: dawn/models/refiner.py   Training: scripts/train_refiner.py   Layouts: docs/conventions.md
+#
+# Merged as flow.yaml + data.yaml + THIS file, later files winning:
+#   python scripts/train_refiner.py --device cuda
+#   python scripts/train_refiner.py --override configs/debug.yaml --device cpu --max-steps 20
+#
+# Every key here is either under the new top-level `refiner:` section or already exists in
+# flow.yaml / data.yaml (tests/test_configs.py checks it), so a typo cannot silently do nothing.
+# Stage 2 reads everything else -- the resolution, the grid fit, the pair policy, the dataset --
+# straight from flow.yaml and data.yaml, so the two stages cannot drift apart on any of it.
+#
+# ---------------------------------------------------------------------------------------------
+# THE MISMATCH THIS RUN HAS, AND DOES NOT FIX
+#
+# The refiner is TRAINED on the FITTED (oracle) brightness grid -- the one least-squares-fit from
+# the thermal to the TRUE L* of the paired RGB -- and will be RUN on the GENERATED grid that
+# stage 1's flow sampled, which is worse. Trained on clean input and run on dirty input, it may
+# sharpen edges that are not where it was told they are, so `psnr_L/improvement` measured by this
+# run is an UPPER BOUND on the improvement inference will see. Plainly:
+#
+#   1. This is what the plan specifies: "Input: the fitted brightness grid applied to thermal,
+#      plus the thermal itself." The mismatch is in the spec, not introduced by this config.
+#   2. It is what makes stage 2 trainable BEFORE stage 1 has ever run, which is exactly the
+#      current situation: no flow checkpoint exists yet.
+#   3. The follow-up, IF AND ONLY IF the gate shows the refiner matters, is to generate the input
+#      grid from a stage-1 checkpoint (sample parts, render, take L_grid) instead of fitting it.
+#      That is deliberately NOT implemented, and should not be before there is a checkpoint.
+#
+# The same note is in the module docstring of scripts/train_refiner.py.
+# ---------------------------------------------------------------------------------------------
+
+refiner:
+  # The plan's architecture, unchanged: "two depthwise-separable 5x5 blocks, width 24, 9x9 field,
+  # output L + 0.1 * tanh(residual)". 2,545 parameters in total, which is what keeps the plan's
+  # "1-2 GMACs for the refiner, the grid slice and the colour upsampling" honest beside DINO's 45.
+  hidden_channels: 24      # width of the blocks
+  num_blocks: 2            # depthwise-separable blocks; with kernel_size this IS the field ...
+  kernel_size: 5           # ... 1 + 2 * (5 - 1) = 9 px, far less than a vehicle, so it can only
+                           # act on the few pixels either side of an edge. Odd: the padding is k//2.
+  # The bound on the delta, in L = L*/100 units: 0.1 is +/- 10 L*, whatever the weights learn
+  # (tanh, not a clip, so it is a bound and not a clipping artefact). The plan says "invented
+  # detail is accepted, so the bound can be relaxed" -- raise it only AFTER the gate below comes
+  # out positive, and change nothing else in the same run or the result is unattributable.
+  residual_scale: 0.1
+  # The plan's "random 256x256 crops". The grid is fit on the FULL frame and only then cropped:
+  # the crop is the refiner's loss, not the fit, so it never sees a grid fit from a quarter frame.
+  # A frame smaller than this on an axis keeps that whole axis instead of erroring, which is what
+  # the debug and mps overlays (256x320) need. Crop offsets are a fresh draw per step from the
+  # trainer's own generator, seeded from --seed; the global RNG is never reseeded
+  # (docs/conventions.md section 10.3, and `crop_windows` in scripts/train_refiner.py).
+  crop_size: 256
+  # The plan's loss: L1 to RGB brightness + 0.01 * |residual|, masked. The penalty is what makes
+  # "do nothing" the default -- the refiner has to earn every L* it moves -- and it is the reason
+  # `residual/abs_mean_Lstar` is worth watching: a run pinned against the +/- 10 bound is either
+  # finding real structure or fighting the penalty, and only the improvement says which.
+  residual_penalty: 0.01
+  # The budget, in EPOCHS (docs/training_budget_and_changes.md section 1):
+  #
+  #     8000 steps * optim.batch_size 16 / 3662 train pairs = 35 epochs
+  #
+  # Short next to stage 1's 87 on purpose. This is 2,545 parameters on 256x256 crops: it cannot
+  # memorize 3,662 frames, so the risk is underfitting OPTIMIZER STEPS, not overfitting pairs,
+  # and 8,000 steps is ~8e9 supervised crop pixels for four convolutions. The cost per step is
+  # the loader and the full-frame grid fit, NOT the net (~0.01 GMAC on a crop), so at an
+  # estimated 0.3-0.6 s/step this is 40-80 minutes -- inside the plan's "Stage 2: a few hours"
+  # even if the estimate is 2x out. If you change optim.batch_size, rescale this and every
+  # `logging` count below with it: all of them are counted in steps.
+  num_train_steps: 8000
+
+optim:
+  # 5x stage 1's 2e-4. Four convolutions with no normalization layer anywhere, 2,545 parameters
+  # and a tanh-bounded output tolerate (and need) a far larger step than a 7M transformer + LoRA.
+  lr: 1.0e-3
+  # NO weight decay, unlike stage 1's 0.01. Shrinking 2,545 parameters toward zero is a prior
+  # that the refiner should be the identity -- which is precisely the hypothesis the gate is
+  # testing, so it must not be baked into the optimizer. `refiner.residual_penalty` is the one
+  # shrinkage in this run and it acts on the OUTPUT, where it is measurable, not on the weights.
+  weight_decay: 0.0
+  lr_warmup_steps: 200     # 2.5% of the budget, then cosine to 0 over the rest
+  batch_size: 16           # unchanged from stage 1, so the epoch arithmetic above carries over
+  grad_clip: 1.0
+  # fp32. There is no large matmul here for bf16 to speed up, and target building, the grid fit
+  # and the losses are float32 by convention anyway (docs/conventions.md section 1); the stage-2
+  # script never opens an autocast context on any device.
+  precision: fp32
+  ema_decay: 0.999         # a ~1,000-step horizon: 4.4 epochs of this budget
+  ema_warmup: true         # the shadow is not 0.999^n initialization at the first validation
+  # NOTE: stage 2 calls `cosine_warmup_schedule(optimizer, optim.lr_warmup_steps,
+  # refiner.num_train_steps)` DIRECTLY and never goes through `build_schedule`, so `optim.schedule`,
+  # `optim.cosine` and `optim.one_cycle` (inherited from flow.yaml) are not read here. A one cycle
+  # is a fixed-budget schedule bought for a model that is hard to optimize; this one is not, and a
+  # schedule you must not early-stop is a liability on a run whose whole point is a go/no-go.
+
+loader:
+  # Doubled from stage 1's 4. A stage-2 step is dominated by PNG decode and the full-frame grid
+  # fit, not by the 2,545-parameter net, so the loader is the bottleneck here in a way it never is
+  # in stage 1. Drop it back to 0 (and use --override configs/debug.yaml) to debug in-process.
+  num_workers: 8
+
+logging:
+  wandb_project: dawn-refiner  # stage 1 is `dawn`; wandb_entity (my-team) is inherited
+  # none | refiner. Stage 2's scope map is scripts/train_refiner.py: WATCH_SCOPES -- `velocity`
+  # and `all` are stage 1's and name modules this trainer does not have, so they would raise at
+  # the start of the run rather than log nothing for 8,000 steps.
+  watch_scope: refiner
+  watch_freq: 250          # 32 histogram points; the hooks fire every backward either way
+  log_every: 50            # 160 train points over 8,000 steps
+  # 32 validation points. Each one is 64 full 512x640 frames through the grid fit for BOTH
+  # numbers (grid and refined), so it is not free -- but it is the gate, and a go/no-go that is
+  # only read twice cannot show when the improvement appeared.
+  val_every: 250
+  save_every: 2000         # 4 periodic checkpoints beside refiner_best.pt and refiner_last.pt
+  # NOTE: `logging.select_metric` is stage 1's (ciede2000 vs psnr_L) and stage 2 ignores it.
+  # There is exactly one selection rule here: refiner_best.pt follows psnr_L/improvement on the
+  # pairs.eval_subset subset, because the only question stage 2 has to answer is whether the
+  # refiner beats the grid it was handed. Its own PSNR, high or low, says nothing on its own.

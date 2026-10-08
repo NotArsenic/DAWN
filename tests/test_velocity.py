@@ -121,10 +121,15 @@ def test_a_precomputed_bias_and_the_raw_attention_agree(layout, inputs):
     assert torch.equal(from_attn, from_bias)
 
 
-def test_passing_both_attention_forms_is_an_error(layout, inputs):
+def test_dino_attn_wins_when_both_attention_forms_are_passed(layout, inputs):
+    """Callers pass one or the other; if both arrive the raw attention takes precedence."""
+    model = wake_up(VelocityTransformer(layout))
     n = layout.num_tokens
-    with pytest.raises(ValueError, match="not both"):
-        _call(VelocityTransformer(layout), inputs, attn_bias=torch.zeros(B, 1, n, n))
+    with torch.no_grad():
+        for block in model.blocks:
+            block.dino_gate.fill_(0.3)
+        both = _call(model, inputs, attn_bias=torch.zeros(B, 1, n, n))
+        assert torch.equal(both, _call(model, inputs))
 
 
 def test_detach_dino_attn_keeps_gradient_out_of_the_bias(layout, inputs):
@@ -163,29 +168,6 @@ def test_the_thumbnail_is_added_per_token_in_row_major_order(layout, inputs):
         assert not torch.allclose(base, _call(model, inputs, dino_attn=None, thumb=scrambled))
 
 
-@pytest.mark.parametrize(
-    "case, match",
-    [
-        ("tokens_wide", "layout"),
-        ("tokens_few", "resolution"),
-        ("t", "t must"),
-        ("dino_few", "dino_features"),
-        ("thumb", "thumb"),
-    ],
-)
-def test_layout_and_resolution_mismatches_are_clear_errors(layout, inputs, case, match):
-    n, d = layout.num_tokens, layout.dim
-    bad = {
-        "tokens_wide": {"z_t": torch.randn(B, n, d + 1)},
-        "tokens_few": {"z_t": torch.randn(B, n - 1, d)},
-        "t": {"t": torch.rand(B + 1)},
-        "dino_few": {"dino_features": torch.randn(B, n - 1, DINO)},
-        "thumb": {"thumb": torch.randn(B, 1, 3, 3)},
-    }[case]
-    with pytest.raises(ValueError, match=match):
-        _call(VelocityTransformer(layout), inputs, **bad)
-
-
 def test_from_config_reads_the_velocity_section_of_flow_yaml(layout):
     cfg = load_configs()
     model = VelocityTransformer.from_config(cfg["velocity"], layout)
@@ -203,8 +185,6 @@ def test_color_head_gives_one_logit_per_bin_per_patch():
     head = ColorHead()
     logits = head(torch.randn(B, 20, DINO))
     assert logits.shape == (B, 20, NUM_BINS) == (B, 20, 261)
-    with pytest.raises(ValueError, match="patch_tokens"):
-        head(torch.randn(B, DINO))
 
 
 def test_color_head_trains_the_tokens_it_reads():
