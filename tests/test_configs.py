@@ -355,3 +355,23 @@ def test_the_fast_overlay_must_be_applied_after_the_hardware_one():
     """It puts timesteps_per_image back, so the order in the override list is load-bearing."""
     assert _merged("fast.yaml", "gpu_5090.yaml")["flow"]["timesteps_per_image"] == 8
     assert _merged("gpu_5090.yaml", "fast.yaml")["flow"]["timesteps_per_image"] == 4
+
+
+def test_the_shipped_campaign_defaults_to_one_stage_1_run():
+    """A project ships a model; the ablations are research and are parked behind --ablations."""
+    cfg = _load("experiments.yaml")
+    assert [r["name"] for r in cfg["runs"]] == ["baseline"]
+    assert not cfg["runs"][0].get("overrides"), "the baseline is the plain configuration"
+    assert len(cfg["ablations"]) >= 1, "parked, not deleted"
+    assert cfg.get("refiner") and cfg.get("evaluation"), "the essentials still produce a result"
+
+
+def test_every_parked_ablation_still_moves_exactly_one_knob():
+    """They are parked, not abandoned: the rule has to hold whenever one is finally run."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    for run in _load("experiments.yaml")["ablations"]:
+        assert len(run["overrides"]) == 1, f"{run['name']} moves more than one knob"
+        assert run.get("ablates"), f"{run['name']} does not say which key it ablates"
+        assert (repo / run["overrides"][0]).exists(), run["overrides"][0]

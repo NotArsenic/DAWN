@@ -63,15 +63,16 @@ CAMPAIGN = {
             "measures_sec_per_step": True,
         },
     ],
-    "runs": [
-        {"name": "baseline", "hours": 8, "tests": "the reference", "overrides": []},
+    "runs": [{"name": "baseline", "hours": 8, "tests": "the reference", "overrides": []}],
+    # Parked: only in the plan when `--ablations` asks for them.
+    "ablations": [
         {
             "name": "one_cycle",
             "hours": 8,
             "ablates": "optim.schedule",
             "tests": "one cycle",
             "overrides": ["configs/abl_one_cycle.yaml"],
-        },
+        }
     ],
     "refiner": {"name": "refiner", "hours": 1, "tests": "stage 2"},
     "evaluation": {"select_by": "ciede2000", "split": "test_pairs", "hours": 0.3},
@@ -97,23 +98,22 @@ def _write_val_csv(out_dir, rows, subset="box_aligned"):
 # --- the plan ------------------------------------------------------------------------------------
 
 
-def test_the_plan_runs_gates_then_baseline_then_ablations_then_stage_2_then_eval(tmp_path):
-    """The order IS the dependency: nothing expensive starts before the cheap checks."""
+def test_the_default_plan_is_the_essentials_and_leaves_the_ablations_parked(tmp_path):
+    """A project needs a model, not a study: gates, ONE stage-1 run, stage 2, evaluation."""
     stages = _plan(tmp_path)
-    assert [s.name for s in stages] == [
-        "oracle",
-        "gpu_probe",
-        "baseline",
-        "one_cycle",
-        "refiner",
-        "evaluation",
-    ]
-    assert [s.kind for s in stages] == [GATE, GATE, TRAIN, TRAIN, REFINER, EVAL]
-    assert [s.name for s in stages].index("baseline") < [s.name for s in stages].index("one_cycle")
+    assert [s.name for s in stages] == ["oracle", "gpu_probe", "baseline", "refiner", "evaluation"]
+    assert [s.kind for s in stages] == [GATE, GATE, TRAIN, REFINER, EVAL]
+
+
+def test_ablations_are_opt_in_and_come_after_the_baseline(tmp_path):
+    """The order IS the dependency: everything is read against `baseline`, so it goes first."""
+    names = [s.name for s in _plan(tmp_path, include_ablations=True)]
+    assert names == ["oracle", "gpu_probe", "baseline", "one_cycle", "refiner", "evaluation"]
+    assert names.index("baseline") < names.index("one_cycle")
 
 
 def test_every_run_gets_the_common_overrides_and_its_own_directory(tmp_path):
-    stages = {s.name: s for s in _plan(tmp_path)}
+    stages = {s.name: s for s in _plan(tmp_path, include_ablations=True)}
     for name in ("baseline", "one_cycle"):
         command = stages[name].command
         assert "configs/gpu_5090.yaml" in command, name
@@ -122,7 +122,7 @@ def test_every_run_gets_the_common_overrides_and_its_own_directory(tmp_path):
 
 def test_an_ablation_adds_exactly_one_overlay_to_the_baseline(tmp_path):
     """The campaign's one rule. Two knobs in a run makes its result unattributable."""
-    stages = {s.name: s for s in _plan(tmp_path)}
+    stages = {s.name: s for s in _plan(tmp_path, include_ablations=True)}
     baseline = set(stages["baseline"].command)
     extra = [c for c in stages["one_cycle"].command if c.endswith(".yaml") and c not in baseline]
     assert extra == ["configs/abl_one_cycle.yaml"]
@@ -135,10 +135,20 @@ def test_a_gate_that_trains_still_gets_the_campaigns_overrides(tmp_path):
     assert probe.command[probe.command.index("--out-dir") + 1].endswith("runs/gpu_probe")
 
 
-def test_no_ablations_keeps_the_baseline_and_drops_the_rest(tmp_path):
-    names = [s.name for s in _plan(tmp_path, include_ablations=False)]
+def test_the_essentials_still_include_stage_2_and_evaluation(tmp_path):
+    """Dropping the ablations must not drop the things that produce a shippable result."""
+    names = [s.name for s in _plan(tmp_path)]
     assert "baseline" in names and "one_cycle" not in names
     assert "refiner" in names and "evaluation" in names
+
+
+def test_a_summary_still_shows_an_ablation_somebody_ran_once(tmp_path):
+    """Results are read with ablations included whatever the plan was built with, or a row
+    would vanish from the table the moment the default stopped including it."""
+    from dawn.pipeline import stage_one_runs
+
+    assert {r["name"] for r in stage_one_runs(CAMPAIGN)} == {"baseline", "one_cycle"}
+    assert {r["name"] for r in stage_one_runs(CAMPAIGN, False)} == {"baseline"}
 
 
 def test_no_gates_drops_only_the_gates(tmp_path):
@@ -291,9 +301,10 @@ def test_sec_per_step_comes_from_the_probes_csv_and_ignores_the_warm_up(tmp_path
 
 
 def test_the_plan_table_totals_only_what_is_left_to_run(tmp_path):
-    stages = _plan(tmp_path)
-    stages[2].out_dir.mkdir(parents=True)
-    (stages[2].out_dir / "flow_last.pt").write_bytes(b"x")  # baseline already finished
+    stages = _plan(tmp_path, include_ablations=True)
+    baseline = next(s for s in stages if s.name == "baseline")
+    baseline.out_dir.mkdir(parents=True)
+    (baseline.out_dir / "flow_last.pt").write_bytes(b"x")  # baseline already finished
     table = plan_table(stages, {s.name: s.hours for s in stages})
     assert "| `baseline` | train | done |" in table
     assert "9.6 GPU-hours remaining" in table  # 17.6 total less the finished 8
@@ -391,7 +402,7 @@ def test_the_shipped_campaign_names_real_configs_and_one_knob_per_ablation():
     loaded = omegaconf.OmegaConf.load(repo / "configs/experiments.yaml")
     cfg = omegaconf.OmegaConf.to_container(loaded)
     paths = list(cfg["common_overrides"])
-    for run in cfg["runs"]:
+    for run in cfg["runs"] + cfg.get("ablations", []):
         paths += list(run.get("overrides") or [])
     for gate in cfg["gates"]:
         paths += [c for c in gate["command"] if str(c).endswith(".yaml")]
@@ -401,9 +412,6 @@ def test_the_shipped_campaign_names_real_configs_and_one_knob_per_ablation():
         assert (repo / command[0]).exists(), command[0]
 
     assert cfg["runs"][0]["name"] == "baseline" and not cfg["runs"][0].get("overrides")
-    for run in cfg["runs"][1:]:
-        assert len(run["overrides"]) == 1, f"{run['name']} moves more than one knob"
-        assert run.get("ablates"), f"{run['name']} does not say which key it ablates"
 
 
 # --- the data preflight -------------------------------------------------------------------------

@@ -123,7 +123,15 @@ python scripts/run_pipeline.py --yes       # run it
 python scripts/run_pipeline.py --summary   # the comparison table, at any point
 ```
 
-`configs/experiments.yaml` declares the campaign and nothing else decides what runs: four gates, the baseline, one ablation per open decision, stage 2, then evaluation on the winner. Roughly 50 GPU-hours end to end, which is why nothing starts without `--yes`.
+`configs/experiments.yaml` declares the campaign and nothing else decides what runs. The default is the **essentials**: four gates, one stage-1 run, the refiner, and evaluation on the test split — about **10 GPU-hours**, one night, and it produces a shippable model plus the numbers for the README.
+
+| | stages | GPU-hours |
+|---|---|---|
+| **default** (essentials) | 7 | **~10** — one night |
+| default + `configs/fast.yaml` | 7 | ~7 — an evening |
+| `--ablations` (research) | 12 | ~49 — two days |
+
+The five ablations are **parked**, not deleted: each answers an open decision in `CLAUDE.md`, which is knowledge about the method rather than a better model. Run one on its own later if a curve makes you curious (`--only correction`), not as a matter of course.
 
 - **It refuses to start without the data.** A preflight checks the manifests and the aligned PNGs before anything else, because the manifests are committed and the 5,385 × 5 PNGs are not — on a fresh clone that is the first thing that would otherwise fail, a minute into an overnight run.
 - **Gates really gate.** The oracle's 24 dB rule and "the overfit run must approach its own oracle" stop the campaign, and the failure prints what to do rather than only what broke.
@@ -131,16 +139,17 @@ python scripts/run_pipeline.py --summary   # the comparison table, at any point
 - **The cost is measured, not guessed.** `gpu_probe` measures seconds/step on the real configuration and every later estimate is rescaled from it.
 - **One knob per ablation.** `baseline` first and alone; `correction`, `one_cycle`, `segment_equal`, `bgu` and `plain_schedule` are each the baseline plus exactly one overlay, so a difference is attributable. A test pins that rule against the shipped file.
 
-`--only`, `--skip`, `--from`, `--no-ablations` and `--no-gates` select a subset; `--keep-going` carries on past a failed run (never past a failed gate).
+`--only`, `--skip`, `--from`, `--ablations` and `--no-gates` select what runs; `--keep-going` carries on past a failed run (never past a failed gate). `--skip refiner` drops stage 2, which the plan lists first in its own cut order.
 
-**If two days is too long**, `configs/fast.yaml` applies to every stage at once:
+**If one night is still too long**, `configs/fast.yaml` applies to every stage at once:
 
 ```bash
-python scripts/run_pipeline.py --extra-override configs/fast.yaml --yes                  # ~30 h
-python scripts/run_pipeline.py --extra-override configs/fast.yaml --no-ablations --yes   # ~7 h
+python scripts/run_pipeline.py --extra-override configs/fast.yaml --yes   # ~7 h
 ```
 
-52 epochs instead of 87 and `timesteps_per_image` back to 4, with every step-denominated knob rescaled with the budget so the *shape* of the schedule is unchanged. **Note what is not in that list: `optim.batch_size`.** Total work per epoch is `3,662 × 45 GMAC × 2 passes` (DINO, fixed) plus `3,662 × timesteps × 10 GMAC` (velocity) — neither term contains the batch size, so raising it does not save time. It only buys fewer optimizer steps, and on 3,662 pairs that goes bad fast: batch 128 at the same epoch count is 2,500 steps, which is *below* `flow.warmup_steps`, so the conditioning detach would never lift and the run would look healthy the whole way. The levers that work are epochs, timesteps, and how many runs you do.
+52 epochs instead of 87 and `timesteps_per_image` back to 4, with every step-denominated knob rescaled with the budget so the *shape* of the schedule is unchanged.
+
+**Note what is not on that list: `optim.batch_size`.** Total work per epoch is `3,662 × 45 GMAC × 2 passes` (DINO, fixed) plus `3,662 × timesteps × 10 GMAC` (velocity) — neither term contains the batch size, so raising it cannot save time; at a fixed epoch count it is half as many steps costing twice as much. What it does buy is fewer optimizer steps, and on 3,662 pairs that goes bad fast: batch 128 at the same epochs is 2,500 steps, *below* `flow.warmup_steps`, so the conditioning detach would never lift and the run would look healthy the whole way. The levers that work are epochs, timesteps, and how many runs you do.
 
 ### GPU gate commands, by hand
 

@@ -94,9 +94,11 @@ def parse_args() -> argparse.Namespace:
         "--from", dest="start_from", default=None, metavar="STAGE", help="Start at this stage"
     )
     parser.add_argument(
-        "--no-ablations",
+        "--ablations",
         action="store_true",
-        help="Baseline only: the gates, one stage-1 run, stage 2 and evaluation",
+        help="Also run the parked ablations: five more stage-1 runs, one knob each. They "
+        "answer open decisions about the METHOD; the default campaign ships a model without "
+        "them, at about a fifth of the GPU time.",
     )
     parser.add_argument("--no-gates", action="store_true", help="Skip the gates (not advised)")
     parser.add_argument(
@@ -151,7 +153,7 @@ def main() -> int:
     stages = build_plan(
         cfg,
         root=root,
-        include_ablations=not args.no_ablations,
+        include_ablations=args.ablations,
         include_gates=not args.no_gates,
         repo=ROOT,
         extra_overrides=args.extra_override,

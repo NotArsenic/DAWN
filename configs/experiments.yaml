@@ -1,8 +1,8 @@
-# The whole training campaign, declared once: gates, the baseline, the ablations, stage 2, eval.
+# The training campaign, declared once: gates, the baseline, stage 2, evaluation.
 #
 #   python scripts/run_pipeline.py --list            # what would run, in order, with the cost
 #   python scripts/run_pipeline.py --dry-run         # the exact commands, run nothing
-#   python scripts/run_pipeline.py --yes             # run it
+#   python scripts/run_pipeline.py --yes             # run it: the essentials, one night
 #   python scripts/run_pipeline.py --only baseline   # one stage
 #   python scripts/run_pipeline.py --summary         # the comparison table, any time
 #
@@ -10,10 +10,19 @@
 # idempotent: a finished stage is skipped, a half-finished training run is resumed from its own
 # `flow_last.pt`, so an overnight sequence that dies on stage 5 does not lose stages 1 to 4.
 #
-# THE ONE RULE FOR ABLATIONS: one knob against the baseline, never two. With a handful of runs
-# available, changing the schedule and (say) brightness_correction in the same run makes the
-# result unattributable (docs/training_budget_and_changes.md section 2). `abl_plain_schedule` is
-# the single deliberate exception and says why in its own file.
+# WHAT RUNS BY DEFAULT is the essentials only: the four gates, ONE stage-1 run, the refiner, and
+# evaluation on the test split. That is what a working project needs -- a trained model, the
+# numbers to put in the README, and the gates that prove the numbers mean something.
+#
+# The `ablations:` block below is PARKED and does not run unless you pass `--ablations`. Each
+# answers an open decision in CLAUDE.md, which is a research question, not a deliverable: they
+# cost five extra runs for knowledge about the method rather than a better model. Run one on its
+# own later if a curve makes you curious (`--only correction`), not as a matter of course.
+#
+# THE ONE RULE IF YOU DO RUN THEM: one knob against the baseline, never two. Changing the
+# schedule and (say) brightness_correction in the same run makes the result unattributable
+# (docs/training_budget_and_changes.md section 2). `abl_plain_schedule` is the single deliberate
+# exception and says why in its own file.
 
 # Appended to every train/eval command. This is where the hardware choice lives: drop
 # `configs/gpu_5090.yaml` to run the 16 GB profile instead.
@@ -77,13 +86,21 @@ gates:
         against loss/flow_color and the render sheets before going further.
 
 # --- stage 1 -----------------------------------------------------------------------------------
-# `baseline` first and alone; everything else is read against it.
+# The model. One run: 20,000 steps at batch 16 is ~87 passes over the 3,662 train pairs, and
+# flow.yaml already calls 40,000 "well into overfitting".
 runs:
   - name: baseline
     hours: 8
-    tests: The reference run. Every ablation below is this plus exactly one knob.
+    tests: >-
+      The model. 20K steps, the plan's schedule, everything at its decided default. This is the
+      checkpoint that gets evaluated and shipped.
     overrides: []
 
+# --- parked: research, not a deliverable --------------------------------------------------------
+# Not run unless `--ablations`. Five more runs, each the baseline plus exactly one knob, each
+# answering an open decision in CLAUDE.md. They make the method better understood, not the model
+# better. If you run one, run it alone: `--only correction`.
+ablations:
   - name: correction
     hours: 8
     ablates: brightness_correction.enabled
@@ -129,6 +146,9 @@ refiner:
   tests: >-
     Does a bounded 9x9 sharpener on L earn its place? One number decides: psnr_L/improvement,
     refined minus unrefined on the same val pairs. Not positive means cut it.
+  # Kept in the essentials because it is about an hour and the plan ships it as part of the
+  # pipeline. It is also the plan's own first cut: `--skip refiner` if the night is tight, and
+  # inference without `--refiner` is byte-identical to stage 1 alone.
   check:
     kind: val_metric
     metric: psnr_L/improvement

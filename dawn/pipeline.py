@@ -8,8 +8,10 @@ The shape of a campaign (`configs/experiments.yaml`):
 
     gates       cheap checks, in order, each a gate for the next. smoke -> oracle -> probe ->
                 overfit. None of the expensive runs starts until these pass.
-    runs        stage 1: `baseline` first and alone, then one ablation per open decision, each
-                exactly one knob off the baseline.
+    runs        stage 1. One run by default: the model that gets shipped.
+    ablations   PARKED. One extra run per open decision, each exactly one knob off the
+                baseline. Opt in with `--ablations`; they buy understanding of the method, not
+                a better model, and they are five times the GPU time of everything else.
     refiner     stage 2, trained off the fitted grid so it does not depend on which run won.
     evaluation  the winning checkpoint on the test split.
 
@@ -110,6 +112,19 @@ class StageResult:
 # --- building the plan ---------------------------------------------------------------------------
 
 
+def stage_one_runs(cfg: Mapping, include_ablations: bool = True) -> list[Mapping]:
+    """The stage-1 runs: always `runs`, plus `ablations` when they are wanted.
+
+    Reading results always wants both -- a summary written after someone ran `--ablations` must
+    still show those rows -- so `summary_table` and `pick_winner` pass True while `build_plan`
+    passes whatever the caller asked for.
+    """
+    runs = list(cfg.get("runs") or [])
+    if include_ablations:
+        runs += list(cfg.get("ablations") or [])
+    return runs
+
+
 def _train_command(
     out_dir: Path, overrides: Sequence[str], device: str, extra: Sequence[str] = ()
 ) -> tuple[str, ...]:
@@ -123,7 +138,7 @@ def _train_command(
 def build_plan(
     cfg: Mapping,
     root: Path | None = None,
-    include_ablations: bool = True,
+    include_ablations: bool = False,
     include_gates: bool = True,
     repo: Path | None = None,
     extra_overrides: Sequence[str] = (),
@@ -163,9 +178,7 @@ def build_plan(
                 )
             )
 
-    for run in cfg.get("runs") or []:
-        if not include_ablations and run["name"] != "baseline":
-            continue
+    for run in stage_one_runs(cfg, include_ablations):
         out_dir = root / run["name"]
         overrides = common + list(run.get("overrides") or [])
         stages.append(
@@ -350,11 +363,13 @@ def rescale_hours(stages: Sequence[Stage], measured: float, reference: float) ->
     seconds = measured if measured and measured > 0 else reference
     hours = {}
     for stage in stages:
-        if stage.kind == GATE:
-            hours[stage.name] = stage.hours
-        elif stage.steps:
+        # Only stage-1 runs share the probe's step profile. A gate is short and dominated by
+        # data loading; the refiner has no DINO pass at all -- two encoder passes over 16
+        # frames against a 2,545-parameter conv on a crop -- so costing its 8,000 steps at the
+        # flow's rate would overstate it several times over. Both keep their declared estimate.
+        if stage.kind == TRAIN and stage.steps:
             hours[stage.name] = stage.steps * seconds / 3600.0
-        elif measured and reference:
+        elif stage.kind == TRAIN and measured and reference:
             hours[stage.name] = stage.hours * measured / reference
         else:
             hours[stage.name] = stage.hours
@@ -440,7 +455,7 @@ def summary_table(cfg: Mapping, root: Path, subset: str = "box_aligned") -> str:
     knob each row moved named beside it so a difference can be attributed to something.
     """
     rows = []
-    for run in cfg.get("runs") or []:
+    for run in stage_one_runs(cfg):
         scores = run_metrics(root / run["name"], subset)
         if not scores:
             continue
@@ -489,7 +504,7 @@ def pick_winner(cfg: Mapping, root: Path, subset: str = "box_aligned") -> tuple[
         return None
     higher_is_better = metric == "psnr_L"
     best: tuple[float, str] | None = None
-    for run in cfg.get("runs") or []:
+    for run in stage_one_runs(cfg):
         scores = run_metrics(root / run["name"], subset)
         checkpoint = root / run["name"] / "flow_best.pt"
         if key not in scores or not checkpoint.exists():
@@ -672,5 +687,6 @@ __all__ = [
     "run_metrics",
     "run_stage",
     "save_state",
+    "stage_one_runs",
     "summary_table",
 ]
