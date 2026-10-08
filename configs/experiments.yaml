@@ -1,0 +1,145 @@
+# The whole training campaign, declared once: gates, the baseline, the ablations, stage 2, eval.
+#
+#   python scripts/run_pipeline.py --list            # what would run, in order, with the cost
+#   python scripts/run_pipeline.py --dry-run         # the exact commands, run nothing
+#   python scripts/run_pipeline.py --yes             # run it
+#   python scripts/run_pipeline.py --only baseline   # one stage
+#   python scripts/run_pipeline.py --summary         # the comparison table, any time
+#
+# `scripts/run_pipeline.py` reads this file and nothing else decides what runs. Re-running is
+# idempotent: a finished stage is skipped, a half-finished training run is resumed from its own
+# `flow_last.pt`, so an overnight sequence that dies on stage 5 does not lose stages 1 to 4.
+#
+# THE ONE RULE FOR ABLATIONS: one knob against the baseline, never two. With a handful of runs
+# available, changing the schedule and (say) brightness_correction in the same run makes the
+# result unattributable (docs/training_budget_and_changes.md section 2). `abl_plain_schedule` is
+# the single deliberate exception and says why in its own file.
+
+# Appended to every train/eval command. This is where the hardware choice lives: drop
+# `configs/gpu_5090.yaml` to run the 16 GB profile instead.
+common_overrides: [configs/gpu_5090.yaml]
+
+device: cuda
+
+# Where everything lands. Each stage gets `<root>/<stage name>/`.
+root: runs
+
+# --- gates -------------------------------------------------------------------------------------
+# In order, each a gate for the next. A gate that fails STOPS the pipeline: the whole point is
+# that none of the expensive runs start until the cheap checks have passed.
+gates:
+  - name: smoke_dino
+    hours: 0.05
+    tests: Real DINOv3 weights load, the LoRA targets match, shapes and VRAM are sane.
+    command: [scripts/smoke_dino.py, --backend, timm, --batch-size, "16"]
+    # Nothing to check numerically; a non-zero exit is the failure.
+
+  - name: oracle
+    hours: 0.2
+    tests: >-
+      The measured ceiling of this parametrization. The plan's decision rule: at about 24 dB or
+      more the brightness grid alone is kept, below that the generated correction is needed.
+    command: [scripts/check_oracle.py, --device, cuda]
+    check:
+      kind: oracle_psnr
+      metric: psnr_grid_r1
+      rows: outputs/oracle/rows_val.jsonl
+      min: 24.0
+      on_fail: >-
+        The grid alone is under the plan's 24 dB bar, so brightness is not a regional curve of
+        thermal on this data. Turn `brightness_correction.enabled` on (configs/correction.yaml)
+        and make THAT the baseline before spending a night on anything else.
+
+  - name: gpu_probe
+    hours: 0.1
+    tests: >-
+      Peak VRAM and seconds/step of the real configuration, 50 steps. Also what every cost
+      estimate below is rescaled from, so the plan's hours stop being a guess.
+    command:
+      [scripts/train_flow.py, --override, configs/gpu_probe.yaml, --max-steps, "50"]
+    measures_sec_per_step: true
+
+  - name: overfit
+    hours: 0.5
+    tests: >-
+      100 pairs, full resolution: the render must approach the matching oracle. If a model cannot
+      fit 100 frames it will not fit 3,662, and the fault is the code, not the data.
+    command: [scripts/train_flow.py, --override, configs/overfit_gpu.yaml, --overfit, "100"]
+    check:
+      kind: val_metric
+      metric: psnr_L/euler
+      # Against the oracle logged beside it in the same validation row.
+      relative_to: psnr_L/oracle
+      min_fraction: 0.85
+      on_fail: >-
+        The overfit gate did not approach its own oracle. Something is wrong in the model or the
+        targets; a full run would only spend a night confirming it. Check loss/flow_brightness
+        against loss/flow_color and the render sheets before going further.
+
+# --- stage 1 -----------------------------------------------------------------------------------
+# `baseline` first and alone; everything else is read against it.
+runs:
+  - name: baseline
+    hours: 8
+    tests: The reference run. Every ablation below is this plus exactly one knob.
+    overrides: []
+
+  - name: correction
+    hours: 8
+    ablates: brightness_correction.enabled
+    tests: >-
+      The generated L correction at the colour-map size. The oracle puts it at 26.9 dB against
+      25.1 for the grid alone; this asks whether a model can actually reach any of that. A layout
+      change (the token goes 48 -> 64), so its checkpoints are not interchangeable.
+    overrides: [configs/correction.yaml]
+
+  - name: one_cycle
+    hours: 8
+    ablates: optim.schedule
+    tests: Smith's one cycle against the plan's warmup-then-cosine.
+    overrides: [configs/abl_one_cycle.yaml]
+
+  - name: segment_equal
+    hours: 8
+    ablates: flow.segment_balance
+    tests: Weigh brightness and colour equally in L_flow instead of per value.
+    overrides: [configs/abl_segment_equal.yaml]
+
+  - name: bgu
+    hours: 8
+    ablates: color.upsample
+    tests: >-
+      Edge-aware colour upsampling on a GENERATED map, which is the one thing the oracle's
+      measurement could not settle.
+    overrides: [configs/abl_bgu.yaml]
+
+  - name: plain_schedule
+    hours: 8
+    ablates: optim.ema_warmup + flow.warmup_ramp_steps
+    tests: >-
+      The control for the two schedule smoothings. Both off is the plan's literal schedule.
+    overrides: [configs/abl_plain_schedule.yaml]
+
+# --- stage 2 -----------------------------------------------------------------------------------
+# Trained once, off the fitted grid, so it does not depend on which stage-1 run won
+# (docs/proposals_review.md section 8 -- that independence is also its known weakness).
+refiner:
+  name: refiner
+  hours: 1
+  tests: >-
+    Does a bounded 9x9 sharpener on L earn its place? One number decides: psnr_L/improvement,
+    refined minus unrefined on the same val pairs. Not positive means cut it.
+  check:
+    kind: val_metric
+    metric: psnr_L/improvement
+    min: 0.0
+    on_fail: >-
+      The refiner did not improve L* PSNR. That is a real answer, not a failure: the plan lists
+      it first in its own cut order. Drop --refiner at inference and move on.
+
+# --- evaluation --------------------------------------------------------------------------------
+# On the winning stage-1 checkpoint, chosen by `select_by` over the runs above.
+evaluation:
+  select_by: ciede2000          # the metric that picks the winning run (lower is better)
+  split: test_pairs
+  hours: 0.3

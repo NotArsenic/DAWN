@@ -1,0 +1,11 @@
+# Ablation: weigh each L_flow segment equally instead of per value.
+#
+#   --override configs/gpu_5090.yaml configs/abl_segment_equal.yaml
+#
+# A token is [brightness 16 | colour 32]. `per_value` (the baseline) is a plain mean over the
+# token, so colour carries twice brightness's weight; `equal` gives each segment's own mean the
+# same weight. CLAUDE.md parks this as open until the loss/flow_brightness and loss/flow_color
+# curves show which lags -- this run is how that gets answered.
+
+flow:
+  segment_balance: equal

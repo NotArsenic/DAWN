@@ -1,0 +1,12 @@
+# Ablation: bilateral guided upsampling for the a*b* map instead of bilinear.
+#
+#   --override configs/gpu_5090.yaml configs/abl_bgu.yaml
+#
+# The maintainer chose bilinear at the oracle checkpoint on a MEASURED ceiling (0.90 vs 1.28 mean
+# |delta a*b*|, CIEDE2000 3.33 vs 3.50). This run is not re-litigating that; it tests the thing
+# the oracle could not see, which is whether a GENERATED colour map -- smoother than the true one
+# the ceiling was measured with -- is helped by an edge-aware upsample at real thermal boundaries.
+# Read it next to the `ab_err_*_edge` numbers in outputs/oracle/report.md.
+
+color:
+  upsample: bgu

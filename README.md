@@ -97,9 +97,27 @@ Validation runs every 500 steps (40 points over the run) and logs, for box-align
 
 Everything that goes to Weights & Biases is also written under `--out-dir`: `train_log.jsonl`, `metrics/<kind>.csv` and `run_config.json`, so the plots can be rebuilt without it. Details and the reasoning: [`docs/training_budget_and_changes.md`](docs/training_budget_and_changes.md) §1a, §1b and §3.
 
-### GPU gate commands
+### One command for the whole campaign
 
-In this order; each is a gate for the next. The Mac cannot measure VRAM at 640×512. Add `configs/gpu_5090.yaml` to every `--override` below if you are on the 32 GB card.
+```bash
+python scripts/run_pipeline.py --list      # what would run, in order, with the GPU-hours
+python scripts/run_pipeline.py --dry-run   # the exact commands, run nothing
+python scripts/run_pipeline.py --yes       # run it
+python scripts/run_pipeline.py --summary   # the comparison table, at any point
+```
+
+`configs/experiments.yaml` declares the campaign and nothing else decides what runs: four gates, the baseline, one ablation per open decision, stage 2, then evaluation on the winner. Roughly 50 GPU-hours end to end, which is why nothing starts without `--yes`.
+
+- **Gates really gate.** The oracle's 24 dB rule and "the overfit run must approach its own oracle" stop the campaign, and the failure prints what to do rather than only what broke.
+- **Resumable and idempotent.** A finished stage is skipped; a half-finished run restarts with `--resume`. Dying on stage 9 at 4 a.m. keeps stages 1–8. The record is `runs/pipeline_state.json`, and every stage streams to `runs/logs/<stage>.log`.
+- **The cost is measured, not guessed.** `gpu_probe` measures seconds/step on the real configuration and every later estimate is rescaled from it.
+- **One knob per ablation.** `baseline` first and alone; `correction`, `one_cycle`, `segment_equal`, `bgu` and `plain_schedule` are each the baseline plus exactly one overlay, so a difference is attributable. A test pins that rule against the shipped file.
+
+`--only`, `--skip`, `--from`, `--no-ablations` and `--no-gates` select a subset; `--keep-going` carries on past a failed run (never past a failed gate).
+
+### GPU gate commands, by hand
+
+What the pipeline runs for you, in case you want one of them on its own. Each is a gate for the next. The Mac cannot measure VRAM at 640×512. Add `configs/gpu_5090.yaml` to every `--override` below if you are on the 32 GB card.
 
 ```bash
 # 0. setup: PyTorch built for CUDA 12.8+ with sm_120
@@ -161,7 +179,9 @@ dawn/
 │   ├── data.yaml            # DroneVehicle paths and every data threshold (commented)
 │   ├── flow.yaml            # stage 1: resolution, grid, colour, losses, schedule, optimizer
 │   ├── debug.yaml, mps.yaml, gpu_probe.yaml, overfit_gpu.yaml, correction.yaml,
-│   │                        # gpu_5090.yaml (32 GB: timesteps 8)                 # overlays
+│   │                        # gpu_5090.yaml (32 GB), abl_*.yaml (one knob each)  # overlays
+│   ├── refiner.yaml         # stage 2
+│   ├── experiments.yaml     # the whole campaign: gates, baseline, ablations, stage 2, eval
 │   └── eval.yaml            # parked (inference/eval phase)
 ├── docs/
 │   ├── conventions.md       # layouts, coordinates, color spaces, token layout, data rules (read first)
@@ -182,6 +202,7 @@ dawn/
 │   └── uncertainty/         # parked: sample-spread maps land with the inference phase
 ├── scripts/
 │   ├── prepare_dronevehicle.py, audit_alignment.py   # data
+│   ├── run_pipeline.py                               # the whole campaign, one command
 │   ├── check_oracle.py, smoke_dino.py, train_flow.py # model phase (stage 1)
 │   ├── train_refiner.py                              # stage 2
 │   └── infer.py, evaluate.py, benchmark_latency.py   # parked
