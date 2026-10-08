@@ -198,11 +198,15 @@ def test_a_missing_folder_is_reported_without_raising(tmp_path):
 
 
 def test_stems_that_do_not_pair_across_the_four_folders_are_caught(tmp_path):
-    """The thing that actually breaks a prepare run: an RGB frame with no thermal label."""
+    """The thing that actually breaks a prepare run: RGB frames with no thermal counterpart.
+
+    Reported once they are more than a rounding error -- a few are tolerated, see below.
+    """
     _populate(tmp_path / "train", "train")
-    (tmp_path / "train" / "trainimg" / "99999.jpg").write_bytes(b"")
+    for i in range(20):
+        (tmp_path / "train" / "trainimg" / f"9{i:04d}.jpg").write_bytes(b"")
     problems = verify_split(tmp_path, "train")
-    assert any("trainimg has 1 stems the other three do not" in p for p in problems)
+    assert any("trainimg has 20 stems the other three do not" in p for p in problems)
 
 
 def test_a_frame_of_the_wrong_size_is_caught_before_the_pipeline_crops_it(tmp_path):
@@ -259,3 +263,21 @@ def test_an_archive_that_is_corrupt_throughout_still_raises(tmp_path):
     archive.write_bytes(bytes(raw))
     with pytest.raises(zipfile.BadZipFile, match="archive-level corruption"):
         safe_extract(archive, tmp_path / "work", max_bad=2)
+
+
+def test_a_handful_of_unpaired_stems_is_tolerated(tmp_path, caplog):
+    """A bad download costs a few files; the day stage already drops pairs missing a modality
+    (docs/conventions.md 10.1), so stopping the whole run over 0.1% is out of proportion."""
+    _populate(tmp_path / "train", "train")  # 120 paired stems
+    (tmp_path / "train" / "trainimg" / "99999.jpg").write_bytes(b"")  # 1 unpaired, 0.8%
+    with caplog.at_level("WARNING"):
+        assert verify_split(tmp_path, "train") == []
+    assert "tolerated" in caplog.text
+
+
+def test_many_unpaired_stems_still_fail(tmp_path):
+    """Losing a tenth of a folder is a broken download, not a few bad files."""
+    _populate(tmp_path / "train", "train")
+    for i in range(20):  # 14% of the folder
+        (tmp_path / "train" / "trainimg" / f"9{i:04d}.jpg").write_bytes(b"")
+    assert any("stems the other three do not" in p for p in verify_split(tmp_path, "train"))

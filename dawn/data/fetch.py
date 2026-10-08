@@ -42,6 +42,10 @@ MIN_FILES_PER_FOLDER = 100
 # Corrupt members tolerated per archive before it counts as archive-level corruption rather
 # than one bad file. 56,878 images per the dataset card, so this is well under 0.1%.
 MAX_BAD_MEMBERS = 50
+# Share of a folder's stems that may fail to pair across the four before it counts as a broken
+# download rather than a few bad files. 1% of ~28,400 is ~280 pairs, which the alignment filter
+# would mostly have discarded anyway.
+MAX_UNPAIRED_FRACTION = 0.01
 ARRANGE_MODES = ("symlink", "copy", "move")
 
 
@@ -255,9 +259,21 @@ def verify_split(root: Path, split: str, sample: int = 5) -> list[str]:
         return problems
 
     shared = set.intersection(*counts.values())
+    # A few unpaired stems are not a reason to stop. `prepare_dronevehicle.py stats` already
+    # gives a pair missing a modality (or carrying an unreadable JPEG) a status and drops it at
+    # the day stage (docs/conventions.md section 10.1), and a handful of corrupt files in a
+    # 28,411-pair download costs almost nothing once the alignment filter has taken its ~80%.
+    # A LOT of them is a bad download, which is a different thing and still fails.
     for name, stems in counts.items():
-        if extra := len(stems - shared):
-            problems.append(f"{split}/{name} has {extra} stems the other three do not")
+        extra = len(stems - shared)
+        if not extra:
+            continue
+        share = extra / max(len(stems), 1)
+        message = f"{split}/{name} has {extra} stems the other three do not ({share:.1%})"
+        if share > MAX_UNPAIRED_FRACTION:
+            problems.append(message)
+        else:
+            logger.warning("%s -- tolerated; those pairs drop out at the day stage", message)
     if not shared:
         problems.append(f"{split}: no stem appears in all four folders")
         return problems
@@ -297,6 +313,7 @@ __all__ = [
     "ARRANGE_MODES",
     "FOLDER_SUFFIXES",
     "MAX_BAD_MEMBERS",
+    "MAX_UNPAIRED_FRACTION",
     "MIN_FILES_PER_FOLDER",
     "REPO_ID",
     "SPLITS",
