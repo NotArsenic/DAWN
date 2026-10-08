@@ -8,7 +8,9 @@ CIELAB):
     + correction the same grid plus the generated-L correction at the colour-map size, upsampled
                  bilinearly and by the BGU (both through `render`)
     colour       the true a*b* area-averaged to the colour-map size and brought back up by the BGU
-                 guided by the true L, against bilinear: mean |delta a*b*|
+                 guided by the true L, against bilinear: mean |delta a*b*|, over the whole frame
+                 and again restricted to the top decile of gradient magnitude (`*_edge`), where
+                 an upsampling that bleeds across boundaries would show
     assembled    the whole oracle image through `render` (grid-only and with the correction, each
                  upsample mode): CIEDE2000 next to the L* PSNR
 
@@ -30,7 +32,7 @@ from torch.utils.data import DataLoader, Subset, default_collate
 
 from dawn.data.resample import area_downsample
 from dawn.data.sheets import thumbnail, thumbnail_thermal, tile_sheet
-from dawn.eval.metrics import ciede2000, masked_mean, masked_psnr
+from dawn.eval.metrics import ciede2000, edge_quantile_mask, masked_mean, masked_psnr
 from dawn.flow.render import RenderSettings, render
 from dawn.flow.targets import FitSettings, build_targets, prepare_batch
 from dawn.flow.tokens import TokenLayout
@@ -50,6 +52,8 @@ METRICS = (
     "psnr_corr_bgu_r1",
     "ab_err_bilinear",
     "ab_err_bgu",
+    "ab_err_bilinear_edge",
+    "ab_err_bgu_edge",
     "de_grid_only_bilinear",
     "de_grid_only_bgu",
     "de_with_correction_bilinear",
@@ -64,6 +68,8 @@ LABELS = {
     "psnr_corr_bgu_r1": "grid + correction (BGU), refine 1 (dB)",
     "ab_err_bilinear": "colour ceiling, bilinear (mean abs delta a*b*)",
     "ab_err_bgu": "colour ceiling, BGU (mean abs delta a*b*)",
+    "ab_err_bilinear_edge": "colour ceiling AT EDGES, bilinear (mean abs delta a*b*)",
+    "ab_err_bgu_edge": "colour ceiling AT EDGES, BGU (mean abs delta a*b*)",
     "de_grid_only_bilinear": "assembled oracle, grid only, bilinear colour (CIEDE2000)",
     "de_grid_only_bgu": "assembled oracle, grid only, BGU colour (CIEDE2000)",
     "de_with_correction_bilinear": "assembled oracle, with correction, bilinear (CIEDE2000)",
@@ -115,10 +121,19 @@ def measure_batch(batch: Mapping, cfg: Mapping) -> dict[str, torch.Tensor]:
                 )
             ab_up, ab_bil = colour_ceiling(plain, base, size, off)
             true_ab = plain.lab[:, 1:]
-            out["ab_err_bgu"] = masked_mean(torch.linalg.vector_norm(ab_up - true_ab, dim=1), mask)
-            out["ab_err_bilinear"] = masked_mean(
-                torch.linalg.vector_norm(ab_bil - true_ab, dim=1), mask
+            err_bgu = torch.linalg.vector_norm(ab_up - true_ab, dim=1)
+            err_bil = torch.linalg.vector_norm(ab_bil - true_ab, dim=1)
+            out["ab_err_bgu"] = masked_mean(err_bgu, mask)
+            out["ab_err_bilinear"] = masked_mean(err_bil, mask)
+            # The same two numbers restricted to structural edges. The whole-frame means are
+            # dominated by flat asphalt and roofs, so they cannot answer whether bilinear bleeds
+            # across sharp boundaries -- which is the one objection the Checkpoint A measurement
+            # left open (docs/proposals_review.md section 3.B).
+            edge = mask * edge_quantile_mask(
+                plain.lab[:, :1] / 100.0, mask, float(cfg["color"].get("edge_quantile", 0.9))
             )
+            out["ab_err_bgu_edge"] = masked_mean(err_bgu, edge)
+            out["ab_err_bilinear_edge"] = masked_mean(err_bil, edge)
     return out
 
 

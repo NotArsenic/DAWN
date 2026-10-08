@@ -30,16 +30,17 @@ num_train_steps = epochs * steps_per_epoch
 **Recommendation: 80-100 epochs for the first full run.** At batch 16 that is the 20,000 steps
 already in `flow.yaml` (87 epochs).
 
-### Why a big batch is the wrong way to spend an A100
+### Why a big batch is the wrong way to spend a 32 GB card
 
-The temptation on a 40/80 GB card is `batch_size: 128`. It does not work here, and the reason is
+The temptation on a 32 GB card is `batch_size: 128`. It does not work here, and the reason is
 the dataset, not the card: 3,662 pairs over a batch of 128 is **29 steps per epoch**, so a
 100-epoch run is 2,900 optimizer steps in total.
 
 - 2,900 steps is **fewer than `flow.warmup_steps` (3,000)**, so the conditioning detach would
   never lift and the velocity net would train on frozen features for the entire run. That is a
-  silent wrong result, not a crash.
-- `logging.save_every: 5000` would never fire; `val_every: 2500` would fire once.
+  silent wrong result, not a crash. The start-of-run `Budget:` line (`budget_summary`) now prints
+  this in epochs, so the trap is visible rather than inferred.
+- `logging.save_every: 5000` would never fire; `val_every: 500` would give 5 points, not 40.
 - EMA at 0.999 has a horizon of ~1,000 steps, which at batch 128 is 35 epochs — over a third of
   training, so the average lags the weights badly.
 - More fundamentally, a 7M-parameter transformer plus LoRA wants **optimizer steps**, not just
@@ -53,7 +54,7 @@ steps per epoch — the arithmetic intensity you wanted from batch 128, with 4×
 
 | what you want | do this | not this |
 |---|---|---|
-| use the A100's memory | `timesteps_per_image: 8`, `batch_size: 16-32` | `batch_size: 128` |
+| use the 5090's memory | `configs/gpu_5090.yaml` (`timesteps_per_image: 8`) | `batch_size: 128` |
 | finish sooner | fewer epochs, same batch | a bigger batch at the same epoch count |
 
 If you do go past 32, rescale every constant in the table below **and** check that
@@ -95,14 +96,92 @@ than the plain cosine is, because it sits near the peak for much longer.
 
 ### Hardware
 
-Training is on an **A100**, not the 16 GB RTX 5060 Ti the spec and `README.md` assume. That retires
-the VRAM concern those documents are built around: at batch 16 × 4 timesteps the velocity net's
-attention needs roughly 5 GB (the DINO attention bias is an additive float mask, so SDPA cannot use
-a flash kernel and has to materialize `64 × 4 × 1280 × 1280` scores per block and keep them for
-backward). On 16 GB that was tight enough to expect the 8 × 4 fallback; on an A100 it is not a
-constraint, and a larger batch is available if the step count is re-derived from the table above.
+Training is on an **RTX 5090 (32 GB)**, not the 16 GB RTX 5060 Ti the spec and `README.md` assume.
+Same Blackwell architecture, so the setup requirement carries over unchanged: PyTorch built for
+CUDA 12.8 or newer with `sm_120` in `torch.cuda.get_arch_list()`.
 
-`configs/gpu_probe.yaml` is still worth 50 steps before an overnight run, for seconds/step.
+What 32 GB retires is the VRAM concern those documents are built around. At batch 16 × 4 timesteps
+the velocity net's attention needs roughly 5 GB: the DINO attention bias is an additive float mask,
+so SDPA cannot use a flash kernel and has to materialize `64 × 4 × 1280 × 1280` scores per block
+and keep them for backward. On 16 GB that was tight enough to plan the 8 × 4 fallback; on 32 GB it
+is not a constraint and the fallback can be ignored.
+
+**`configs/gpu_5090.yaml`** is the overlay that spends the headroom, and it spends it on
+`flow.timesteps_per_image: 8` rather than on the batch, for the reason in the section above: one
+encoder pass already feeds `timesteps_per_image` velocity passes, so 4 → 8 doubles the velocity
+samples per optimizer step and leaves steps-per-epoch untouched. It also sets
+`flow.render_subset: 64`, because L_render would otherwise double to 128 rendered 256×320 images
+per step; a random 64 of the 128 is an unbiased estimate of the same mean, so the render path
+keeps its current cost while L_flow gets twice the samples.
+
+Expect roughly **2× the step time** from that change. Run `configs/gpu_probe.yaml` *with* the 5090
+overlay for 50 steps before committing a night to it — the probe is the only thing that knows the
+real seconds/step and peak VRAM:
+
+```bash
+python scripts/train_flow.py --config configs/flow.yaml \
+    --override configs/gpu_probe.yaml configs/gpu_5090.yaml \
+    --device cuda --max-steps 50 --out-dir outputs/gpu_probe
+```
+
+If the probe shows comfortable headroom, the next-biggest wall-clock win is `encoder.
+grad_checkpointing: false` — it trades a few GB for not recomputing DINO's 12 blocks on every
+backward. It is left on in the overlay because an out-of-memory crash costs a whole run and the
+recompute does not.
+
+---
+
+## 1a. Validation resolution
+
+`logging.val_every` was 2,500, which over a 20,000-step run produces **eight validation points**.
+That is not the resolution needed to see a divergence begin, and on 3,662 training pairs over ~87
+epochs a divergence is the headline risk. It is now **500**, giving 40.
+
+Three things were added with it, because more points are only useful if they measure the right
+things:
+
+| key | what it adds |
+|---|---|
+| `logging.val_loss_batches: 8` | `FlowTrainer.validate_loss`: the **training objective itself** on held-out pairs. `validate` scores sampled image quality, which is what the model is for; this is the loss it is minimizing, and a train curve falling while this one turns up is the memorization signal. Nothing in the run reported it before |
+| `logging.select_metric: ciede2000` | which number picks `flow_best.pt`. It was L\* PSNR alone — and L\* comes mostly from the brightness grid fitted on thermal, the half of the model least able to memorize, so selection was blind to colour going wrong. CIEDE2000 is the full Lab difference: brightness **and** colour. `psnr_L` remains selectable |
+| `logging.val_retrieval: true` | patch retrieval: does each adapted thermal token's nearest frozen-RGB token turn out to be its own? Reported with `within_1`, which separates residual misalignment (the neighbour wins) from features that do not localize at all. Chance is 1/1280 ≈ 0.08% |
+
+The held-out loss is measured on the **live** weights, not the EMA ones, so it is comparable with
+the train curve it is read against; `validate`'s image scores stay on the EMA weights, which is
+what is reported and selected on.
+
+**Cost.** A validation is now roughly 96 encoder passes of batch 4 (two subsets × 64 images, plus
+the frozen pass for retrieval, plus the held-out loss batches) against a training step's 32
+image-passes — order 4–8% of wall-clock at `val_every: 500`. The probe gives the real number. If
+it is too much, the dials in order are `val_retrieval: false`, a smaller `val_loss_batches`, and
+only then a larger `val_every`.
+
+---
+
+## 1b. Two smoothings of the schedule
+
+Both are strict generalizations — with their knobs at the old values they reproduce the previous
+behaviour exactly — and both are on by default.
+
+**`optim.ema_warmup: true`.** A fixed decay of 0.999 leaves the EMA shadow `0.999 ** n`
+initialization after `n` updates: **61% random weights at step 500** and still 5% at step 3,000.
+Every validation inside that window was measuring the initialization as much as the model, which
+did not matter at eight validation points starting at 2,500 and matters a great deal at forty
+starting at 500. The warmup is the standard `min(decay, (1 + n) / (10 + n))`: it drives the
+initialization's share to about 1e-5 within ten updates and only ever *lowers* the decay, so the
+late-training average is exactly the one `ema_decay` asks for.
+
+**`flow.warmup_ramp_steps: 500`.** `flow.warmup_steps` is a gate, not a ramp. At step 2,999 the
+velocity net is fitting a frozen feature distribution that LoRA has been moving under it for 3,000
+steps on L_align and L_color; at step 3,000 it would suddenly be fitting a moving one, and LoRA
+would suddenly be taking a loss it has never seen. `conditioning_scale` now scales that gradient
+linearly from 0 to 1 over 500 steps instead. The **forward pass is identical** either way — the
+scaling is on the gradient only — so `warmup_ramp_steps: 0` is the old hard gate exactly, and
+`null` derives `max(1, warmup_steps / 6)` so the short overlays scale with their own warmup.
+
+`optim.cosine.min_factor` is also exposed now (floor of the cosine decay, as a fraction of each
+group's LR). It defaults to **0.0**, the plan's schedule and the previous behaviour: a knob, not a
+recommendation.
 
 ---
 
@@ -193,8 +272,40 @@ A bad `watch_scope` raises at the start of the run rather than silently logging 
 steps, and it raises even when `wandb_mode` is `disabled`, so a typo cannot hide in a debug run.
 
 wandb is an optional dependency: if it is not installed, or `wandb_mode: disabled`, the run logs to
-the console and `train_log.jsonl` and nothing here fires. `tests/test_wandb_logging.py` covers all
-of that with a fake `wandb` module, since CI has no real one.
+the console and the local files below and nothing here fires. `tests/test_wandb_logging.py` covers
+all of that with a fake `wandb` module, since CI has no real one.
+
+### Every metric is also on disk
+
+W&B owns the live curves, but a plot has to be rebuildable months later by someone without the
+run. `RunLog` is now the single place a metric is recorded, and it writes three ways from one
+call, so they cannot drift:
+
+| file (under `--out-dir`) | what it holds |
+|---|---|
+| `train_log.jsonl` | one JSON object per line: `step`, `kind`, and every key W&B got |
+| `metrics/<kind>.csv` | one CSV per kind — `train`, `val_box_aligned`, `val_fallback`, `valloss_*` — with a stable header, rewritten whole on each append so a killed run still leaves complete files and a late column (`beta1`, `peak_vram_gb`) lands in the header retroactively |
+| `run_config.json` | the fully merged config, so a plot can be traced to its settings |
+
+Set `logging.metrics_csv: false` to skip the CSVs; the JSONL mirror is not optional. Before this
+existed the JSONL held the raw loss dict while W&B got the prefixed one *plus* the attention
+gates, so the two quietly disagreed about what a run had recorded.
+
+### What else is logged now
+
+| key | why |
+|---|---|
+| `contrib/{flow,render,align,color}` | each term's share of `total` (`weight × value / total`, summing to 1). Four hand-set weights over terms on different scales can leave one doing nothing, or everything, without any curve looking wrong on its own |
+| `grad/{velocity,encoder,color_head}` | per-module gradient norm, read before clipping. One global `grad_norm` cannot say whether LoRA is receiving anything, and the step where that changes is the most load-bearing moment in the schedule |
+| `loss/cond_scale`, `loss/ema_decay` | the two ramps above, so their effect is attributable |
+| `progress/epoch` | the axis the budget is actually reasoned about in |
+| `val_*/ciede2000/gap_to_oracle` | the colour twin of `psnr_L/gap_to_oracle`: distance from the measured ceiling, positive when the model is behind |
+| `val_*/colorfulness/ratio_*` | colourfulness over the ground truth's. 1.0 is "as vivid as the real photo"; below 1 is the washed-out brown that averaging colourisers fall into. The raw number alone is not readable |
+| `val_*/retrieval/{top1,within_1,chance}` | §1a |
+| `valloss_*/loss/*` | §1a |
+
+`grad/*` and `contrib/*` cost one extra pass over the gradients, so they are computed only on the
+steps that are logged (`train_step(detailed=True)`).
 
 ---
 
@@ -226,19 +337,22 @@ What it was missing was the answer to "is this finishing tonight?", which is now
 
 ## 5. Dependencies actually installed
 
-`pip install -e ".[dev]"` has not fully run in `.venv`. Three declared packages are missing:
+**Resolved, 8 October 2026.** The three packages this section used to list as missing are now
+present in `.venv`: `wandb 0.30.0`, `lpips 0.1.4`, `scikit-image 0.26.0`. In particular the one
+that mattered — a 20K-step run completing with no W&B tracking at all and a single `WARNING` line
+to say so — cannot happen now. Re-check on the training machine anyway, since `.venv` is not the
+box the run happens on:
 
-| package | consequence |
-|---|---|
-| `wandb>=0.16` | **`WandbRun` logs a warning and falls back to console-only.** A 20K-step A100 run would train to completion with no W&B tracking at all and only one `WARNING` line to say so. Install it before the real run |
-| `lpips>=0.1.4` | the plan's LPIPS metric cannot be computed (eval phase, not written yet) |
-| `scikit-image>=0.21` | not imported anywhere yet; presumably intended for SSIM |
+```bash
+python -c "import wandb, lpips, skimage; print('ok')"
+```
 
-`black>=23.0` and `ipython>=8.0` are also missing from the dev extra and do not matter — `black`
-is configured in `pyproject.toml` but `ruff format` is what is actually used, so the `[tool.black]`
-section is dead configuration.
+`black>=23.0` and `ipython>=8.0` are still absent from the dev extra and do not matter — `black`
+is configured in `pyproject.toml` but `ruff format` is what is nominally used, so the
+`[tool.black]` section is dead configuration. (`ruff check` is the gate that actually runs and
+passes; the tree is hand-wrapped and has never been `ruff format`-clean.)
 
-Everything else is installed and the suite runs offline on CPU.
+Everything else is installed and the suite runs offline on CPU: **939 tests in about 70 s**.
 
 ## 6. What changed in the code
 

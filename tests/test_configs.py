@@ -178,7 +178,14 @@ def test_data_config_decisions_hold():
     assert cfg["align"]["exclude_copied_boxes"] is True
 
 
-OVERLAYS = ["debug.yaml", "mps.yaml", "gpu_probe.yaml", "correction.yaml", "overfit_gpu.yaml"]
+OVERLAYS = [
+    "debug.yaml",
+    "mps.yaml",
+    "gpu_probe.yaml",
+    "correction.yaml",
+    "overfit_gpu.yaml",
+    "gpu_5090.yaml",
+]
 
 
 @pytest.mark.parametrize("name", OVERLAYS)
@@ -220,6 +227,47 @@ def test_the_correction_overlay_widens_the_token_and_the_overfit_overlay_keeps_t
     gate = _merged("overfit_gpu.yaml")
     assert gate["encoder"]["input_size"] == [512, 640] and gate["optim"]["precision"] == "bf16"
     assert gate["flow"]["warmup_steps"] < gate["flow"]["num_train_steps"]
+
+
+def test_the_5090_overlay_spends_its_headroom_on_timesteps_not_on_the_batch():
+    """32 GB buys velocity samples per optimizer step, not fewer optimizer steps.
+
+    Raising `optim.batch_size` instead would cut steps-per-epoch on a 3,662-pair training set
+    until the budget no longer clears `flow.warmup_steps`
+    (docs/training_budget_and_changes.md section 1).
+    """
+    base, gpu = _merged(), _merged("gpu_5090.yaml")
+    assert gpu["flow"]["timesteps_per_image"] > base["flow"]["timesteps_per_image"]
+    assert gpu["optim"]["batch_size"] == base["optim"]["batch_size"]
+    for key in ("num_train_steps", "warmup_steps", "warmup_ramp_steps"):
+        assert gpu["flow"][key] == base["flow"][key], "step counts stay put when the batch does"
+    assert gpu["optim"]["precision"] == "bf16" and gpu["encoder"]["input_size"] == [512, 640]
+    # L_render would otherwise double with the timesteps; the subset keeps it at its old cost.
+    subset = gpu["flow"]["render_subset"]
+    assert subset == base["optim"]["batch_size"] * base["flow"]["timesteps_per_image"]
+
+
+def test_the_validation_resolution_and_selection_metric_are_the_decided_ones():
+    log = _load("flow.yaml")["logging"]
+    steps = _load("flow.yaml")["flow"]["num_train_steps"]
+    # 8 validation points over a 20K-step run was not enough to see a divergence begin.
+    assert steps / log["val_every"] >= 40
+    assert log["select_metric"] == "ciede2000"  # the full Lab difference, not L* alone
+    assert log["watch_scope"] == "velocity" and log["watch_freq"] == 500
+    assert log["val_retrieval"] is True and log["metrics_csv"] is True
+
+
+def test_the_schedule_defaults_stay_on_the_baseline():
+    """One cycle and the cosine floor are opt-in: the baseline run must be the plan's schedule."""
+    optim = _load("flow.yaml")["optim"]
+    assert optim["schedule"] == "cosine"
+    assert optim["cosine"]["min_factor"] == 0.0
+    assert optim["ema_warmup"] is True  # strictly lowers the decay early; no late-run effect
+
+
+def test_the_conditioning_ramp_lands_well_inside_the_run():
+    flow = _load("flow.yaml")["flow"]
+    assert 0 < flow["warmup_ramp_steps"] < flow["num_train_steps"] - flow["warmup_steps"]
 
 
 def test_the_debug_overlay_runs_on_the_cpu_with_random_weights_and_no_wandb():

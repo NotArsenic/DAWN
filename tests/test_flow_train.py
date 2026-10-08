@@ -262,6 +262,109 @@ def test_validation_reports_the_oracle_and_both_samplers_per_image():
     assert again["psnr_L/euler"] == scores["psnr_L/euler"]
 
 
+def test_validation_reports_the_retrieval_diagnostic_and_the_colourfulness_ratios():
+    """The two diagnostics added for the first run (docs/proposals_review.md section 6)."""
+    trainer, batch = _trainer()
+    scores = trainer.validate([batch])
+    for key in ("retrieval/top1", "retrieval/within_1", "retrieval/chance"):
+        assert key in scores, key
+    assert 0.0 <= scores["retrieval/top1"] <= 1.0
+    assert scores["retrieval/top1"] <= scores["retrieval/within_1"], "top1 implies within_1"
+    assert scores["retrieval/chance"] == pytest.approx(1.0 / trainer.layout.num_tokens)
+    assert scores["ciede2000/gap_to_oracle"] == pytest.approx(
+        scores["ciede2000/euler"] - scores["ciede2000/oracle"]
+    )
+    assert scores["colorfulness/ratio_euler"] == pytest.approx(
+        scores["colorfulness/euler"] / scores["colorfulness/gt"]
+    )
+
+
+def test_every_selection_metric_is_a_key_validate_really_returns():
+    """A `logging.select_metric` whose key does not exist would KeyError at the first
+    validation -- 500 steps into an overnight run, after the data and the stats pass."""
+    from scripts.train_flow import SELECTION
+
+    trainer, batch = _trainer()
+    scores = trainer.validate([batch])
+    for key, _ in SELECTION.values():
+        assert key in scores, key
+
+
+def test_the_retrieval_diagnostic_can_be_switched_off():
+    trainer, batch = _trainer(logging={"val_retrieval": False})
+    assert not any(k.startswith("retrieval/") for k in trainer.validate([batch]))
+
+
+def test_held_out_loss_reports_every_term_and_is_repeatable():
+    """`validate_loss` is the overfitting curve: it has to be low-variance to be readable."""
+    trainer, batch = _trainer()
+    first = trainer.validate_loss([batch])
+    assert first["num_images"] == 2.0
+    for key in ("loss/total", "loss/flow", "loss/render", "loss/align", "loss/color"):
+        assert key in first and torch.isfinite(torch.tensor(first[key])), key
+    torch.manual_seed(777)  # a fixed generator, not the global RNG
+    again = trainer.validate_loss([batch])
+    assert again["loss/total"] == pytest.approx(first["loss/total"], rel=1e-6)
+    assert trainer.validate_loss([batch], seed=99)["loss/total"] != pytest.approx(
+        first["loss/total"], rel=1e-9
+    )
+
+
+def test_held_out_loss_leaves_no_gradients_behind():
+    trainer, batch = _trainer()
+    trainer.validate_loss([batch])
+    assert all(p.grad is None for p in trainer.trainable_parameters().values())
+
+
+def test_a_detailed_step_adds_per_module_gradients_and_loss_shares():
+    trainer, batch = _trainer()
+    wake_up(trainer.velocity)
+    plain = trainer.train_step(batch)
+    assert not any(k.startswith(("grad/", "contrib/")) for k in plain)
+
+    out = trainer.train_step(batch, detailed=True)
+    assert {"grad/velocity", "grad/encoder", "grad/color_head"} <= set(out)
+    assert out["grad/velocity"] > 0
+    shares = {k: v for k, v in out.items() if k.startswith("contrib/")}
+    assert set(shares) == {"contrib/flow", "contrib/render", "contrib/align", "contrib/color"}
+    assert sum(shares.values()) == pytest.approx(1.0, rel=1e-5)
+
+
+def test_the_conditioning_ramp_hands_lora_a_fraction_of_the_velocity_gradient():
+    """Mid-ramp the gradient is scaled, not switched: the forward pass is unchanged either way."""
+    trainer, batch = _trainer(flow={"warmup_steps": 2, "warmup_ramp_steps": 4})
+    wake_up(trainer.velocity)
+    trainer.train()
+
+    trainer.step = 2  # the gate lifts; the ramp is one quarter in
+    assert trainer.conditioning_scale() == pytest.approx(0.25)
+    losses, info = trainer.compute_losses(batch)
+    assert info["detach_cond"] is False and info["cond_scale"] == pytest.approx(0.25)
+    partial = _lora_grad_norm(trainer, losses["flow"])
+
+    trainer.step = 5  # the ramp has completed
+    assert trainer.conditioning_scale() == 1.0
+    full = _lora_grad_norm(trainer, trainer.compute_losses(batch)[0]["flow"])
+    assert 0.0 < partial < full
+
+
+def test_a_zero_ramp_reproduces_the_old_hard_gate_exactly():
+    hard, batch = _trainer(flow={"warmup_steps": 2, "warmup_ramp_steps": 0}, seed=4)
+    hard.step = 2
+    assert hard.conditioning_scale() == 1.0
+    hard.step = 1
+    assert hard.conditioning_scale() == 0.0
+    losses, info = hard.compute_losses(batch)
+    assert info["detach_cond"] is True
+    assert _lora_grad_norm(hard, losses["flow"]) == 0.0
+
+
+def test_the_ramp_defaults_to_a_sixth_of_the_warmup_when_it_is_not_set():
+    """So the short overlays, which scale `warmup_steps` down, scale the ramp with it."""
+    trainer, _ = _trainer(flow={"warmup_steps": 600, "warmup_ramp_steps": None})
+    assert trainer.warmup_ramp_steps == 100
+
+
 def test_only_the_network_forwards_run_under_autocast_never_the_pixel_side(monkeypatch):
     """bf16 autocast is for network forwards only: targets, the fit, the render and the metrics
     (matmuls in `area_downsample`, the Lab einsum) must stay float32. CUDA is the only place the

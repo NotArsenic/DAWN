@@ -12,7 +12,7 @@ It treats thermal as a one-channel image and splits the job in two. Brightness i
 |---|---|
 | Data pipeline (DroneVehicle read, day filter, box-matched alignment, dedup, masks, aligned PNGs, dataset) | **Works.** Implemented, tested and run on the real data |
 | Alignment audit (contact sheets, fit histograms) | Works; thresholds are starting values awaiting the maintainer's decision |
-| Model code (DINO encoder with LoRA, velocity transformer on 1,280 tokens, brightness grid, colour map, the four losses, sampler, trainer, validation metrics) | **Done and tested; nothing is trained yet.** The debug run (40 steps on real pairs, CPU) and an overfit-100 run on a Mac (fp32, half resolution) have been run; the full 20K-step run is for the RTX 5060 Ti |
+| Model code (DINO encoder with LoRA, velocity transformer on 1,280 tokens, brightness grid, colour map, the four losses, sampler, trainer, validation metrics) | **Done and tested; nothing is trained yet.** The debug run (40 steps on real pairs, CPU) and an overfit-100 run on a Mac (fp32, half resolution) have been run; the full 20K-step run is for the RTX 5090 |
 | Brightness / colour oracle (`scripts/check_oracle.py`) | **Measured** on all 345 val pairs; the ceiling is in the next section |
 | Inference and the uncertainty maps | **Works, untested on a trained model.** `scripts/infer.py`, `dawn/uncertainty/spread.py` (the spread of K samples, in L\* and a\*b\* units) and `dawn/flow/inference.py` are implemented and tested against random weights |
 | Evaluation, calibration, latency | **Works, untested on a trained model.** `scripts/{evaluate,benchmark_latency}.py`, `configs/eval.yaml` and `dawn/eval/{metrics,calibration,visualize}.py`: L\* PSNR and SSIM, CIEDE2000, colorfulness, LPIPS, the uncertainty rank correlation, comparison sheets and per-component GMACs. See [`docs/inference_eval_phase.md`](docs/inference_eval_phase.md) |
@@ -30,7 +30,7 @@ pip install -e ".[dev]"
 ```
 
 - Python ≥ 3.10, PyTorch ≥ 2.1. The data pipeline runs on CPU.
-- The model phase wants PyTorch built for CUDA 12.8 or newer on an RTX 5060 Ti (16 GB).
+- The model phase wants PyTorch built for CUDA 12.8 or newer with `sm_120`. Training is on an **RTX 5090 (32 GB)** (`configs/gpu_5090.yaml`); `flow.yaml`'s defaults still fit the 16 GB RTX 5060 Ti the plan assumes. Same Blackwell architecture either way.
 - DINOv3 weights: the default `timm` backend loaded `vit_small_plus_patch16_dinov3.lvd1689m` without a Hugging Face token on 2026-10-06 (timm's own hosting). The `transformers` backend (`pip install -e ".[transformers]"`) needs the gated [facebook/dinov3-*](https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m) repo: accept its license and `export HF_TOKEN=...`. Either way the DINOv3 license applies. Tests never download weights.
 
 ```bash
@@ -91,11 +91,15 @@ python scripts/train_flow.py --config configs/flow.yaml --override configs/mps.y
 python scripts/train_flow.py --config configs/flow.yaml --device cuda   # the real run: batch 16 x 4 timesteps, bf16, 20K steps
 ```
 
-`flow.yaml` is the real configuration (20K steps, a 3K-step detach warmup, batch 16 × 4, bf16 on CUDA only); overlays (`debug`, `mps`, `gpu_probe`, `overfit_gpu`, `correction`) change a few keys each. Validation logs full-resolution L\* PSNR, CIEDE2000 and colorfulness for the model at NFE 2 (Euler and midpoint) next to the oracle and the gap, for box-aligned and fallback pairs separately, and `loss/flow_brightness`, `loss/flow_color` (and `_correction`) beside the total.
+`flow.yaml` is the real configuration (20K steps, a 3K-step detach warmup ramped in over 500, batch 16 × 4, bf16 on CUDA only); overlays (`debug`, `mps`, `gpu_probe`, `overfit_gpu`, `correction`, `gpu_5090`) change a few keys each.
 
-### GPU gate commands (RTX 5060 Ti, 16 GB)
+Validation runs every 500 steps (40 points over the run) and logs, for box-aligned and fallback pairs separately: full-resolution L\* PSNR, CIEDE2000 and colorfulness at NFE 2 (Euler and midpoint) next to the oracle and the gap to it, colorfulness as a ratio of the ground truth's, the patch-retrieval diagnostic, and the **training objective itself on held-out pairs** — the curve that shows memorization. Per step it logs each loss, each term's share of the total, per-module gradient norms, the conditioning ramp and the attention gates. `flow_best.pt` follows CIEDE2000 on the box-aligned subset, not L\* PSNR, because L\* is mostly the brightness grid and is blind to colour going wrong.
 
-In this order; each is a gate for the next. The Mac cannot measure VRAM at 640×512.
+Everything that goes to Weights & Biases is also written under `--out-dir`: `train_log.jsonl`, `metrics/<kind>.csv` and `run_config.json`, so the plots can be rebuilt without it. Details and the reasoning: [`docs/training_budget_and_changes.md`](docs/training_budget_and_changes.md) §1a, §1b and §3.
+
+### GPU gate commands
+
+In this order; each is a gate for the next. The Mac cannot measure VRAM at 640×512. Add `configs/gpu_5090.yaml` to every `--override` below if you are on the 32 GB card.
 
 ```bash
 # 0. setup: PyTorch built for CUDA 12.8+ with sm_120
@@ -106,9 +110,11 @@ python scripts/smoke_dino.py --backend timm --batch-size 16
 
 # 2. THE 50-STEP PROBE of the real configuration: peak VRAM and seconds/step, BEFORE an overnight run.
 #    DINO's attention reaches the velocity net as a float mask, so PyTorch has to pick an attention
-#    kernel that keeps 1,280-token attention affordable; this tells you. If it runs out of memory,
-#    put `optim: {batch_size: 8}` in a small YAML and add it to --override (the 8 x 4 fallback).
-python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_probe.yaml \
+#    kernel that keeps 1,280-token attention affordable; this tells you. On 16 GB, if it runs out of
+#    memory, put `optim: {batch_size: 8}` in a small YAML and add it to --override (the 8 x 4
+#    fallback). On the 5090 the overlay DOUBLES timesteps_per_image, so probe it as it will run.
+python scripts/train_flow.py --config configs/flow.yaml \
+    --override configs/gpu_probe.yaml configs/gpu_5090.yaml \
     --device cuda --max-steps 50 --out-dir outputs/gpu_probe
 
 # 3. overfit-100 at full resolution, both modes: render L* PSNR must approach the matching oracle
@@ -118,8 +124,12 @@ python scripts/train_flow.py --config configs/flow.yaml --override configs/overf
     --device cuda --overfit 100 --out-dir outputs/overfit_gpu/on
 
 # 4. the real run (resume with --resume checkpoints/run1/flow_last.pt)
-python scripts/train_flow.py --config configs/flow.yaml --device cuda --out-dir checkpoints/run1
+python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_5090.yaml \
+    --device cuda --out-dir checkpoints/run1
 ```
+
+Use the probe's seconds/step to sanity-check `logging.val_every` (500 by default): validation
+should stay a few percent of wall-clock.
 
 ## Project structure
 
@@ -128,7 +138,8 @@ dawn/
 ├── configs/
 │   ├── data.yaml            # DroneVehicle paths and every data threshold (commented)
 │   ├── flow.yaml            # stage 1: resolution, grid, colour, losses, schedule, optimizer
-│   ├── debug.yaml, mps.yaml, gpu_probe.yaml, overfit_gpu.yaml, correction.yaml   # overlays
+│   ├── debug.yaml, mps.yaml, gpu_probe.yaml, overfit_gpu.yaml, correction.yaml,
+│   │                        # gpu_5090.yaml (32 GB: timesteps 8)                 # overlays
 │   └── eval.yaml            # parked (inference/eval phase)
 ├── docs/
 │   ├── conventions.md       # layouts, coordinates, color spaces, token layout, data rules (read first)

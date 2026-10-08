@@ -1,0 +1,54 @@
+# Overlay for the real run on an RTX 5090 (32 GB, Blackwell / sm_120).
+#
+#   # 1. the probe FIRST -- this overlay changes the memory profile, so re-measure it
+#   python scripts/train_flow.py --config configs/flow.yaml \
+#       --override configs/gpu_probe.yaml configs/gpu_5090.yaml \
+#       --device cuda --max-steps 50 --out-dir outputs/gpu_probe
+#
+#   # 2. the run
+#   python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_5090.yaml \
+#       --device cuda --out-dir checkpoints/run1
+#
+# Setup is unchanged from the 5060 Ti the README assumes: same Blackwell architecture, so PyTorch
+# still has to be built for CUDA 12.8+ with sm_120 in `torch.cuda.get_arch_list()`.
+#
+# What 32 GB buys, and what it does NOT.
+#
+# The binding constraint at 640x512 is the velocity net's attention: DINO's attention bias reaches
+# it as an additive float mask, so SDPA cannot use a flash kernel and has to materialize
+# `batch x timesteps x heads x 1280 x 1280` scores and keep them for backward -- roughly 5 GB at
+# 16 x 4. On 16 GB that was tight enough to plan an 8 x 4 fallback. On 32 GB it is not a
+# constraint, and the 8 x 4 fallback can be ignored.
+#
+# The headroom is spent on `timesteps_per_image`, NOT on `batch_size`. One encoder pass already
+# feeds `timesteps_per_image` velocity passes, so 4 -> 8 doubles the velocity samples per
+# optimizer step and leaves steps-per-epoch untouched. Raising the batch instead would spend the
+# same memory to make the run WORSE: 3,662 train pairs over a batch of 64 is 57 steps an epoch, so
+# the whole 20,000-step budget would be 1,140 epochs of nothing -- or, held at ~87 epochs, about
+# 5,000 optimizer steps, of which the first 3,000 are spent with the conditioning detached. A 7.6M
+# transformer plus LoRA wants optimizer steps (docs/training_budget_and_changes.md section 1).
+#
+# If you do change `optim.batch_size` here, rescale `flow.num_train_steps`,
+# `flow.warmup_steps`, `flow.warmup_ramp_steps`, `logging.val_every` and `logging.save_every`
+# with it, and the peak LR by roughly the square-root rule. Every one of them is counted in
+# steps, so moving the batch alone silently runs a different experiment.
+
+flow:
+  # The one knob that buys compute without costing epoch budget. Expect roughly 2x the step time
+  # and ~10 GB of attention: the probe tells you both before you commit a night to it.
+  timesteps_per_image: 8
+  # L_render would otherwise also double, to 128 rendered 256x320 images per step. A random 64 of
+  # the 128 is an unbiased estimate of the same mean, so this keeps the render path at exactly its
+  # current cost while L_flow gets twice the samples. Set to null to render all 128.
+  render_subset: 64
+
+loader:
+  num_workers: 8          # 8 x 4 PNG decodes per step; 4 workers become the bottleneck
+
+# If the probe shows comfortable headroom, the next-biggest WALL-CLOCK win is turning off DINO's
+# gradient checkpointing -- it trades a few GB for not recomputing 12 blocks every backward:
+#
+# encoder:
+#   grad_checkpointing: false
+#
+# It is left on here because an out-of-memory crash costs a whole run and the recompute does not.

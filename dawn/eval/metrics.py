@@ -249,6 +249,64 @@ def masked_psnr(
     return 10.0 * torch.log10(peak**2 / mse.clamp(min=1e-10))
 
 
+def sobel_magnitude(image: torch.Tensor) -> torch.Tensor:
+    """Gradient magnitude of a one-channel image by a 3x3 Sobel pair, replicate-padded.
+
+    `(B, 1, H, W)` in, `(B, 1, H, W)` out, in the input's own units per pixel. Used to pick the
+    structural edges a region metric is restricted to (`edge_quantile_mask`); it is not a
+    resampling step, so the area-averaging rule of docs/conventions.md section 4a does not
+    apply. Replicate padding, so the frame border does not read as one long edge.
+    """
+    if image.ndim != 4 or image.shape[1] != 1:
+        raise ValueError(f"sobel_magnitude takes (B, 1, H, W), got {tuple(image.shape)}")
+    x = image.float()
+    kernel = torch.tensor(
+        [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=x.dtype, device=x.device
+    )
+    pair = torch.stack([kernel, kernel.T]).unsqueeze(1)  # (2, 1, 3, 3): d/dx, d/dy
+    gradient = F.conv2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), pair)
+    return gradient.pow(2).sum(dim=1, keepdim=True).sqrt()
+
+
+def edge_quantile_mask(
+    image: torch.Tensor, mask: torch.Tensor, quantile: float = 0.9
+) -> torch.Tensor:
+    """The structural edges of each image: pixels above the `quantile` of gradient magnitude.
+
+    A whole-frame mean |delta a*b*| is dominated by the flat asphalt, fields and roofs that make
+    up most of an aerial frame, so it cannot answer "does this upsampling bleed across sharp
+    boundaries?". Restricting the same metric to the top decile of gradient magnitude can
+    (docs/proposals_review.md section 3.B). The threshold is **per image** over the pixels
+    `mask` keeps, because frames differ enormously in how much structure they contain.
+
+    Args:
+        image: `(B, 1, H, W)` the structure to read edges from -- L* / 100, not a*b*.
+        mask: `(B, 1, H, W)` weights in [0, 1]; pixels with no weight never become edges and do
+            not enter the threshold.
+        quantile: Share of kept pixels treated as flat. 0.9 keeps the top decile.
+
+    Returns:
+        `(B, 1, H, W)` float 0/1. An image with no kept pixels, or no gradient at all, gets an
+        all-zero mask, so a metric over it has no weight rather than a wrong value.
+    """
+    if not 0.0 <= quantile < 1.0:
+        raise ValueError(f"quantile must be in [0, 1), got {quantile}")
+    magnitude = sobel_magnitude(image)
+    keep = mask.to(torch.float32) > 0
+    out = torch.zeros_like(magnitude)
+    for index in range(magnitude.shape[0]):
+        values = magnitude[index][keep[index]]
+        if values.numel() == 0:
+            continue
+        threshold = torch.quantile(values.flatten().float(), quantile)
+        # `> 0` as well as `>= threshold`: on an image that is flat over more than `quantile` of
+        # itself the quantile IS zero, and `>= 0` would mark every pixel -- the opposite of an
+        # edge mask. Flat frames then contribute no weight, which is the honest answer.
+        selected = (magnitude[index] >= threshold) & (magnitude[index] > 0) & keep[index]
+        out[index] = selected.to(out.dtype)
+    return out
+
+
 def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Per-image mean of `value` over the pixels that count: `sum(value * w) / sum(w)`.
 

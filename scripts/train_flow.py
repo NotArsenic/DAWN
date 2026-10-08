@@ -20,8 +20,10 @@ plumbing. Token layout, raw vs standardized and the pixel masks: docs/convention
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
+import os
 import statistics
 import sys
 import time
@@ -37,8 +39,14 @@ if str(ROOT) not in sys.path:
 from dawn.flow.loaders import build_loaders, cycle, load_config, stats_batches  # noqa: E402
 from dawn.flow.targets import FitSettings, compute_token_stats, load_or_compute_stats  # noqa: E402
 from dawn.flow.tokens import TokenLayout  # noqa: E402
-from dawn.flow.trainer import FlowTrainer  # noqa: E402
+from dawn.flow.trainer import FlowTrainer, budget_summary  # noqa: E402
 from dawn.progress import format_duration  # noqa: E402
+
+# How `logging.select_metric` picks the best checkpoint: (validation key, higher is better).
+SELECTION = {
+    "ciede2000": ("ciede2000/euler", False),
+    "psnr_L": ("psnr_L/euler", True),
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -115,6 +123,77 @@ class JsonlLog:
 
     def close(self) -> None:
         self.handle.close()
+
+
+class CsvLog:
+    """One CSV per kind of record, rewritten whole on every append.
+
+    W&B owns the live curves; these files exist so every plot can be rebuilt from disk months
+    later, by someone without the W&B run, in a spreadsheet. One file per kind keeps the columns
+    stable and dense -- a single wide file would be mostly empty, because train rows arrive every
+    `log_every` steps and validation rows every `val_every`.
+
+    Rewriting the whole file each time (rather than appending) costs nothing at this scale -- a
+    20K-step run writes about 200 train rows and 40 of each validation kind -- and buys two
+    things: a column that only appears later (`beta1`, `peak_vram_gb`) lands in the header
+    retroactively, and the file on disk is always complete, even if the run is killed.
+    """
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.rows: dict[str, list[dict]] = {}
+        self.columns: dict[str, list[str]] = {}
+
+    def write(self, step: int, kind: str, values: dict) -> None:
+        row = {"step": step, **{k: v for k, v in values.items()}}
+        rows = self.rows.setdefault(kind, [])
+        columns = self.columns.setdefault(kind, [])
+        rows.append(row)
+        columns.extend(key for key in row if key not in columns)
+        path = self.directory / f"{kind}.csv"
+        partial = path.with_suffix(".partial")
+        with partial.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns, restval="")
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(partial, path)
+
+
+class RunLog:
+    """The one place a metric is recorded: W&B, a JSONL mirror and a CSV per kind.
+
+    Callers pass the final W&B key names, so the three records hold identical keys by
+    construction and the local files really can rebuild the W&B plots. Before this existed the
+    JSONL held the raw loss dict while W&B got the prefixed one plus the attention gates, so the
+    two quietly disagreed about what a run had recorded.
+    """
+
+    def __init__(self, cfg, out_dir: Path):
+        self.wandb = WandbRun(cfg)
+        self.jsonl = JsonlLog(out_dir / "train_log.jsonl")
+        self.csv = CsvLog(out_dir / "metrics") if cfg["logging"].get("metrics_csv", True) else None
+
+    def log(self, kind: str, step: int, values: dict) -> None:
+        self.wandb.log(values, step=step)
+        self.jsonl.write(step, kind, values)
+        if self.csv is not None:
+            self.csv.write(step, kind, values)
+
+    def watch(self, trainer, cfg) -> None:
+        self.wandb.watch(trainer, cfg)
+
+    def close(self) -> None:
+        self.wandb.finish()
+        self.jsonl.close()
+
+
+def write_run_config(cfg: dict, out_dir: Path) -> Path:
+    """The fully merged config beside the metrics, so a plot can be traced to its settings."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "run_config.json"
+    path.write_text(json.dumps(cfg, indent=2, default=str) + "\n", encoding="utf-8")
+    return path
 
 
 def token_stats(cfg: dict, layout: TokenLayout, device: torch.device):
@@ -204,12 +283,41 @@ def main():
         trainer.load_state_dict(torch.load(args.resume, map_location=device, weights_only=False))
         logger.info("  Resumed from %s at step %d", args.resume, trainer.step)
 
-    run, jsonl = WandbRun(cfg), JsonlLog(out_dir / "train_log.jsonl")
+    # Every step-denominated knob, re-read in epochs. The trap this closes: raising
+    # optim.batch_size without rescaling the step counts runs a different experiment, and the
+    # worst case (a budget shorter than the detach warmup) looks like a healthy run.
+    budget = budget_summary(cfg, loaders.train_size)
+    logger.info(
+        "  Budget: %.0f steps/epoch x %.1f epochs; conditioning detached for %.1f epochs, then "
+        "ramped over %d steps; %.0f validation points; %.0f samples/step",
+        budget["steps_per_epoch"],
+        budget["epochs"],
+        budget["detach_epochs"],
+        trainer.warmup_ramp_steps,
+        budget["val_points"],
+        budget["samples_per_step"],
+    )
+    logger.info("  Wrote %s", write_run_config(cfg, out_dir))
+
+    run = RunLog(cfg, out_dir)
     run.watch(trainer, cfg)
     log_cfg = cfg["logging"]
     total_steps = cfg["flow"]["num_train_steps"]
     headline = cfg["pairs"]["eval_subset"]  # which validation subset selects the best checkpoint
+    select_name = str(log_cfg.get("select_metric", "ciede2000"))
+    if select_name not in SELECTION:
+        raise ValueError(
+            f"logging.select_metric must be one of {sorted(SELECTION)}, got {select_name!r}"
+        )
+    select_key, select_higher = SELECTION[select_name]
+    logger.info(
+        "  flow_best.pt follows %s on the %s subset (%s is better)",
+        select_key,
+        headline,
+        "higher" if select_higher else "lower",
+    )
     best = float("-inf")
+    val_loss_batches = log_cfg.get("val_loss_batches")
     batches = cycle(loaders.train)
     step_times: list[float] = []
     started_at = time.perf_counter()
@@ -220,7 +328,8 @@ def main():
             if step == 1 and device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)  # skip the one-off warmup allocs
             started = time.perf_counter()
-            losses = trainer.train_step(next(batches))
+            detailed = step % log_cfg["log_every"] == 0  # the extra pass only on logged steps
+            losses = trainer.train_step(next(batches), detailed=detailed)
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             losses["sec_per_step"] = time.perf_counter() - started
@@ -235,8 +344,12 @@ def main():
                     losses["peak_vram_gb"],
                 )
 
-            if step % log_cfg["log_every"] == 0:
-                values = {f"loss/{k}": v for k, v in losses.items()}
+            if detailed:
+                # `grad/...` and `contrib/...` already carry their own panel prefix; everything
+                # else is a loss or a schedule value and goes under loss/.
+                values = {(k if "/" in k else f"loss/{k}"): v for k, v in losses.items()}
+                values["progress/epoch"] = step / budget["steps_per_epoch"]
+                values["progress/step"] = float(step)
                 if log_cfg["log_attn_gates"]:
                     values.update(
                         {f"gate/{k}": v for k, v in trainer.velocity.attn_gates().items()}
@@ -264,8 +377,7 @@ def main():
                     losses["sec_per_step"],
                     format_duration(left),
                 )
-                run.log(values, step=step)
-                jsonl.write(step, "train", losses)
+                run.log("train", step, values)
 
             if (step + 1) % log_cfg["val_every"] == 0 or trainer.step == total_steps:
                 nfe = cfg["flow"]["num_inference_steps"]
@@ -281,18 +393,44 @@ def main():
                             " | ".join(f"{k} {v:.3f}" for k, v in sorted(scores.items())),
                         )
                         run.log(
-                            {f"val_{subset}/{k}": v for k, v in scores.items()}, step=trainer.step
+                            f"val_{subset}",
+                            trainer.step,
+                            {f"val_{subset}/{k}": v for k, v in scores.items()},
                         )
-                        jsonl.write(trainer.step, f"val_{subset}", scores)
-                        if subset == headline and scores["psnr_L/euler"] > best:
-                            best = scores["psnr_L/euler"]
+                        if subset != headline:
+                            continue
+                        value = scores[select_key] * (1.0 if select_higher else -1.0)
+                        if value > best:
+                            best = value
                             trainer.save_checkpoint(out_dir / "flow_best.pt")
+
+                # The training objective on held-out pairs: a train curve falling while this one
+                # turns up is the memorization signal, and nothing else in the run reports it.
+                # Deliberately OUTSIDE the EMA context -- the train curve it is read against is
+                # on the live weights, and comparing an averaged model with an instantaneous one
+                # would put a gap between the two that has nothing to do with overfitting.
+                for subset, loader in loaders.val.items():
+                    held = trainer.validate_loss(loader, max_batches=val_loss_batches)
+                    logger.info(
+                        "step %6d | val %-11s | held-out loss %s",
+                        trainer.step,
+                        subset,
+                        " | ".join(
+                            f"{k.split('/')[-1]} {v:.4f}"
+                            for k, v in sorted(held.items())
+                            if k.startswith("loss/")
+                        ),
+                    )
+                    run.log(
+                        f"valloss_{subset}",
+                        trainer.step,
+                        {f"valloss_{subset}/{k}": v for k, v in held.items()},
+                    )
 
             if (step + 1) % log_cfg["save_every"] == 0 or trainer.step == total_steps:
                 trainer.save_checkpoint(out_dir / f"flow_{trainer.step:06d}.pt")
     finally:
-        run.finish()
-        jsonl.close()
+        run.close()
 
     trainer.save_checkpoint(out_dir / "flow_last.pt")
     steady = step_times[5:] or step_times

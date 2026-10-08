@@ -34,6 +34,10 @@ color:
   soft_k: 5              # Zhang et al.: the 5 nearest bins ...
   soft_sigma: 5.0        # ... with a Gaussian of this width (a*b* units)
   min_patch_fraction: 0.5  # L_color ignores patches whose kept (unmasked) share is below this
+  # scripts/check_oracle.py also reports the colour ceiling restricted to the top decile of RGB
+  # gradient magnitude. The whole-frame mean is dominated by flat asphalt and roofs, so only the
+  # edge-restricted number can say whether bilinear bleeds across sharp boundaries.
+  edge_quantile: 0.9
   # How the colour map (and the correction) are upsampled: bilinear | bgu. BILINEAR by the
   # maintainer's decision at Checkpoint A: on the real val pairs its colour ceiling is 0.87 mean
   # |delta a*b*| against the BGU's 1.3 (best setting) to 2.1 (16 x 20 cells), and the assembled
@@ -113,6 +117,14 @@ flow:
   # velocity net, so LoRA is trained by L_align and L_color alone. After it, everything trains
   # jointly. ~15% of training. This is not the optimizer's LR warmup (optim.lr_warmup_steps).
   warmup_steps: 3000
+  # How the conditioning gradient is eased in once the gate above lifts, instead of switching it
+  # on between two steps. At step 2,999 the velocity net is fitting a frozen feature distribution
+  # that LoRA has been moving under it for 3,000 steps on L_align and L_color; at step 3,000 it
+  # would suddenly be fitting a moving one, and LoRA would suddenly be taking a loss it has never
+  # seen. The ramp scales that gradient linearly 0 -> 1 over these steps (the FORWARD pass is
+  # unchanged either way). 0 is the old hard gate exactly; `null` derives max(1, warmup_steps / 6),
+  # so the short overlays scale with their own warmup.
+  warmup_ramp_steps: 500
   # Render loss on a random subset of the batch_size x timesteps_per_image samples. null = all.
   # Only a VRAM valve.
   render_subset: null
@@ -129,6 +141,11 @@ optim:
   # says (bf16 on MPS is patchy: silent slowdowns and errors that have nothing to do with the model).
   precision: bf16         # bf16 | fp32
   ema_decay: 0.999
+  # Ramp the EMA decay in from 0.1 as min(ema_decay, (1 + n) / (10 + n)). A fixed 0.999 leaves the
+  # shadow 0.999^n initialization: 61% random weights at step 500 and 5% at step 3,000, so every
+  # early validation would be measuring the initialization. It only ever LOWERS the decay, so the
+  # late-training average is exactly the one ema_decay asks for. false = the old fixed decay.
+  ema_warmup: true
   lr_warmup_steps: 1000   # linear LR warmup, then cosine decay over flow.num_train_steps
   # cosine    | the plan's schedule: lr_warmup_steps of linear ramp, then cosine to 0.
   # one_cycle | Smith's one cycle: a long cosine ramp to each group's `lr` as the PEAK, then
@@ -138,6 +155,12 @@ optim:
   # is in the last low-LR stretch, so do not early-stop one. Pick the budget in EPOCHS first
   # (steps = epochs * len(train_pairs) / optim.batch_size) and set num_train_steps from it.
   schedule: cosine
+  cosine:
+    # Floor of the cosine decay, as a fraction of each group's lr. 0.0 anneals to exactly zero
+    # (the plan's schedule, and the measured default). A small floor (0.02-0.05) keeps the last
+    # few hundred steps doing something; it is a knob, not a recommendation, and changing it in
+    # the same run as anything else makes the result unattributable.
+    min_factor: 0.0
   one_cycle:
     # 0.2 of 20K steps peaks at 4,000: 1,000 steps after flow.warmup_steps hands LoRA its
     # velocity gradients, so the features settle before the LR is hottest. Keep the peak after
@@ -168,5 +191,25 @@ logging:
   watch_scope: velocity
   watch_freq: 500         # throttles the LOGGING; the hooks fire on every backward either way
   save_every: 5000
-  val_every: 2500
+  # 20,000 / 500 = 40 validation points. At 2,500 a run produced EIGHT, which is not the
+  # resolution needed to see a divergence begin on 3,662 pairs over ~87 epochs. Raise it only
+  # after the gpu_probe has given you seconds/step: validation should stay a few percent of
+  # wall-clock (docs/training_budget_and_changes.md section 1a).
+  val_every: 500
   num_val_samples: 64     # val pairs per subset (box-aligned, fallback) per validation
+  # Batches of the TRAINING objective on held-out pairs, at every validation. `validate` scores
+  # sampled image quality; this is the loss itself, and a train curve falling while this one
+  # turns up is the memorization signal nothing else in the run reports. null = every val batch.
+  val_loss_batches: 8
+  # Patch retrieval: does each adapted thermal token's nearest frozen RGB token turn out to be
+  # its own? The evidence for or against a contrastive L_align (docs/proposals_review.md 4.1).
+  # Costs one extra frozen DINO pass per validation batch.
+  val_retrieval: true
+  # Which validation number picks flow_best.pt, on the `pairs.eval_subset` subset:
+  #   ciede2000  the full Lab difference: brightness AND colour. The default.
+  #   psnr_L     L* only. L* comes mostly from the brightness grid fitted on thermal, the half
+  #              of the model least able to memorize, so it is blind to colour going wrong.
+  select_metric: ciede2000
+  # Every metric that goes to W&B is also written locally, so the plots can be rebuilt without
+  # it: train_log.jsonl (one object per line, the full record) and metrics/<kind>.csv per kind.
+  metrics_csv: true

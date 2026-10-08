@@ -7,7 +7,7 @@ project's own targets code, renders them with the one render path, and measures 
     - L* PSNR (peak 100) of the grid alone at refine 0 and 1, with the generated-L correction
       (BGU-upsampled, and bilinear as the plan's reference), by box-aligned and fallback pairs;
     - the colour ceiling: the true a*b* at the colour-map size, bilinear vs bilateral guided
-      upsampling guided by the true L;
+      upsampling guided by the true L, whole-frame and restricted to structural edges;
     - the assembled oracle image's L* PSNR and CIEDE2000;
     - a small BGU grid-size sweep, to choose `color.bgu` in configs/flow.yaml;
     - a contact sheet of the worst 10% of grid-only scenes: what the grid cannot express.
@@ -186,6 +186,18 @@ def main():
         f"colour ceiling over all pairs: bilinear {bil:.3f} vs BGU {bgu:.3f} (configured "
         f"{cfg['color']['bgu']}) mean abs delta a*b*; `color.upsample` is "
         f"**{cfg['color']['upsample']}** (the maintainer chose bilinear at Checkpoint A)"
+    )
+    # The same comparison restricted to structural edges. The whole-frame mean is dominated by
+    # flat asphalt, fields and roofs, so it cannot say whether bilinear bleeds colour across
+    # sharp thermal boundaries; this can. If BGU wins here while losing above, the choice of
+    # `color.upsample` is a trade rather than a clear call (docs/proposals_review.md, 3.B).
+    bgu_e = oracle.summarize(rows, "ab_err_bgu_edge")["mean"]
+    bil_e = oracle.summarize(rows, "ab_err_bilinear_edge")["mean"]
+    quantile = float(cfg["color"].get("edge_quantile", 0.9))
+    checks.append(
+        f"colour ceiling AT EDGES (top {100 * (1 - quantile):.0f}% of gradient magnitude): "
+        f"bilinear {bil_e:.3f} vs BGU {bgu_e:.3f} mean abs delta a*b* -- "
+        f"**{'bilinear ahead' if bil_e <= bgu_e else 'BGU ahead at edges'}**"
     )
     de_bil = oracle.summarize(rows, "de_grid_only_bilinear")["mean"]
     de_bgu = oracle.summarize(rows, "de_grid_only_bgu")["mean"]

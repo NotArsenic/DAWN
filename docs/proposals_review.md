@@ -5,9 +5,14 @@ inference/eval phase done except the refiner, and **nothing trained yet**. That 
 most of what follows.
 
 Not a conventions document. `docs/conventions.md` remains the only authoritative file for layouts
-and units; where this note touches one it points at the section rather than restating it. Nothing
-here has been implemented — it is a record of what was proposed, what was measured against it, and
-what was decided, so the same suggestions do not have to be re-litigated from scratch.
+and units; where this note touches one it points at the section rather than restating it. It is a
+record of what was proposed, what was measured against it, and what was decided, so the same
+suggestions do not have to be re-litigated from scratch.
+
+> **Acted on, 8 October 2026.** The recommendations in section 6 are now in the code; section 7
+> lists exactly what changed and what it cost. **None of the seven proposals themselves was
+> implemented** — what went in is the instrumentation that will decide three of them from a real
+> run instead of from argument.
 
 The proposals came in three batches: two review notes (overfitting, colour bleeding, hallucination
 framing), a LUPI block of three auxiliary losses, and a perceptual-loss suggestion with a reply
@@ -255,3 +260,36 @@ In order:
    - vehicle-crop CIEDE2000 and colourfulness (`metrics.vehicle_region`, already an open decision)
      → tests proposal 2
 4. **After run 1**, revisit proposal 2 only if the vehicle crops are bad, and only with a tight mask.
+
+---
+
+## 7. What was implemented
+
+Items 2 and 3 of section 6, plus the telemetry needed to read the result. The full reasoning and
+every config key is in `docs/training_budget_and_changes.md` §1a, §1b and §3; this is the index.
+
+| Change | Where | Why |
+|---|---|---|
+| `logging.val_every` 2,500 → **500** | `configs/flow.yaml` | 40 validation points over the run instead of 8 |
+| Held-out **training loss** (`validate_loss`) | `dawn/flow/trainer.py` | The actual overfitting signal. Measured on *live* weights, so it is comparable with the train curve; `validate`'s image scores stay on EMA |
+| `flow_best.pt` selects on **CIEDE2000** (`logging.select_metric`) | `scripts/train_flow.py` | L\* PSNR is mostly the brightness grid fitted on thermal, and blind to colour going wrong. CIEDE2000 is brightness *and* colour. `psnr_L` stays selectable |
+| **Patch retrieval** `top1` / `within_1` / `chance` | `trainer.patch_retrieval` | Tests proposal 1's premise directly. `within_1` separates residual misalignment from features that do not localize |
+| **Edge-restricted** colour ceiling (`ab_err_*_edge`) | `dawn/eval/metrics.py: edge_quantile_mask`, `dawn/flow/oracle.py` | Tests 3.B — and proposal 3's goal with it. The whole-frame mean cannot see bleeding at boundaries |
+| `ciede2000/gap_to_oracle`, `colorfulness/ratio_*` | `trainer.validate` | A colour twin of the PSNR gap; colourfulness is unreadable except against the ground truth's |
+| `contrib/*`, `grad/*` per module | `train_step(detailed=True)` | Makes loss balancing and the detach gate legible — the exact risk the LUPI note raised about *adding* a loss applies to the four that are already there |
+| **EMA decay warmup** (`optim.ema_warmup`) | `trainer.EMA` | A fixed 0.999 leaves the shadow 61% initialization at step 500. Without this, the extra validation points would have measured noise |
+| **Conditioning ramp** (`flow.warmup_ramp_steps`) | `trainer.conditioning_scale` | The detach gate was a one-step flip from frozen features to moving ones. Gradient-only scaling, so a ramp of 0 is the old behaviour exactly |
+| `optim.cosine.min_factor` | `build_schedule` | Exposed, default 0.0 — a knob, not a recommendation |
+| W&B mirrored to **JSONL + CSV + `run_config.json`** | `scripts/train_flow.py: RunLog` | Plots rebuildable without W&B. One call site, so the records cannot drift (they already had) |
+| `configs/gpu_5090.yaml` | new overlay | 32 GB spent on `timesteps_per_image: 8`, not on the batch, with `render_subset: 64` so L_render keeps its cost |
+
+**What it cost.** 47 new tests (892 → 939, still ~70 s offline on CPU), `ruff check` clean. The
+two schedule changes are strict generalizations: with `ema_warmup: false` and
+`warmup_ramp_steps: 0` the run is bit-for-bit the old one, which is what keeps a baseline
+comparable. Validation is now order 4–8% of wall-clock at `val_every: 500`; the probe gives the
+real number, and `val_retrieval: false` is the first dial if it is too much.
+
+**Still not done.** Proposal 2's vehicle-crop metrics (`metrics.vehicle_region`) remain the open
+decision in `docs/inference_eval_phase.md`, and the plan's stage-2 refiner
+(`dawn/models/refiner.py`, `scripts/train_refiner.py`, `configs/refiner.yaml`) does not exist —
+it is first in the plan's own cut order.
