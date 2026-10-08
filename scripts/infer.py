@@ -150,10 +150,10 @@ def run_one(
     device: torch.device,
     args,
     refiner: LocalRefiner | None = None,
-) -> tuple[SpreadResult, torch.Tensor]:
+) -> tuple[SpreadResult, SpreadResult, torch.Tensor]:
     """One frame, end to end: read, one DINO pass, K members, render, then step 6.
 
-    Returns the result and the refiner's residual `(1, 1, h, w)` in `L = L*/100` units, so the
+    Returns the unrefined result, the refined result, and the refiner's residual `(1, 1, h, w)` in `L = L*/100` units, so the
     caller can report whether Stage 2 moved anything; with no refiner the residual is zeros.
     """
     thermal = read_thermal(path, bundle.input_size).to(device)
@@ -188,7 +188,7 @@ def run_one(
         lab=ensemble["lab"],
         rgb=ensemble["rgb"],
     )
-    return refined, member["residual"]
+    return out, refined, member["residual"]
 
 
 def main() -> None:
@@ -269,27 +269,31 @@ def main() -> None:
     times = []
     for index, path in enumerate(files, 1):
         start = time.perf_counter()
-        out, residual = run_one(bundle, path, device, args, refiner)
+        unrefined, refined, residual = run_one(bundle, path, device, args, refiner)
         times.append(time.perf_counter() - start)
-        write_outputs(out, path.stem, directory, args)
+        
+        write_outputs(unrefined, path.stem, directory, args)
+        if refiner is not None:
+            write_outputs(refined, path.stem, directory / "refined", args)
+
         # The residual is in L = L*/100 units; report L*, the unit the maps and the metrics use,
         # so "the refiner did nothing" is visible per frame rather than only in the images.
-        refined = (
+        refined_str = (
             "" if refiner is None else f", refiner |dL*| {100 * float(residual.abs().mean()):.2f}"
         )
-        if out.num_samples > 1:
+        if unrefined.num_samples > 1:
             logger.info(
                 "[%d/%d] %s  mean L* spread %.2f, a*b* spread %.2f%s  (%.2f s)",
                 index,
                 len(files),
                 path.name,
-                float(out.l_std.mean()),
-                float(out.ab_std.mean()),
-                refined,
+                float(unrefined.l_std.mean()),
+                float(unrefined.ab_std.mean()),
+                refined_str,
                 times[-1],
             )
         else:
-            logger.info("[%d/%d] %s%s  (%.2f s)", index, len(files), path.name, refined, times[-1])
+            logger.info("[%d/%d] %s%s  (%.2f s)", index, len(files), path.name, refined_str, times[-1])
 
     logger.info(
         "done: %d frame(s), %.2f s/frame (this is not a latency benchmark: see "
