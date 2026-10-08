@@ -73,6 +73,7 @@ class Stage:
     check: Mapping | None = None
     hours: float = 0.0
     ablates: str = ""
+    steps: int = 0  # optimizer steps this stage really runs; 0 when it does not train
 
     def is_done(self) -> bool:
         """Every `done` file exists. A stage with no `done` files never counts as finished."""
@@ -124,6 +125,8 @@ def build_plan(
     root: Path | None = None,
     include_ablations: bool = True,
     include_gates: bool = True,
+    repo: Path | None = None,
+    extra_overrides: Sequence[str] = (),
 ) -> list[Stage]:
     """Every stage of the campaign, in run order.
 
@@ -132,8 +135,11 @@ def build_plan(
     both their seconds/step meaningless.
     """
     root = Path(root or cfg.get("root", "runs"))
+    repo = Path(repo or Path(__file__).resolve().parents[1])
     device = str(cfg.get("device", "cuda"))
-    common = [str(p) for p in cfg.get("common_overrides") or []]
+    # `extra_overrides` go last so they win: that is how `--extra-override configs/fast.yaml`
+    # puts back a key configs/gpu_5090.yaml changed.
+    common = [str(p) for p in cfg.get("common_overrides") or []] + [str(p) for p in extra_overrides]
     stages: list[Stage] = []
 
     if include_gates:
@@ -153,6 +159,7 @@ def build_plan(
                     tests=" ".join(str(gate.get("tests", "")).split()),
                     check=gate.get("check"),
                     hours=float(gate.get("hours", 0.0)),
+                    steps=resolve_steps(repo, common, command),
                 )
             )
 
@@ -160,17 +167,19 @@ def build_plan(
         if not include_ablations and run["name"] != "baseline":
             continue
         out_dir = root / run["name"]
+        overrides = common + list(run.get("overrides") or [])
         stages.append(
             Stage(
                 name=run["name"],
                 kind=TRAIN,
-                command=_train_command(out_dir, common + list(run.get("overrides") or []), device),
+                command=_train_command(out_dir, overrides, device),
                 out_dir=out_dir,
                 done=(out_dir / "flow_last.pt",),
                 resumable_from=out_dir / "flow_last.pt",
                 tests=" ".join(str(run.get("tests", "")).split()),
                 hours=float(run.get("hours", 0.0)),
                 ablates=str(run.get("ablates", "")),
+                steps=resolve_steps(repo, overrides, ("train_flow.py",)),
             )
         )
 
@@ -191,6 +200,7 @@ def build_plan(
                 tests=" ".join(str(refiner.get("tests", "")).split()),
                 check=refiner.get("check"),
                 hours=float(refiner.get("hours", 0.0)),
+                steps=resolve_steps(repo, common, command),
             )
         )
 
@@ -220,7 +230,11 @@ def _append_train_options(
         command = [command[0], "--config", "configs/flow.yaml", *command[1:]]
     if common:
         if "--override" in command:
-            command.insert(command.index("--override") + 1, *common)
+            # Slice assignment, not `insert(i, *common)`: that only ever worked while
+            # `common_overrides` held exactly one entry, and silently raised on the second.
+            # The campaign's overrides go FIRST so the gate's own overlay still wins.
+            at = command.index("--override") + 1
+            command[at:at] = list(common)
         else:
             command += ["--override", *common]
     return command + ["--device", device, "--out-dir", str(out_dir)]
@@ -298,14 +312,53 @@ def median_sec_per_step(out_dir: Path) -> float | None:
     return statistics.median(values) if values else None
 
 
+def resolve_steps(repo: Path, overrides: Sequence[str], command: Sequence[str]) -> int:
+    """How many optimizer steps a stage will really run, from its own merged config.
+
+    Read rather than assumed, because `--extra-override configs/fast.yaml` changes
+    `flow.num_train_steps` and a cost table that still quoted the full budget would be worse
+    than no table. `--max-steps` on the command line wins, as it does in the trainer.
+    """
+    command = list(command)
+    if "--max-steps" in command:
+        return int(command[command.index("--max-steps") + 1])
+    try:
+        from omegaconf import OmegaConf
+
+        merged = OmegaConf.merge(
+            OmegaConf.load(repo / "configs/flow.yaml"), OmegaConf.load(repo / "configs/data.yaml")
+        )
+        for path in overrides:
+            merged = OmegaConf.merge(merged, OmegaConf.load(repo / path))
+        section = "refiner" if any("train_refiner" in c for c in command) else "flow"
+        return int(OmegaConf.to_container(merged, resolve=True)[section]["num_train_steps"])
+    except Exception:  # a missing or unreadable overlay: fall back to the declared estimate
+        return 0
+
+
 def rescale_hours(stages: Sequence[Stage], measured: float, reference: float) -> dict[str, float]:
-    """Each stage's estimated hours, scaled by how the measured step time compares with the
-    estimate the config was written against. Gates keep their own numbers: they are short and
-    dominated by data loading, not by the step time."""
-    if not measured or not reference or measured <= 0:
-        return {s.name: s.hours for s in stages}
-    factor = measured / reference
-    return {s.name: (s.hours if s.kind == GATE else s.hours * factor) for s in stages}
+    """Each stage's estimated hours, given the step time the probe measured.
+
+    A stage whose real step count is known is costed directly as `steps x seconds`, which is
+    exact once the probe has run and stays right when an overlay changes the budget. Anything
+    else falls back to scaling the declared estimate. Gates keep their own numbers: they are
+    short and dominated by data loading and JPEG decode, not by the training step.
+    """
+    # Before the probe has run, the reference step time stands in. It is a single number, so it
+    # cannot know that an overlay halved `timesteps_per_image`; the probe measures the real one
+    # and every number here becomes exact.
+    seconds = measured if measured and measured > 0 else reference
+    hours = {}
+    for stage in stages:
+        if stage.kind == GATE:
+            hours[stage.name] = stage.hours
+        elif stage.steps:
+            hours[stage.name] = stage.steps * seconds / 3600.0
+        elif measured and reference:
+            hours[stage.name] = stage.hours * measured / reference
+        else:
+            hours[stage.name] = stage.hours
+    return hours
 
 
 # --- checks --------------------------------------------------------------------------------------
@@ -614,6 +667,7 @@ __all__ = [
     "preflight_data",
     "read_csv_rows",
     "record",
+    "resolve_steps",
     "rescale_hours",
     "run_metrics",
     "run_stage",

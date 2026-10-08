@@ -265,14 +265,19 @@ def test_a_stage_with_no_check_passes_on_its_exit_code(tmp_path):
 def test_the_probe_rescales_the_training_estimates_but_not_the_gates(tmp_path):
     """Gates are short and dominated by data loading, so the step time does not scale them."""
     stages = _plan(tmp_path)
-    hours = rescale_hours(stages, measured=2.8, reference=1.4)
-    assert hours["baseline"] == pytest.approx(16.0), "twice the step time, twice the hours"
-    assert hours["oracle"] == pytest.approx(0.2), "a gate keeps its own estimate"
+    slow = rescale_hours(stages, measured=2.8, reference=1.4)
+    quick = rescale_hours(stages, measured=1.4, reference=1.4)
+    assert slow["baseline"] == pytest.approx(2 * quick["baseline"]), "twice the step time"
+    assert slow["oracle"] == quick["oracle"] == pytest.approx(0.2), "a gate keeps its estimate"
 
 
-def test_an_unmeasured_probe_leaves_the_estimates_alone(tmp_path):
+def test_an_unmeasured_probe_costs_the_real_step_count_at_the_reference_rate(tmp_path):
+    """`--list` before anything has run still has to respond to a budget overlay, so the step
+    count is used even when the step TIME is still the reference guess."""
     stages = _plan(tmp_path)
-    assert rescale_hours(stages, 0.0, 1.4)["baseline"] == pytest.approx(8.0)
+    baseline = next(s for s in stages if s.name == "baseline")
+    assert baseline.steps == 20000, "read from the real configs/flow.yaml"
+    assert rescale_hours(stages, 0.0, 1.4)["baseline"] == pytest.approx(20000 * 1.4 / 3600)
 
 
 def test_sec_per_step_comes_from_the_probes_csv_and_ignores_the_warm_up(tmp_path):
@@ -479,3 +484,83 @@ def test_the_evaluation_stage_looks_for_the_file_evaluate_py_actually_writes(tmp
     source = (Path(__file__).resolve().parents[1] / "scripts" / "evaluate.py").read_text("utf-8")
     written = set(re.findall(r'out_dir / "([\w.]+)"', source))
     assert {p.name for p in stage.done} <= written, f"evaluate.py writes {sorted(written)}"
+
+
+# --- step counts, extra overrides, and the cost that follows from them ---------------------------
+
+
+def _repo():
+    from pathlib import Path
+
+    return Path(__file__).resolve().parents[1]
+
+
+def test_a_stages_step_count_comes_from_its_own_merged_config(tmp_path):
+    """Not from the estimate in experiments.yaml: an overlay may change the budget."""
+    from dawn.pipeline import resolve_steps
+
+    full = resolve_steps(_repo(), ["configs/gpu_5090.yaml"], ("train_flow.py",))
+    overlays = ["configs/gpu_5090.yaml", "configs/fast.yaml"]
+    fast = resolve_steps(_repo(), overlays, ("train_flow.py",))
+    assert full == 20000
+    assert 0 < fast < full, "configs/fast.yaml must shorten the budget"
+
+
+def test_max_steps_on_the_command_line_wins_over_the_config():
+    from dawn.pipeline import resolve_steps
+
+    assert resolve_steps(_repo(), [], ("train_flow.py", "--max-steps", "50")) == 50
+
+
+def test_the_refiner_step_count_comes_from_its_own_section():
+    from dawn.pipeline import resolve_steps
+
+    steps = resolve_steps(_repo(), ["configs/refiner.yaml"], ("scripts/train_refiner.py",))
+    assert steps > 0 and steps != 20000
+
+
+def test_an_unreadable_overlay_falls_back_instead_of_crashing_the_plan():
+    from dawn.pipeline import resolve_steps
+
+    assert resolve_steps(_repo(), ["configs/does_not_exist.yaml"], ("train_flow.py",)) == 0
+
+
+def test_extra_overrides_go_last_so_they_win(tmp_path):
+    """`--extra-override configs/fast.yaml` has to beat configs/gpu_5090.yaml."""
+    stages = {
+        s.name: s
+        for s in build_plan(CAMPAIGN, root=tmp_path, repo=_repo(), extra_overrides=["b.yaml"])
+    }
+    command = list(stages["baseline"].command)
+    assert command.index("configs/gpu_5090.yaml") < command.index("b.yaml")
+
+
+def test_two_common_overrides_do_not_break_a_gates_command(tmp_path):
+    """Regression: this was `list.insert(i, *common)`, which only worked for exactly one."""
+    stages = {
+        s.name: s
+        for s in build_plan(CAMPAIGN, root=tmp_path, repo=_repo(), extra_overrides=["b.yaml"])
+    }
+    command = list(stages["gpu_probe"].command)
+    at = command.index("--override")
+    # The campaign's overlays come first; the gate's own still wins by being last.
+    assert command[at + 1 : at + 4] == ["configs/gpu_5090.yaml", "b.yaml", "configs/gpu_probe.yaml"]
+
+
+def test_hours_are_costed_from_the_real_step_count(tmp_path):
+    stages = [
+        Stage("a", TRAIN, ("x",), hours=8.0, steps=20000),
+        Stage("b", TRAIN, ("x",), hours=8.0, steps=12000),
+        Stage("g", GATE, ("x",), hours=0.2),
+    ]
+    hours = rescale_hours(stages, measured=1.8, reference=1.4)
+    assert hours["a"] == pytest.approx(20000 * 1.8 / 3600)
+    assert hours["b"] == pytest.approx(12000 * 1.8 / 3600)
+    assert hours["g"] == pytest.approx(0.2), "a gate is not costed per training step"
+
+
+def test_a_shorter_budget_shows_as_fewer_hours_before_the_probe_has_run(tmp_path):
+    """The whole point of reading the step count: --list must respond to the overlay."""
+    stages = [Stage("a", TRAIN, ("x",), hours=8.0, steps=20000)]
+    shorter = [Stage("a", TRAIN, ("x",), hours=8.0, steps=12000)]
+    assert rescale_hours(shorter, 0.0, 1.4)["a"] < rescale_hours(stages, 0.0, 1.4)["a"]

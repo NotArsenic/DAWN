@@ -314,3 +314,44 @@ def test_the_debug_overlay_runs_on_the_cpu_with_random_weights_and_no_wandb():
 
 def test_the_old_regime_configs_are_gone():
     assert not (CONFIGS / "camera_calib.yaml").exists()
+
+
+def test_the_fast_overlay_rescales_every_step_denominated_knob_together():
+    """The rescaling trap: a shorter budget that forgot one of these is a different experiment.
+
+    The SHAPE of the schedule must survive -- the detach still lifting at ~15% of the run, the
+    LR warmup at ~5% -- or the short run is not a shorter version of the long one.
+    """
+    full, fast = _merged("gpu_5090.yaml"), _merged("gpu_5090.yaml", "fast.yaml")
+    ratio = fast["flow"]["num_train_steps"] / full["flow"]["num_train_steps"]
+    assert 0 < ratio < 1, "fast.yaml must actually shorten the budget"
+    for section, key in (
+        ("flow", "warmup_steps"),
+        ("flow", "warmup_ramp_steps"),
+        ("optim", "lr_warmup_steps"),
+        ("logging", "val_every"),
+        ("logging", "save_every"),
+    ):
+        scaled = full[section][key] * ratio
+        assert fast[section][key] == pytest.approx(scaled, rel=0.1), f"{section}.{key} not rescaled"
+
+
+def test_the_fast_overlay_keeps_the_budget_clear_of_its_own_warmup():
+    """Below ~2x the warmup the conditioning detach eats the run (trainer warns, then wastes it)."""
+    fast = _merged("gpu_5090.yaml", "fast.yaml")["flow"]
+    assert fast["num_train_steps"] > 4 * fast["warmup_steps"]
+
+
+def test_the_fast_overlay_cuts_time_without_touching_the_batch():
+    """Total work per epoch is independent of batch size and linear in timesteps, so the batch
+    is NOT the lever and raising it only costs optimizer steps."""
+    full, fast = _merged("gpu_5090.yaml"), _merged("gpu_5090.yaml", "fast.yaml")
+    assert fast["optim"]["batch_size"] == full["optim"]["batch_size"]
+    assert fast["optim"]["lr"] == full["optim"]["lr"]  # no LR rescale needed if the batch is fixed
+    assert fast["flow"]["timesteps_per_image"] < full["flow"]["timesteps_per_image"]
+
+
+def test_the_fast_overlay_must_be_applied_after_the_hardware_one():
+    """It puts timesteps_per_image back, so the order in the override list is load-bearing."""
+    assert _merged("fast.yaml", "gpu_5090.yaml")["flow"]["timesteps_per_image"] == 8
+    assert _merged("gpu_5090.yaml", "fast.yaml")["flow"]["timesteps_per_image"] == 4

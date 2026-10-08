@@ -133,6 +133,15 @@ python scripts/run_pipeline.py --summary   # the comparison table, at any point
 
 `--only`, `--skip`, `--from`, `--no-ablations` and `--no-gates` select a subset; `--keep-going` carries on past a failed run (never past a failed gate).
 
+**If two days is too long**, `configs/fast.yaml` applies to every stage at once:
+
+```bash
+python scripts/run_pipeline.py --extra-override configs/fast.yaml --yes                  # ~30 h
+python scripts/run_pipeline.py --extra-override configs/fast.yaml --no-ablations --yes   # ~7 h
+```
+
+52 epochs instead of 87 and `timesteps_per_image` back to 4, with every step-denominated knob rescaled with the budget so the *shape* of the schedule is unchanged. **Note what is not in that list: `optim.batch_size`.** Total work per epoch is `3,662 × 45 GMAC × 2 passes` (DINO, fixed) plus `3,662 × timesteps × 10 GMAC` (velocity) — neither term contains the batch size, so raising it does not save time. It only buys fewer optimizer steps, and on 3,662 pairs that goes bad fast: batch 128 at the same epoch count is 2,500 steps, which is *below* `flow.warmup_steps`, so the conditioning detach would never lift and the run would look healthy the whole way. The levers that work are epochs, timesteps, and how many runs you do.
+
 ### GPU gate commands, by hand
 
 What the pipeline runs for you, in case you want one of them on its own. Each is a gate for the next. The Mac cannot measure VRAM at 640×512. Add `configs/gpu_5090.yaml` to every `--override` below if you are on the 32 GB card.

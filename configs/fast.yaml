@@ -1,0 +1,62 @@
+# Short-budget overlay: a campaign in an evening instead of two days.
+#
+#   python scripts/run_pipeline.py --extra-override configs/fast.yaml --yes
+#   python scripts/train_flow.py --config configs/flow.yaml \
+#       --override configs/gpu_5090.yaml configs/fast.yaml --device cuda
+#
+# MUST come AFTER configs/gpu_5090.yaml in the override list: it puts timesteps_per_image back.
+#
+# ---------------------------------------------------------------------------------------------
+# WHY THIS AND NOT A BIGGER BATCH
+#
+# Raising `optim.batch_size` does not save time. Total work per epoch is
+#
+#     3,662 x 45 GMAC x 2 encoder passes     +     3,662 x timesteps x 10 GMAC
+#     \_______ DINO, fixed _______/                \____ velocity, linear in timesteps ____/
+#
+# and neither term contains the batch size. It only decides how that work is cut into steps: at
+# a fixed epoch count, batch 32 is half as many steps that each cost twice as much. What it DOES
+# change is the number of optimizer steps, and on 3,662 pairs that goes bad quickly --
+#
+#     batch  16 -> 19,900 steps at 87 epochs   (warmup is 15% of the run)
+#     batch  32 -> 10,000                      (30%)
+#     batch  64 ->  5,000                      (60%)
+#     batch 128 ->  2,500                      (120%: the detach NEVER lifts, silently)
+#
+# -- so a 7.8M transformer plus LoRA ends up underfitting however many epochs it saw
+# (docs/training_budget_and_changes.md section 1). The three levers that really move wall-clock
+# are epochs, timesteps_per_image, and how many runs you do. This file uses the first two; the
+# third is `--no-ablations`.
+#
+# If you still want a bigger batch, every one of these keys must move with it, and the peak LR
+# by roughly the square-root rule (2.8e-4 at batch 32): num_train_steps, warmup_steps,
+# warmup_ramp_steps, optim.lr_warmup_steps, logging.val_every, logging.save_every.
+# ---------------------------------------------------------------------------------------------
+#
+# What this costs: 52 epochs instead of 87, and half the velocity samples per optimizer step.
+# The second is the one to watch -- L_flow's gradient gets noisier, so if `loss/flow_colour`
+# plateaus high, that is the first thing to put back. The epoch cut is the safer half: the
+# project's own note already calls 175 epochs "well into overfitting" and 3,662 pairs over
+# ~1,049 distinct scenes is not a set that rewards a long budget.
+
+flow:
+  # Back to the plan's default from the 5090 overlay's 8. This is the linear lever: it halves
+  # the velocity work per epoch, and the velocity net is about half the per-step cost.
+  timesteps_per_image: 4
+  # 12,000 x 16 / 3,662 = 52 epochs (the full budget is 87). Still 6.7x the detach warmup, so
+  # the run is nowhere near the failure mode above.
+  num_train_steps: 12000
+  # Everything step-denominated, scaled by 12,000 / 20,000 = 0.6, so the SHAPE of the schedule
+  # is unchanged: the detach still lifts at 15% of the run and the ramp is still 2.5% of it.
+  warmup_steps: 1800
+  warmup_ramp_steps: 300
+  # 64 velocity samples a step again (16 x 4), which is what the render path costs by default.
+  render_subset: null
+
+optim:
+  lr_warmup_steps: 600    # 5% of the budget, as in flow.yaml
+  # batch_size and lr are deliberately NOT touched: see the block above.
+
+logging:
+  val_every: 300          # 40 validation points, the same resolution as the full budget
+  save_every: 3000        # 4 periodic checkpoints

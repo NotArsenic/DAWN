@@ -99,6 +99,14 @@ def parse_args() -> argparse.Namespace:
         help="Baseline only: the gates, one stage-1 run, stage 2 and evaluation",
     )
     parser.add_argument("--no-gates", action="store_true", help="Skip the gates (not advised)")
+    parser.add_argument(
+        "--extra-override",
+        nargs="*",
+        default=[],
+        metavar="YAML",
+        help="Extra overlays appended to experiments.common_overrides for EVERY stage, winning "
+        "over them. `configs/fast.yaml` is the short-budget one: an evening, not two days.",
+    )
     parser.add_argument("--list", action="store_true", help="Print the plan and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print every command and exit")
     parser.add_argument("--summary", action="store_true", help="Print the results table and exit")
@@ -145,7 +153,11 @@ def main() -> int:
         root=root,
         include_ablations=not args.no_ablations,
         include_gates=not args.no_gates,
+        repo=ROOT,
+        extra_overrides=args.extra_override,
     )
+    if args.extra_override:
+        logger.info("extra overrides on every stage: %s", " ".join(args.extra_override))
     stages = select(stages, args)
 
     # Rescale the estimates from whatever the probe measured, if it has run.
