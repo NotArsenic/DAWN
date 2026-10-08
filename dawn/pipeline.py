@@ -116,13 +116,45 @@ def stage_one_runs(cfg: Mapping, include_ablations: bool = True) -> list[Mapping
     """The stage-1 runs: always `runs`, plus `ablations` when they are wanted.
 
     Reading results always wants both -- a summary written after someone ran `--ablations` must
-    still show those rows -- so `summary_table` and `pick_winner` pass True while `build_plan`
-    passes whatever the caller asked for.
+    still show those rows -- so `summary_table` passes True while `build_plan` passes whatever
+    the caller asked for.
+
+    Raises:
+        ValueError: a name appears in both lists. `Stage.name` is the directory, the `--only`
+            selector and the key in `pipeline_state.json`, so a duplicate silently gives two
+            stages one output directory. The natural way in is un-parking an ablation by
+            copying it into `runs:` instead of moving it.
     """
     runs = list(cfg.get("runs") or [])
     if include_ablations:
         runs += list(cfg.get("ablations") or [])
+    seen = [run["name"] for run in runs]
+    if len(seen) != len(set(seen)):
+        repeated = sorted({n for n in seen if seen.count(n) > 1})
+        raise ValueError(f"experiments.yaml names {repeated} in both runs: and ablations:")
     return runs
+
+
+def command_overrides(command: Sequence[str]) -> list[str]:
+    """The `--override` values of a built command, so a gate's own overlay is not lost.
+
+    `configs/overfit_gpu.yaml` sets `num_train_steps: 3000`; costing that gate from the
+    campaign's overrides alone resolved it to the baseline's 20,000.
+    """
+    command = list(command)
+    if "--override" not in command:
+        return []
+    out = []
+    for part in command[command.index("--override") + 1 :]:
+        if part.startswith("-"):
+            break
+        out.append(part)
+    return out
+
+
+def _trains(command: Sequence[str]) -> bool:
+    """Whether a command runs a training loop at all (`smoke_dino` and the oracle do not)."""
+    return any(c.endswith(("train_flow.py", "train_refiner.py")) for c in command)
 
 
 def _train_command(
@@ -154,7 +186,8 @@ def build_plan(
     device = str(cfg.get("device", "cuda"))
     # `extra_overrides` go last so they win: that is how `--extra-override configs/fast.yaml`
     # puts back a key configs/gpu_5090.yaml changed.
-    common = [str(p) for p in cfg.get("common_overrides") or []] + [str(p) for p in extra_overrides]
+    base_overrides = [str(p) for p in cfg.get("common_overrides") or []]
+    common = base_overrides + [str(p) for p in extra_overrides]
     stages: list[Stage] = []
 
     if include_gates:
@@ -174,7 +207,11 @@ def build_plan(
                     tests=" ".join(str(gate.get("tests", "")).split()),
                     check=gate.get("check"),
                     hours=float(gate.get("hours", 0.0)),
-                    steps=resolve_steps(repo, common, command),
+                    steps=(
+                        resolve_steps(repo, command_overrides(command), command)
+                        if _trains(command)
+                        else 0
+                    ),
                 )
             )
 
@@ -199,9 +236,14 @@ def build_plan(
     refiner = cfg.get("refiner")
     if refiner:
         out_dir = root / refiner["name"]
+        # `common_overrides` only, NOT `extra_overrides`. `train_refiner.py` merges its
+        # `--override` files AFTER configs/refiner.yaml, so a stage-1 budget overlay like
+        # configs/fast.yaml would silently rewrite stage 2's LR warmup and checkpoint spacing
+        # while leaving its own step count alone -- on the one stage whose entire output is a
+        # go/no-go number. Hardware overlays belong in `common_overrides` and are fine here.
         command = ["scripts/train_refiner.py", "--device", device, "--out-dir", str(out_dir)]
-        if common:
-            command += ["--override", *common]
+        if base_overrides:
+            command += ["--override", *base_overrides]
         stages.append(
             Stage(
                 name=refiner["name"],
@@ -213,7 +255,6 @@ def build_plan(
                 tests=" ".join(str(refiner.get("tests", "")).split()),
                 check=refiner.get("check"),
                 hours=float(refiner.get("hours", 0.0)),
-                steps=resolve_steps(repo, common, command),
             )
         )
 
@@ -352,10 +393,10 @@ def resolve_steps(repo: Path, overrides: Sequence[str], command: Sequence[str]) 
 def rescale_hours(stages: Sequence[Stage], measured: float, reference: float) -> dict[str, float]:
     """Each stage's estimated hours, given the step time the probe measured.
 
-    A stage whose real step count is known is costed directly as `steps x seconds`, which is
-    exact once the probe has run and stays right when an overlay changes the budget. Anything
-    else falls back to scaling the declared estimate. Gates keep their own numbers: they are
-    short and dominated by data loading and JPEG decode, not by the training step.
+    A stage-1 run whose real step count is known is costed directly as `steps x seconds`,
+    which is exact once the probe has run and stays right when an overlay changes the budget.
+    Gates and the refiner keep their declared estimate whatever the probe measures -- see the
+    comment in the loop for why neither shares stage 1's per-step profile.
     """
     # Before the probe has run, the reference step time stands in. It is a single number, so it
     # cannot know that an overlay halved `timesteps_per_image`; the probe measures the real one
@@ -363,13 +404,15 @@ def rescale_hours(stages: Sequence[Stage], measured: float, reference: float) ->
     seconds = measured if measured and measured > 0 else reference
     hours = {}
     for stage in stages:
-        # Only stage-1 runs share the probe's step profile. A gate is short and dominated by
-        # data loading; the refiner has no DINO pass at all -- two encoder passes over 16
-        # frames against a 2,545-parameter conv on a crop -- so costing its 8,000 steps at the
-        # flow's rate would overstate it several times over. Both keep their declared estimate.
-        if stage.kind == TRAIN and stage.steps:
+        # A stage with a real step count is costed directly. Gates keep their declared
+        # estimate: two of them do not train at all, and the two that do are short and
+        # dominated by data loading. So does the refiner -- it has no DINO pass, just two
+        # encoder passes' worth of grid fit against a 2,545-parameter conv on a crop, so its
+        # 8,000 steps cost nothing like stage 1's. Evaluation IS the probe's profile (one DINO
+        # pass plus NFE velocity passes per test pair), so it scales.
+        if stage.steps and stage.kind in (TRAIN, EVAL):
             hours[stage.name] = stage.steps * seconds / 3600.0
-        elif stage.kind == TRAIN and measured and reference:
+        elif stage.kind in (TRAIN, EVAL) and measured and reference:
             hours[stage.name] = stage.hours * measured / reference
         else:
             hours[stage.name] = stage.hours
@@ -379,10 +422,22 @@ def rescale_hours(stages: Sequence[Stage], measured: float, reference: float) ->
 # --- checks --------------------------------------------------------------------------------------
 
 
+def is_blocking(stage: Stage) -> bool:
+    """Whether a failed check should stop the campaign.
+
+    A gate is blocking: it exists to say the rest is not worth running. The refiner's check is
+    not -- "the refiner did not earn its place" is a RESULT, and halting on it would throw away
+    the evaluation that is the whole point of the night. `check.blocking: false` says so.
+    """
+    return bool((stage.check or {}).get("blocking", True))
+
+
 def check_stage(stage: Stage, root: Path) -> tuple[bool, str]:
     """Judge a finished stage against its configured `check`. `(passed, detail)`.
 
     A stage with no check passes on its exit code alone, which the caller has already seen.
+    Judged from the artifacts on disk, never from `pipeline_state.json`, so re-running a
+    campaign re-evaluates a gate that failed rather than skipping it as "done".
     """
     check = stage.check
     if not check:
@@ -465,7 +520,7 @@ def summary_table(cfg: Mapping, root: Path, subset: str = "box_aligned") -> str:
 
     header = (
         "| run | knob | step | CIEDE2000 | best | L* PSNR | best | gap | colourfulness |\n"
-        "|---|---|---|---|---|---|---|---|"
+        "|---|---|---|---|---|---|---|---|---|"
     )
     lines = [header]
     baseline = next((s for n, _, s in rows if n == "baseline"), None)
@@ -492,23 +547,44 @@ def summary_table(cfg: Mapping, root: Path, subset: str = "box_aligned") -> str:
     return "\n".join(lines)
 
 
-def pick_winner(cfg: Mapping, root: Path, subset: str = "box_aligned") -> tuple[str, Path] | None:
+def pick_winner(
+    cfg: Mapping,
+    root: Path,
+    subset: str = "box_aligned",
+    names: Iterable[str] | None = None,
+) -> tuple[str, Path] | None:
     """The run with the best `evaluation.select_by`, and its `flow_best.pt`.
 
-    Ablations that move the token layout (the correction) are still eligible: a checkpoint is
-    self-describing, so evaluation and inference pick the layout up from it.
+    Two restrictions, both of which cost a night when they are missing:
+
+    `names` scopes the candidates to the runs the campaign actually planned. Without it the
+    default essentials campaign would happily evaluate and ship a PARKED ablation left over
+    from an earlier `--ablations` run, so the 8 hours of `baseline` nobody had to re-run would
+    go unevaluated. `None` means every run in the file, which is what a bare `--summary` wants.
+
+    A run must also have **finished**: `flow_best.pt` is rewritten at every validation, so an
+    aborted run has one from step 500 and it can easily hold the best score of a short curve.
+    `flow_last.pt` only appears when the loop completes, so that is the test.
+
+    An ablation that moves the token layout (the correction) is still eligible when it is in
+    scope: a checkpoint is self-describing, so evaluation picks the layout up from it.
     """
     metric = str((cfg.get("evaluation") or {}).get("select_by", "ciede2000"))
     key = {"ciede2000": "best_ciede2000/euler", "psnr_L": "best_psnr_L/euler"}.get(metric)
     if key is None:
         return None
     higher_is_better = metric == "psnr_L"
+    wanted = None if names is None else set(names)
     best: tuple[float, str] | None = None
     for run in stage_one_runs(cfg):
+        if wanted is not None and run["name"] not in wanted:
+            continue
         scores = run_metrics(root / run["name"], subset)
         checkpoint = root / run["name"] / "flow_best.pt"
         if key not in scores or not checkpoint.exists():
             continue
+        if not (root / run["name"] / "flow_last.pt").exists():
+            continue  # the run did not finish; its "best" is the best of a truncated curve
         value = scores[key] * (1.0 if higher_is_better else -1.0)
         if best is None or value > best[0]:
             best = (value, run["name"])
@@ -674,7 +750,9 @@ __all__ = [
     "StageResult",
     "build_plan",
     "check_stage",
+    "command_overrides",
     "evaluation_command",
+    "is_blocking",
     "load_state",
     "median_sec_per_step",
     "pick_winner",

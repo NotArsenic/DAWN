@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the whole Dawn training campaign: gates, the baseline, every ablation, stage 2, evaluation.
+"""Run the Dawn training campaign: the gates, the model, stage 2 and evaluation.
 
 One command, start to finish:
 
@@ -10,10 +10,13 @@ One command, start to finish:
 What runs is declared in `configs/experiments.yaml` and nowhere else. The order is the dependency:
 
     smoke_dino -> oracle -> gpu_probe -> overfit      the gates, each a gate for the next
-    baseline                                          the reference run
-    correction, one_cycle, segment_equal, bgu, ...    one knob off the baseline, each
+    baseline                                          the model
     refiner                                           stage 2
     evaluation                                        the winning checkpoint on the test split
+
+The five ablations in `ablations:` are PARKED: they answer open decisions about the method, not
+about this model, and cost five times the rest put together. `--ablations` runs them all;
+`--only correction` runs one.
 
 Three things this buys over running the commands by hand:
 
@@ -25,9 +28,9 @@ what to do about it rather than only what broke.
 `flow_last.pt` restarts with `--resume`. A campaign that dies on stage 5 at 4 a.m. keeps stages 1
 to 4 and picks up where it stopped; `pipeline_state.json` is the record.
 
-**It costs what it says.** `gpu_probe` measures seconds/step on the real configuration and every
-later estimate is rescaled from it, so the hours in the table stop being a guess written into a
-config file. Nothing launches without `--yes`, because the full campaign is days of GPU time.
+**It costs what it says.** `gpu_probe` measures seconds/step on the real configuration and the
+stage-1 and evaluation estimates are rescaled from it (a gate and the refiner do not share that
+per-step profile, so they keep their declared numbers). Nothing launches without `--yes`.
 
 Afterwards, `--summary` prints the comparison table at any point, finished or not.
 """
@@ -52,6 +55,7 @@ from dawn.pipeline import (  # noqa: E402
     build_plan,
     check_stage,
     evaluation_command,
+    is_blocking,
     load_state,
     median_sec_per_step,
     pick_winner,
@@ -74,7 +78,7 @@ REFERENCE_SEC_PER_STEP = 1.4
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the whole training campaign (gates, baseline, ablations, stage 2, eval)",
+        description="Run the training campaign (gates, the model, stage 2, evaluation)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -84,10 +88,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Override experiments.device")
     parser.add_argument(
         "--only",
-        nargs="*",
+        nargs="+",
         default=None,
         metavar="STAGE",
-        help="Run only these stages, by name. Their gates are still enforced if already run.",
+        help="Run only these stages, by name. A parked ablation named here is pulled into the "
+        "plan, so `--only correction` works without --ablations. At least one name is "
+        "required: a bare --only used to mean 'everything', which with --yes is a two-day job.",
     )
     parser.add_argument("--skip", nargs="*", default=[], metavar="STAGE", help="Skip these stages")
     parser.add_argument(
@@ -106,8 +112,9 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         metavar="YAML",
-        help="Extra overlays appended to experiments.common_overrides for EVERY stage, winning "
-        "over them. `configs/fast.yaml` is the short-budget one: an evening, not two days.",
+        help="Extra overlays appended to experiments.common_overrides for every stage-1 run, "
+        "winning over them. `configs/fast.yaml` is the short-budget one. NOT applied to the "
+        "refiner, whose own config would lose to it.",
     )
     parser.add_argument("--list", action="store_true", help="Print the plan and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print every command and exit")
@@ -121,6 +128,13 @@ def parse_args() -> argparse.Namespace:
         help="Carry on after a FAILED run. Gate failures always stop: they mean the rest is void.",
     )
     return parser.parse_args()
+
+
+def _guidance(stage: Stage) -> None:
+    """The configured `on_fail`: what to do about it, not only what broke."""
+    text = " ".join(str((stage.check or {}).get("on_fail", "")).split())
+    if text:
+        logger.error("    %s", text)
 
 
 def select(stages: list[Stage], args: argparse.Namespace) -> list[Stage]:
@@ -153,7 +167,9 @@ def main() -> int:
     stages = build_plan(
         cfg,
         root=root,
-        include_ablations=args.ablations,
+        # `--only correction` has to find `correction`, so naming any stage pulls the parked
+        # ablations into the plan before `select()` validates the names against it.
+        include_ablations=args.ablations or bool(args.only),
         include_gates=not args.no_gates,
         repo=ROOT,
         extra_overrides=args.extra_override,
@@ -217,20 +233,23 @@ def main() -> int:
     started = time.perf_counter()
     failures: list[str] = []
 
+    planned = {s.name for s in stages}
+    winner_file = (root / "evaluation" / "winner.txt") if root else None
+
     for index, stage in enumerate(stages, 1):
         head = f"[{index}/{len(stages)}] {stage.name}"
-        if stage.is_done():
-            logger.info("%s: already finished, skipping", head)
-            continue
 
-        # Evaluation needs the winner, which is not known until the stage-1 runs have curves.
+        # Evaluation needs the winner, which is not known until the stage-1 runs have curves,
+        # so it is resolved BEFORE the is-it-done test: an evaluation of yesterday's winner is
+        # stale, not finished.
+        expected = None
         if stage.kind == EVAL:
-            winner = pick_winner(cfg, root)
+            winner = pick_winner(cfg, root, names=planned)
             if winner is None:
-                logger.warning("%s: no finished stage-1 run to evaluate, skipping", head)
+                logger.warning("%s: no FINISHED stage-1 run to evaluate, skipping", head)
                 continue
-            name, checkpoint = winner
-            logger.info("%s: the winning run is %s (%s)", head, name, checkpoint)
+            expected, checkpoint = winner
+            logger.info("%s: the winning run is %s (%s)", head, expected, checkpoint)
             stage = Stage(
                 **{
                     **stage.__dict__,
@@ -239,6 +258,30 @@ def main() -> int:
                     ),
                 }
             )
+
+        if stage.is_done():
+            recorded = None
+            if expected is not None and winner_file and winner_file.exists():
+                recorded = winner_file.read_text(encoding="utf-8").strip()
+            if expected is not None and recorded != expected:
+                logger.info(
+                    "%s: on disk it evaluated %s, the winner is now %s -- redoing it",
+                    head,
+                    recorded or "an unrecorded run",
+                    expected,
+                )
+            else:
+                # A finished stage is still JUDGED. Its check reads the artifacts on disk, and
+                # a gate that failed wrote its checkpoint anyway, so without this one re-run
+                # of the same command walks straight past it.
+                passed, detail = check_stage(stage, root)
+                if not passed and is_blocking(stage):
+                    logger.error("%s: already finished, but its CHECK FAILS -- %s", head, detail)
+                    _guidance(stage)
+                    logger.error("Stopping: a gate decides whether the rest is worth running.")
+                    return 2
+                logger.info("%s: already finished, skipping", head)
+                continue
 
         verb = "resuming" if stage.can_resume() else "starting"
         logger.info("%s: %s (~%.1f h) -- %s", head, verb, hours.get(stage.name, 0), stage.tests)
@@ -254,12 +297,18 @@ def main() -> int:
             result.detail = detail
             if detail:
                 logger.info("%s: %s", head, detail)
-            if not passed:
+            if not passed and is_blocking(stage):
                 result.status = "gate_failed"
                 logger.error("%s: CHECK FAILED -- %s", head, detail)
-                guidance = " ".join(str((stage.check or {}).get("on_fail", "")).split())
-                if guidance:
-                    logger.error("    %s", guidance)
+                _guidance(stage)
+            elif not passed:
+                # Advisory: "the refiner did not earn its place" is a RESULT. Stopping here
+                # would throw away the evaluation that is the point of the night.
+                result.status = "check_failed"
+                logger.warning("%s: check did not pass -- %s", head, detail)
+                _guidance(stage)
+            elif expected is not None and stage.out_dir:
+                (stage.out_dir / "winner.txt").write_text(expected + "\n", encoding="utf-8")
         state = record(state, result)
         save_state(root, state)
 

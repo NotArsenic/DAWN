@@ -332,7 +332,8 @@ def test_the_winner_is_the_best_ciede2000_with_a_checkpoint_on_disk(tmp_path):
     root = tmp_path / "runs"
     for name, delta in (("baseline", 4.0), ("one_cycle", 3.0)):
         _write_val_csv(root / name, [{"step": 1, "ciede2000/euler": delta}])
-        (root / name / "flow_best.pt").write_bytes(b"x")
+        for marker in ("flow_best.pt", "flow_last.pt"):
+            (root / name / marker).write_bytes(b"x")
     assert pick_winner(CAMPAIGN, root)[0] == "one_cycle"
 
 
@@ -340,7 +341,8 @@ def test_a_run_without_a_checkpoint_cannot_win(tmp_path):
     """A curve with no `flow_best.pt` is a crashed run, not a candidate."""
     root = tmp_path / "runs"
     _write_val_csv(root / "baseline", [{"step": 1, "ciede2000/euler": 4.0}])
-    (root / "baseline" / "flow_best.pt").write_bytes(b"x")
+    for marker in ("flow_best.pt", "flow_last.pt"):
+        (root / "baseline" / marker).write_bytes(b"x")
     _write_val_csv(root / "one_cycle", [{"step": 1, "ciede2000/euler": 1.0}])  # better, no file
     assert pick_winner(CAMPAIGN, root)[0] == "baseline"
 
@@ -572,3 +574,126 @@ def test_a_shorter_budget_shows_as_fewer_hours_before_the_probe_has_run(tmp_path
     stages = [Stage("a", TRAIN, ("x",), hours=8.0, steps=20000)]
     shorter = [Stage("a", TRAIN, ("x",), hours=8.0, steps=12000)]
     assert rescale_hours(shorter, 0.0, 1.4)["a"] < rescale_hours(stages, 0.0, 1.4)["a"]
+
+
+# --- what the max-effort review found -------------------------------------------------------------
+
+
+def test_only_pulls_a_parked_ablation_into_the_plan(tmp_path):
+    """`--only correction` is documented in four places; without this it hard-errors, because
+    `select()` validates names against a plan the ablations were never added to."""
+    import argparse
+
+    from scripts.run_pipeline import select
+    from scripts.train_flow import main as _  # noqa: F401  (import guard only)
+
+    stages = build_plan(CAMPAIGN, root=tmp_path, repo=_repo(), include_ablations=True)
+    args = argparse.Namespace(only=["one_cycle"], skip=[], start_from=None)
+    assert [s.name for s in select(stages, args)] == ["one_cycle"]
+
+
+def test_only_requires_at_least_one_name():
+    """A bare `--only` used to parse as [] and mean 'run everything' -- a two-day job."""
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "scripts/run_pipeline.py", "--only", "--ablations", "--list"],
+        cwd=_repo(), capture_output=True, text=True,
+    )
+    assert out.returncode != 0 and "expected at least one argument" in out.stderr
+
+
+def test_the_winner_is_scoped_to_the_runs_that_were_planned(tmp_path):
+    """Otherwise the essentials campaign ships a parked ablation left over from an older run."""
+    root = tmp_path / "runs"
+    for name, delta in (("baseline", 4.0), ("one_cycle", 3.0)):
+        _write_val_csv(root / name, [{"step": 1, "ciede2000/euler": delta}])
+        for marker in ("flow_best.pt", "flow_last.pt"):
+            (root / name / marker).write_bytes(b"x")
+    assert pick_winner(CAMPAIGN, root)[0] == "one_cycle", "unscoped: the best of everything"
+    assert pick_winner(CAMPAIGN, root, names={"baseline"})[0] == "baseline"
+
+
+def test_an_unfinished_run_cannot_win(tmp_path):
+    """`flow_best.pt` is rewritten at every validation, so an aborted run has one -- and the
+    best of a 1,000-step curve can beat a finished run."""
+    root = tmp_path / "runs"
+    _write_val_csv(root / "baseline", [{"step": 20000, "ciede2000/euler": 4.0}])
+    (root / "baseline" / "flow_best.pt").write_bytes(b"x")
+    (root / "baseline" / "flow_last.pt").write_bytes(b"x")
+    _write_val_csv(root / "one_cycle", [{"step": 1000, "ciede2000/euler": 3.0}])
+    (root / "one_cycle" / "flow_best.pt").write_bytes(b"x")  # aborted: no flow_last.pt
+    assert pick_winner(CAMPAIGN, root)[0] == "baseline"
+
+
+def test_the_summary_table_is_valid_markdown(tmp_path):
+    """GFM drops the whole block when the delimiter row does not match the header."""
+    root = tmp_path / "runs"
+    _write_val_csv(root / "baseline", [{"step": 1, "ciede2000/euler": 4.0}])
+    lines = summary_table(CAMPAIGN, root).splitlines()
+    cells = [line.count("|") for line in lines[:3]]
+    assert len(set(cells)) == 1, f"header/delimiter/row cell counts differ: {cells}"
+
+
+def test_a_duplicated_run_name_is_refused(tmp_path):
+    """Un-parking by COPYING into runs: would give two stages one output directory."""
+    from dawn.pipeline import stage_one_runs
+
+    clashing = {**CAMPAIGN, "runs": CAMPAIGN["runs"] + [{"name": "one_cycle", "overrides": []}]}
+    with pytest.raises(ValueError, match="one_cycle"):
+        stage_one_runs(clashing)
+
+
+def test_a_gate_resolves_its_own_overlays_step_count(tmp_path):
+    """configs/overfit_gpu.yaml sets 3,000 steps; costing it from the campaign's overrides
+    alone resolved it to the baseline's 20,000."""
+    from dawn.pipeline import command_overrides
+
+    command = ["scripts/train_flow.py", "--override", "a.yaml", "b.yaml", "--device", "cuda"]
+    assert command_overrides(command) == ["a.yaml", "b.yaml"]
+    assert command_overrides(["scripts/smoke_dino.py"]) == []
+
+
+def test_a_non_training_gate_has_no_step_count(tmp_path):
+    """smoke_dino and the oracle do not train, so a step count for them is meaningless."""
+    stages = {s.name: s for s in _plan(tmp_path, include_gates=True)}
+    assert stages["oracle"].steps == 0
+
+
+def test_the_refiner_does_not_inherit_a_stage_1_budget_overlay(tmp_path):
+    """train_refiner.py merges --override AFTER configs/refiner.yaml, so configs/fast.yaml
+    would rewrite stage 2's LR warmup and checkpoint spacing but not its step count."""
+    stages = {
+        s.name: s
+        for s in build_plan(
+            CAMPAIGN, root=tmp_path, repo=_repo(), extra_overrides=["configs/fast.yaml"]
+        )
+    }
+    assert "configs/fast.yaml" in stages["baseline"].command, "stage 1 does take it"
+    assert "configs/fast.yaml" not in stages["refiner"].command, "stage 2 must not"
+    assert "configs/gpu_5090.yaml" in stages["refiner"].command, "hardware overlays still apply"
+
+
+def test_the_refiners_check_is_advisory_and_a_gates_is_not():
+    """"The refiner did not earn its place" is a result; halting would skip the evaluation."""
+    from dawn.pipeline import is_blocking
+
+    assert is_blocking(Stage("overfit", GATE, ("x",), check={"kind": "val_metric"}))
+    assert not is_blocking(Stage("refiner", REFINER, ("x",), check={"blocking": False}))
+    assert is_blocking(Stage("plain", TRAIN, ("x",))), "no check at all is not a free pass"
+
+
+def test_the_shipped_refiner_check_does_not_block_the_campaign():
+    """The most likely single outcome of the night must not destroy the deliverable."""
+    from pathlib import Path
+
+    import omegaconf
+
+    from dawn.pipeline import is_blocking
+
+    cfg = omegaconf.OmegaConf.to_container(
+        omegaconf.OmegaConf.load(Path(_repo()) / "configs/experiments.yaml")
+    )
+    stage = Stage("refiner", REFINER, ("x",), check=cfg["refiner"]["check"])
+    assert not is_blocking(stage)

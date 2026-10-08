@@ -1,10 +1,12 @@
-# Short-budget overlay: a campaign in an evening instead of two days.
+# Short-budget overlay: the essentials in an evening (~7 h) instead of a night (~10 h).
 #
 #   python scripts/run_pipeline.py --extra-override configs/fast.yaml --yes
 #   python scripts/train_flow.py --config configs/flow.yaml \
 #       --override configs/gpu_5090.yaml configs/fast.yaml --device cuda
 #
 # MUST come AFTER configs/gpu_5090.yaml in the override list: it puts timesteps_per_image back.
+# It is a STAGE-1 overlay. run_pipeline.py deliberately does not pass it to train_refiner.py,
+# which merges --override after configs/refiner.yaml and would take stage 2's schedule with it.
 #
 # ---------------------------------------------------------------------------------------------
 # WHY THIS AND NOT A BIGGER BATCH
@@ -26,7 +28,7 @@
 # -- so a 7.8M transformer plus LoRA ends up underfitting however many epochs it saw
 # (docs/training_budget_and_changes.md section 1). The three levers that really move wall-clock
 # are epochs, timesteps_per_image, and how many runs you do. This file uses the first two; the
-# third is `--no-ablations`.
+# third is the default campaign, which runs one stage-1 run and parks the five ablations.
 #
 # If you still want a bigger batch, every one of these keys must move with it, and the peak LR
 # by roughly the square-root rule (2.8e-4 at batch 32): num_train_steps, warmup_steps,

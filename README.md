@@ -131,13 +131,13 @@ python scripts/run_pipeline.py --summary   # the comparison table, at any point
 | default + `configs/fast.yaml` | 7 | ~7 — an evening |
 | `--ablations` (research) | 12 | ~49 — two days |
 
-The five ablations are **parked**, not deleted: each answers an open decision in `CLAUDE.md`, which is knowledge about the method rather than a better model. Run one on its own later if a curve makes you curious (`--only correction`), not as a matter of course.
+The five ablations are **parked**, not deleted: they buy knowledge about the method rather than a better model. Run one on its own later if a curve makes you curious (`--only correction`), not as a matter of course. Three of the five answer an open decision in `CLAUDE.md`; `bgu` re-opens one the oracle already settled on measured numbers and `one_cycle` is not an open decision at all, so weigh those two before spending ~16 GPU-hours.
 
 - **It refuses to start without the data.** A preflight checks the manifests and the aligned PNGs before anything else, because the manifests are committed and the 5,385 × 5 PNGs are not — on a fresh clone that is the first thing that would otherwise fail, a minute into an overnight run.
 - **Gates really gate.** The oracle's 24 dB rule and "the overfit run must approach its own oracle" stop the campaign, and the failure prints what to do rather than only what broke.
-- **Resumable and idempotent.** A finished stage is skipped; a half-finished run restarts with `--resume`. Dying on stage 9 at 4 a.m. keeps stages 1–8. The record is `runs/pipeline_state.json`, and every stage streams to `runs/logs/<stage>.log`.
+- **Resumable and idempotent.** A finished stage is skipped; a half-finished run restarts with `--resume`. Dying at 4 a.m. keeps everything that finished, and a finished stage is still judged — a gate whose check fails stops the re-run too, rather than being skipped as done. The record is `runs/pipeline_state.json`, and every stage streams to `runs/logs/<stage>.log`.
 - **The cost is measured, not guessed.** `gpu_probe` measures seconds/step on the real configuration and every later estimate is rescaled from it.
-- **One knob per ablation.** `baseline` first and alone; `correction`, `one_cycle`, `segment_equal`, `bgu` and `plain_schedule` are each the baseline plus exactly one overlay, so a difference is attributable. A test pins that rule against the shipped file.
+- **One knob per ablation.** `baseline` first and alone; `correction`, `one_cycle`, `segment_equal`, `bgu` and `plain_schedule` are each the baseline plus exactly one overlay, so a difference is attributable. `tests/test_configs.py` pins that rule against the shipped file.
 
 `--only`, `--skip`, `--from`, `--ablations` and `--no-gates` select what runs; `--keep-going` carries on past a failed run (never past a failed gate). `--skip refiner` drops stage 2, which the plan lists first in its own cut order.
 

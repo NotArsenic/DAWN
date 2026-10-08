@@ -92,8 +92,9 @@ runs:
   - name: baseline
     hours: 8
     tests: >-
-      The model. 20K steps, the plan's schedule, everything at its decided default. This is the
-      checkpoint that gets evaluated and shipped.
+      The model: the plain configuration, no ablation applied. This is the checkpoint that gets
+      evaluated and shipped. Its budget comes from flow.yaml and whatever overlays are active,
+      so read the hours column rather than assuming a step count.
     overrides: []
 
 # --- parked: research, not a deliverable --------------------------------------------------------
@@ -153,6 +154,10 @@ refiner:
     kind: val_metric
     metric: psnr_L/improvement
     min: 0.0
+    # ADVISORY, not a gate. "The refiner did not earn its place" is a result, and halting on it
+    # would skip the evaluation that is the whole point of the night -- on the one stage the
+    # plan already lists first in its own cut order.
+    blocking: false
     on_fail: >-
       The refiner did not improve L* PSNR. That is a real answer, not a failure: the plan lists
       it first in its own cut order. Drop --refiner at inference and move on.
