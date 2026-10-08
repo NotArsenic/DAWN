@@ -377,10 +377,29 @@ def _common() -> argparse.ArgumentParser:
     common.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
     common.add_argument("--splits", nargs="+", default=None, help="Override dronevehicle.splits")
     common.add_argument(
-        "--workers", type=int, default=os.cpu_count() or 1, help="Processes (default: every core)"
+        "--workers",
+        type=int,
+        default=default_workers(),
+        help=f"Processes (default: {default_workers()}, the cores this process may actually use)",
     )
     common.add_argument("--force", action="store_true", help="Redo work already on disk")
     return common
+
+
+def default_workers(cap: int = 16) -> int:
+    """Processes to fork by default: the cores this process may actually use, capped.
+
+    NOT `os.cpu_count()`. Inside a container that reports the HOST's core count -- 100+ on a
+    rented GPU box -- so the default forked ~100 workers, each importing torch, and the OOM
+    killer took one and the pool died with `BrokenProcessPool`. `sched_getaffinity` respects
+    the cgroup's CPU set, and the cap keeps memory sane on a machine that really does have
+    that many cores: these jobs are JPEG decode and PNG encode, which saturate well before 16.
+    """
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:  # not Linux
+        available = os.cpu_count() or 1
+    return max(1, min(cap, available))
 
 
 def main() -> None:
