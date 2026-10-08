@@ -62,16 +62,23 @@ logger = logging.getLogger(__name__)
 
 SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
-
-def find_inputs(path: Path, limit: int | None) -> list[Path]:
-    """One file, or every image in a directory, sorted so runs are reproducible."""
-    if path.is_file():
-        return [path]
-    if not path.is_dir():
-        raise FileNotFoundError(f"no such file or directory: {path}")
-    files = sorted(p for p in path.rglob("*") if p.suffix.lower() in SUFFIXES)
+def find_inputs(paths: list[str], limit: int | None) -> list[Path]:
+    """One or more files/directories, sorted so runs are reproducible."""
+    files = set()
+    for p_str in paths:
+        p = Path(p_str)
+        if p.is_file():
+            if p.suffix.lower() in SUFFIXES:
+                files.add(p)
+        elif p.is_dir():
+            for f in p.rglob("*"):
+                if f.suffix.lower() in SUFFIXES:
+                    files.add(f)
+        else:
+            raise FileNotFoundError(f"no such file or directory: {p}")
     if not files:
-        raise FileNotFoundError(f"no images under {path} (looked for {sorted(SUFFIXES)})")
+        raise FileNotFoundError(f"no images found in {paths}")
+    files = sorted(list(files))
     return files[:limit] if limit else files
 
 
@@ -195,7 +202,7 @@ def main() -> None:
         default=None,
         help="Stage 2 refiner checkpoint; without it the Stage 1 render is saved as it is",
     )
-    parser.add_argument("--input", type=str, required=True, help="Thermal image, or a directory")
+    parser.add_argument("--input", nargs="+", required=True, help="Thermal image(s), or a directory")
     parser.add_argument("--output", type=str, default="outputs/infer", help="Where to write")
     parser.add_argument("--limit", type=int, default=None, help="Only the first N of a directory")
     parser.add_argument(
@@ -248,7 +255,7 @@ def main() -> None:
             100.0 * refiner.residual_scale,
         )
 
-    files = find_inputs(Path(args.input), args.limit)
+    files = find_inputs(args.input, args.limit)
     directory = Path(args.output)
     logger.info(
         "%d frame(s) -> %s at K=%d, %s, NFE %d",
