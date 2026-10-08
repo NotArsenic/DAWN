@@ -17,6 +17,7 @@ dependencies = [
     "scipy>=1.11",
     "matplotlib>=3.7",     # data-phase histograms; dawn.eval.visualize / calibration plots
     "tqdm>=4.65",
+    "huggingface-hub>=0.23",  # scripts/fetch_dronevehicle.py pulls the three zips from the Hub
     "wandb>=0.16",
     "lpips>=0.1.4",
     "scikit-image>=0.21",

@@ -56,6 +56,7 @@ from dawn.pipeline import (  # noqa: E402
     median_sec_per_step,
     pick_winner,
     plan_table,
+    preflight_data,
     record,
     rescale_hours,
     run_stage,
@@ -186,6 +187,16 @@ def main() -> int:
             sum(hours.get(s.name, 0) for s in stages if not s.is_done()),
         )
         return 0
+
+    # The cheapest check against the most expensive mistake: a campaign that starts, builds
+    # token stats for a minute, and only then dies because the aligned PNGs were never written.
+    data_cfg = OmegaConf.to_container(OmegaConf.load(ROOT / "configs/data.yaml"), resolve=True)
+    problems = preflight_data(data_cfg["dronevehicle"])
+    if problems:
+        logger.error("The data phase is not finished, so nothing below can run:")
+        for problem in problems:
+            logger.error("  %s", problem)
+        return 3
 
     state = load_state(root)
     log_dir = root / "logs"

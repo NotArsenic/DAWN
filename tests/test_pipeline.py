@@ -399,3 +399,83 @@ def test_the_shipped_campaign_names_real_configs_and_one_knob_per_ablation():
     for run in cfg["runs"][1:]:
         assert len(run["overrides"]) == 1, f"{run['name']} moves more than one knob"
         assert run.get("ablates"), f"{run['name']} does not say which key it ablates"
+
+
+# --- the data preflight -------------------------------------------------------------------------
+
+
+def _data_cfg(tmp_path):
+    return {
+        "manifest_dir": str(tmp_path / "manifests"),
+        "aligned_dir": str(tmp_path / "aligned"),
+    }
+
+
+def _manifests(tmp_path, ids=("train_00001", "train_00002")):
+    directory = tmp_path / "manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "train_pairs.txt").write_text("\n".join(ids) + "\n", encoding="utf-8")
+    (directory / "val_pairs.txt").write_text("val_00001\n", encoding="utf-8")
+
+
+def _aligned(tmp_path, ids, kinds=("rgb", "thermal", "valid", "moving", "vehicles")):
+    for image_id in ids:
+        split = image_id.split("_", 1)[0]
+        directory = tmp_path / "aligned" / split
+        directory.mkdir(parents=True, exist_ok=True)
+        for kind in kinds:
+            (directory / f"{image_id}_{kind}.png").write_bytes(b"x")
+
+
+def test_the_preflight_passes_once_the_data_phase_has_really_run(tmp_path):
+    from dawn.pipeline import preflight_data
+
+    _manifests(tmp_path)
+    _aligned(tmp_path, ["train_00001", "train_00002", "val_00001"])
+    assert preflight_data(_data_cfg(tmp_path)) == []
+
+
+def test_committed_manifests_without_the_aligned_pngs_are_caught(tmp_path):
+    """The exact state of a fresh clone: manifests are in git, the 5,385 PNGs are not."""
+    from dawn.pipeline import preflight_data
+
+    _manifests(tmp_path)
+    problems = preflight_data(_data_cfg(tmp_path))
+    assert len(problems) == 1 and "prepare_dronevehicle.py all" in problems[0]
+
+
+def test_a_missing_manifest_names_the_command_that_writes_it(tmp_path):
+    from dawn.pipeline import preflight_data
+
+    problems = preflight_data(_data_cfg(tmp_path))
+    assert any("train_pairs.txt" in p and "prepare_dronevehicle" in p for p in problems)
+
+
+def test_a_half_written_aligned_tree_is_caught(tmp_path):
+    """`write` interrupted partway leaves ids with some of their five PNGs and not others."""
+    from dawn.pipeline import preflight_data
+
+    _manifests(tmp_path)
+    _aligned(tmp_path, ["train_00001", "train_00002"], kinds=("rgb", "thermal"))
+    _aligned(tmp_path, ["val_00001"])
+    problems = preflight_data(_data_cfg(tmp_path))
+    assert any("train_pairs" in p and "missing" in p for p in problems)
+
+
+def test_an_empty_manifest_is_not_mistaken_for_a_finished_one(tmp_path):
+    from dawn.pipeline import preflight_data
+
+    _manifests(tmp_path, ids=())
+    assert any("is empty" in p for p in preflight_data(_data_cfg(tmp_path)))
+
+
+def test_the_evaluation_stage_looks_for_the_file_evaluate_py_actually_writes(tmp_path):
+    """`evaluate.py` writes summary.json. A wrong marker here would silently re-run it forever."""
+    import re
+    from pathlib import Path
+
+    stage = {s.name: s for s in _plan(tmp_path)}["evaluation"]
+    assert [p.name for p in stage.done] == ["summary.json"]
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "evaluate.py").read_text("utf-8")
+    written = set(re.findall(r'out_dir / "([\w.]+)"', source))
+    assert {p.name for p in stage.done} <= written, f"evaluate.py writes {sorted(written)}"

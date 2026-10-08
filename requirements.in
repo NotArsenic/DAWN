@@ -1,0 +1,46 @@
+# Direct runtime dependencies, for pip-compile. `pyproject.toml` stays the source of truth for
+# what the package REQUIRES; this file exists to pin what a training box actually installs, so a
+# run months from now resolves the same wheels.
+#
+#   pip install pip-tools
+#   pip-compile requirements.in -o requirements.txt            # resolve and pin
+#   pip-compile --upgrade requirements.in -o requirements.txt  # refresh
+#   pip-sync requirements.txt                                  # install exactly that
+#
+# TORCH IS NOT PINNED HERE ON PURPOSE. The RTX 5090 is Blackwell (sm_120) and needs a build made
+# for CUDA 12.8 or newer; the default PyPI wheel may not carry that architecture. Install torch
+# FIRST, from the index that matches the card, then compile the rest against it:
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())"
+#     # 'sm_120' must appear in that list
+#
+# pip-compile would otherwise resolve a CPU-only or cu12x wheel from PyPI and the first CUDA call
+# of an overnight run would be the thing that tells you.
+
+torch>=2.1
+torchvision>=0.16
+
+# Model
+einops>=0.7
+timm>=1.0.20          # first release with the DINOv3 models
+peft>=0.12            # LoRA on the DINO encoder; disable_adapter() gives the L_align target
+
+# Config and I/O
+omegaconf>=2.3
+Pillow>=10.0          # JPEG decode, PNG I/O, polygon rasterization, contact sheets
+numpy>=1.24
+scipy>=1.11
+tqdm>=4.65
+
+# Getting the dataset: scripts/fetch_dronevehicle.py pulls the three zips from the Hub.
+huggingface-hub>=0.23
+
+# Metrics and figures
+matplotlib>=3.7       # data-phase histograms; dawn.eval.visualize / calibration plots
+lpips>=0.1.4          # the plan's "does it look like a photo" metric
+scikit-image>=0.21    # SSIM
+
+# Experiment tracking. Not optional in practice: without it a 20K-step run completes with no
+# tracking at all and one WARNING line to say so (docs/training_budget_and_changes.md section 5).
+wandb>=0.16

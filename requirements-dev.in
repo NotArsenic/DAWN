@@ -1,0 +1,17 @@
+# Development dependencies on top of the runtime ones.
+#
+#   pip-compile requirements-dev.in -o requirements-dev.txt
+#
+# The test suite is CPU-only and offline: it never downloads DINOv3 weights and never reads
+# data/DroneVehicle (tests/flow_helpers.py builds a randomly initialized two-block backbone and a
+# tiny aligned tree in tmp_path). So this needs nothing beyond the runtime set and a runner.
+
+-r requirements.in
+
+pytest>=7.0
+ruff>=0.1
+
+# `transformers` is the second encoder backend (`encoder.backend: transformers`). It is in the
+# dev set rather than the runtime one because the default backend is timm, whose DINOv3 weights
+# are not gated; the transformers path needs the gated facebook/dinov3-* repo and an HF token.
+transformers>=4.56

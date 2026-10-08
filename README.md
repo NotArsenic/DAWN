@@ -26,8 +26,16 @@ Few pairs survive the filter: of the 28,411 DroneVehicle pairs, about 8,500 are 
 ```bash
 git clone https://github.com/rzx01/dawn.git
 cd dawn
+
+# The 5090 is Blackwell (sm_120) and needs a CUDA 12.8+ build: install torch FIRST, from the
+# index that matches the card, or pip resolves a wheel without that architecture.
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+python -c "import torch; print(torch.cuda.get_arch_list())"   # 'sm_120' must be in there
+
 pip install -e ".[dev]"
 ```
+
+`pyproject.toml` is the source of truth for what the package requires. For a reproducible training box, `requirements.in` / `requirements-dev.in` are the pip-tools inputs: `pip-compile requirements.in -o requirements.txt`, then `pip-sync`. Torch is deliberately left to the step above in both.
 
 - Python ≥ 3.10, PyTorch ≥ 2.1. The data pipeline runs on CPU.
 - The model phase wants PyTorch built for CUDA 12.8 or newer with `sm_120`. Training is on an **RTX 5090 (32 GB)** (`configs/gpu_5090.yaml`); `flow.yaml`'s defaults still fit the 16 GB RTX 5060 Ti the plan assumes. Same Blackwell architecture either way.
@@ -40,7 +48,16 @@ ruff check dawn scripts tests
 
 ## Data preparation
 
-Download [McCheng/DroneVehicle](https://huggingface.co/datasets/McCheng/DroneVehicle) (about 14 GB) to `data/DroneVehicle/` so that it holds `{train,val,test}/{split}img`, `{split}imgr`, `{split}label` and `{split}labelr` (RGB images, thermal images, RGB XML, thermal XML). Paths and every threshold are in `configs/data.yaml`.
+```bash
+python scripts/fetch_dronevehicle.py        # download ~14 GB, unpack, arrange, verify
+python scripts/prepare_dronevehicle.py all  # stats, day, align, dedup, write
+```
+
+[McCheng/DroneVehicle](https://huggingface.co/datasets/McCheng/DroneVehicle) is **not** a `datasets`-format repo — it is three zip archives (`train.zip`, `val.zip`, `test.zip`) with no parquet shards and no loading script, so `load_dataset("McCheng/DroneVehicle")` does not work on it. `fetch_dronevehicle.py` downloads them, unpacks them and arranges the result as `data/DroneVehicle/{train,val,test}/{split}img`, `{split}imgr`, `{split}label`, `{split}labelr` (RGB images, thermal images, RGB XML, thermal XML), which is what `configs/data.yaml` expects.
+
+The Hub does not document what is inside those archives, so the script **searches** the extracted tree for the four folders by name instead of assuming a path — it does not matter whether a mirror unpacks to `trainimg/`, `train/trainimg/` or deeper. It symlinks rather than copies (the data is 14 GB; `--mode copy` or `--mode move` if you prefer), refuses any archive member that would write outside its own directory, skips an archive that is already unpacked, and finishes by checking that the stems really pair across all four folders and that a sample frame is the 840×712 everything downstream assumes. `--verify` re-runs just those checks; `--archives DIR` uses zips you already have.
+
+Then the stages individually, if you want them one at a time:
 
 ```bash
 python scripts/prepare_dronevehicle.py stats    # per-stem checks, luminance, perceptual hashes (minutes, once)
@@ -108,6 +125,7 @@ python scripts/run_pipeline.py --summary   # the comparison table, at any point
 
 `configs/experiments.yaml` declares the campaign and nothing else decides what runs: four gates, the baseline, one ablation per open decision, stage 2, then evaluation on the winner. Roughly 50 GPU-hours end to end, which is why nothing starts without `--yes`.
 
+- **It refuses to start without the data.** A preflight checks the manifests and the aligned PNGs before anything else, because the manifests are committed and the 5,385 × 5 PNGs are not — on a fresh clone that is the first thing that would otherwise fail, a minute into an overnight run.
 - **Gates really gate.** The oracle's 24 dB rule and "the overfit run must approach its own oracle" stop the campaign, and the failure prints what to do rather than only what broke.
 - **Resumable and idempotent.** A finished stage is skipped; a half-finished run restarts with `--resume`. Dying on stage 9 at 4 a.m. keeps stages 1–8. The record is `runs/pipeline_state.json`, and every stage streams to `runs/logs/<stage>.log`.
 - **The cost is measured, not guessed.** `gpu_probe` measures seconds/step on the real configuration and every later estimate is rescaled from it.

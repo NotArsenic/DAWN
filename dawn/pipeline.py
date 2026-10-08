@@ -203,7 +203,7 @@ def build_plan(
                 kind=EVAL,
                 command=(),  # filled in at run time: it needs the winning checkpoint
                 out_dir=out_dir,
-                done=(out_dir / "metrics.json",),
+                done=(out_dir / "summary.json",),  # what scripts/evaluate.py writes
                 tests="The winning stage-1 checkpoint on the test split.",
                 hours=float(evaluation.get("hours", 0.0)),
             )
@@ -452,6 +452,61 @@ def pick_winner(cfg: Mapping, root: Path, subset: str = "box_aligned") -> tuple[
 # --- state ---------------------------------------------------------------------------------------
 
 
+def preflight_data(data_cfg: Mapping, sample: int = 25) -> list[str]:
+    """What is missing before any training can start. Empty means the data phase is done.
+
+    This is the cheapest possible check against the most expensive possible mistake: a campaign
+    that starts, spends a minute building token stats, and only then dies because the aligned
+    PNGs were never written. The manifests are committed to the repo, but
+    `data/dronevehicle_aligned/` is gitignored and has to be produced locally
+    (`scripts/fetch_dronevehicle.py` then `scripts/prepare_dronevehicle.py all`).
+
+    Args:
+        data_cfg: the `dronevehicle` section of data.yaml.
+        sample: how many manifest entries to actually look for on disk. Spot-checking beats
+            stat-ing 5,385 ids x 5 files every time the pipeline starts.
+    """
+    manifest_dir = Path(str(data_cfg["manifest_dir"]))
+    aligned_dir = Path(str(data_cfg["aligned_dir"]))
+    problems: list[str] = []
+
+    manifests = {}
+    for name in ("train_pairs", "val_pairs"):
+        path = manifest_dir / f"{name}.txt"
+        if not path.exists():
+            problems.append(f"no {path}: run scripts/prepare_dronevehicle.py all")
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines()
+        ids = [line.strip() for line in lines if line.strip()]
+        if not ids:
+            problems.append(f"{path} is empty")
+        manifests[name] = ids
+    if problems:
+        return problems
+
+    if not aligned_dir.is_dir():
+        return [
+            f"no {aligned_dir}: the manifests are committed but the aligned PNGs are not. "
+            "Run scripts/fetch_dronevehicle.py, then scripts/prepare_dronevehicle.py all"
+        ]
+
+    kinds = ("rgb", "thermal", "valid", "moving", "vehicles")
+    for name, ids in manifests.items():
+        step = max(1, len(ids) // max(sample, 1))
+        absent = []
+        for image_id in ids[::step][:sample]:
+            split = image_id.split("_", 1)[0]
+            for kind in kinds:
+                if not (aligned_dir / split / f"{image_id}_{kind}.png").exists():
+                    absent.append(f"{image_id}_{kind}.png")
+        if absent:
+            problems.append(
+                f"{name}: {len(absent)} of {sample * len(kinds)} sampled files missing under "
+                f"{aligned_dir} (e.g. {absent[0]}). Re-run scripts/prepare_dronevehicle.py write"
+            )
+    return problems
+
+
 def load_state(root: Path) -> dict:
     path = root / STATE_FILE
     if not path.exists():
@@ -556,6 +611,7 @@ __all__ = [
     "median_sec_per_step",
     "pick_winner",
     "plan_table",
+    "preflight_data",
     "read_csv_rows",
     "record",
     "rescale_hours",
