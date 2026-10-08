@@ -1,33 +1,53 @@
-# Evaluation configuration.
+# Evaluation: the plan's metric table on test_pairs, against the real paired RGB.
+#
+#   python scripts/evaluate.py --checkpoint checkpoints/run1/flow_best.pt --device cuda
+#
+# Merged on flow.yaml + data.yaml, later files winning, like every other overlay. The MODEL side
+# (layout, resolution, upsampling, stats) is NOT read from here -- it comes out of the checkpoint,
+# because a checkpoint is tied to what it was trained with (docs/conventions.md section 5.1).
 
 eval:
-  checkpoint: checkpoints/dawn.pt
-  data_dir: data/visdrone
+  split: test_pairs        # the manifest to score. val_pairs while iterating; test_pairs once.
+  batch_size: 4            # full resolution; keep it small
+  workers: 4
   output_dir: outputs/eval
-  num_inference_steps: 2
-  batch_size: 16
+
+  # Velocity evaluations per sample, and the sampler. The plan's headline is 2 NFE; both samplers
+  # are reported at the same NFE because that is the comparison that costs the same.
+  nfe: 2
+  methods: [euler, midpoint]
+
+  # K samples per frame for the uncertainty maps (the plan's 4-8). The spread is also what
+  # calibration.py ranks against the realized error. 1 disables the uncertainty rows.
+  num_samples: 8
+
+  # Draw z_0 from the image ID, so the reported numbers are reproducible on any machine and do
+  # not depend on batch composition (docs/conventions.md section 10.3).
+  seed_from_image_id: true
+
+  # Report box-aligned and fallback pairs separately. Fallback pairs are aligned by edge
+  # correlation only, so their numbers are a robustness check, not the headline.
+  report_subsets: true
+  headline_subset: box_aligned
 
 metrics:
-  # Synthetic test set (quantitative).
-  compute_psnr: true
-  compute_ssim: true
-  compute_lpips: true
-  # Object-crop metrics using VisDrone detection boxes.
-  object_crop_metrics: true
+  lpips: true
+  lpips_net: alex          # alex | vgg. alex is the plan's "does it look like a photo" default.
 
-uncertainty:
-  # Calibration: predicted std vs actual |error|.
-  calibration_bins: 20
-  save_calibration_plot: true
+  # "Do vehicles survive?" The plan says vehicle CROPS from the RGB boxes, but boxes are not
+  # persisted with the aligned pairs (ASSET_KINDS is rgb/thermal/valid/moving/vehicles) and
+  # re-deriving them needs the raw 14 GB dataset plus the transform in logs/align.csv.
+  #   mask       the `vehicles` mask as the region. No extra dependency, but the mask is dilated
+  #              3 px and stretched 17.4 px for vehicles that may have moved, so it is larger
+  #              than the true boxes and includes some background.
+  #   boxes      connected components of that mask, as bounding boxes. Closer to the plan's
+  #              "crops"; touching vehicles merge into one component.
+  #   none       skip the vehicle rows.
+  # OPEN: the maintainer picks. `mask` is the honest default because it needs nothing extra.
+  vehicle_region: mask
+  min_vehicle_pixels: 64   # ignore components smaller than this when vehicle_region is `boxes`
 
-hallucination_audit:
-  # Run YOLO on input and output, count objects that appear/disappear.
-  enabled: true
-  detector: yolov8n  # lightweight, off-the-shelf
-  confidence_threshold: 0.25
-  iou_threshold: 0.5
-
-visualization:
-  num_samples: 32
-  save_grids: true          # input | enhanced | uncertainty side-by-side
-  save_uncertainty_maps: true
+report:
+  percentiles: [10, 50, 90]   # reported beside the mean; a mean alone hides the tail
+  save_csv: true              # one row per pair, so the worst cases can be looked at
+  num_examples: 24            # comparison grids written by dawn/eval/visualize.py; 0 disables

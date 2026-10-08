@@ -46,6 +46,9 @@ class SpreadResult:
 
     Args:
         sample_rgb: `(B, 3, h, w)` linear RGB of member 0, the point estimate to display.
+        sample_lab: `(B, 3, h, w)` member 0 in L*, a*, b*. Carried rather than re-derived from
+            `sample_rgb`, because `render` clamps RGB to the gamut and converting back would
+            quietly score the clipped colour instead of the generated one.
         rgb: `(B, 3, h, w)` linear RGB of the ensemble mean, clamped to the gamut.
         lab: `(B, 3, h, w)` the ensemble mean in L*, a*, b*.
         l_std: `(B, 1, h, w)` standard deviation of L* across members, in L* units.
@@ -55,6 +58,7 @@ class SpreadResult:
     """
 
     sample_rgb: torch.Tensor
+    sample_lab: torch.Tensor
     rgb: torch.Tensor
     lab: torch.Tensor
     l_std: torch.Tensor
@@ -101,13 +105,15 @@ def spread_from_parts(
     mean: torch.Tensor | None = None
     m2: torch.Tensor | None = None
     first: torch.Tensor | None = None
+    first_lab: torch.Tensor | None = None
     for index in range(num_samples):
         member = render(
             {name: value[index] for name, value in parts.items()}, thermal, size, settings
         )
         lab = member["lab"].to(torch.float32)
         if first is None:
-            first, mean, m2 = member["rgb"], torch.zeros_like(lab), torch.zeros_like(lab)
+            first, first_lab = member["rgb"], lab
+            mean, m2 = torch.zeros_like(lab), torch.zeros_like(lab)
         delta = lab - mean
         mean = mean + delta / (index + 1)
         m2 = m2 + delta * (lab - mean)
@@ -115,6 +121,7 @@ def spread_from_parts(
     variance = m2 / (num_samples - 1) if num_samples > 1 else torch.zeros_like(m2)
     return SpreadResult(
         sample_rgb=first,
+        sample_lab=first_lab,
         rgb=lab_to_linear(mean).clamp(0.0, 1.0),
         lab=mean,
         l_std=variance[:, 0:1].sqrt(),

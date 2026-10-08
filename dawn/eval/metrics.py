@@ -11,21 +11,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 
 @dataclass
 class MetricResults:
-    """Aggregated evaluation metrics."""
+    """The plan's evaluation table, for one subset of pairs.
 
-    psnr: float = 0.0
-    ssim: float = 0.0
-    lpips: float = 0.0
-    # Object-crop metrics (computed on VisDrone detection boxes).
-    crop_psnr: float = 0.0
-    crop_ssim: float = 0.0
-    # Hallucination audit.
-    objects_appeared: int = 0  # detected in output but not input
-    objects_disappeared: int = 0  # detected in input but not output
+    Structure is scored on L* (peak 100), colour as CIEDE2000, vividness as colorfulness and
+    perceptual likeness as LPIPS. Every pixel metric is masked; `lpips` is not (see
+    `lpips_distance`). `*_vehicles` repeat the pixel metrics over the vehicle region only, which
+    is the plan's "do vehicles survive?" row.
+    """
+
+    psnr: float = 0.0  # L* PSNR, peak 100, masked
+    ssim: float = 0.0  # L* SSIM, masked
+    ciede2000: float = 0.0  # mean colour difference, masked
+    colorfulness: float = 0.0  # Hasler & Suesstrunk, of the prediction
+    colorfulness_target: float = 0.0  # the same for the real RGB, to read it against
+    lpips: float = 0.0  # whole-frame, unmasked
+    psnr_vehicles: float = 0.0
+    ssim_vehicles: float = 0.0
+    ciede2000_vehicles: float = 0.0
     num_images: int = 0
 
 
@@ -43,40 +50,177 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return -10.0 * torch.log10(mse.clamp(min=1e-10))
 
 
-def compute_ssim(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Structural similarity (SSIM) between two batches.
+def _gaussian_window(size: int, sigma: float, device, dtype) -> torch.Tensor:
+    """`(1, 1, size, size)` normalized separable Gaussian, as SSIM is conventionally defined."""
+    coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
+    g = torch.exp(-(coords**2) / (2.0 * sigma**2))
+    g = g / g.sum()
+    return (g[:, None] @ g[None, :]).expand(1, 1, size, size).contiguous()
 
-    Uses the standard 11x11 Gaussian window, K1=0.01, K2=0.03.
+
+def masked_ssim(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    peak: float = 100.0,
+    window_size: int = 11,
+    sigma: float = 1.5,
+    k1: float = 0.01,
+    k2: float = 0.03,
+) -> torch.Tensor:
+    """SSIM over the pixels that count, per image.
+
+    Matches `skimage.metrics.structural_similarity(gaussian_weights=True, sigma=1.5,
+    use_sample_covariance=False)` to 1e-8 **on the interior**. skimage discards the
+    `window_size // 2` border; this keeps it (padded by reflection) and lets the mask decide, so
+    an all-ones mask differs from skimage by about 6e-4 -- that difference is the border and
+    nothing else. Mask the border out and the two agree exactly.
+
+
+    The plan evaluates structure as PSNR **and SSIM on L\\***, so the default `peak` is 100, not 1.
+    Pass the single L* channel, not RGB.
+
+    The SSIM map is computed over the whole image and then averaged with `masked_mean`. The local
+    statistics of a window that straddles the mask edge are therefore contaminated by pixels that
+    do not count: with `valid` and `moving`/`vehicles` masks, which are large contiguous regions,
+    only an 11-px rim is affected. Weighting the local moments by the mask instead would change
+    the definition and stop it matching `skimage`, which is the worse trade for a reported number.
 
     Args:
-        pred: (B, 3, H, W) in [0, 1].
-        target: (B, 3, H, W) in [0, 1].
+        pred, target: `(B, C, H, W)`, the same units.
+        mask: `(B, 1, H, W)` weights in `[0, 1]`.
+        peak: the signal peak (100 for L*, 1 for `[0, 1]` images).
+        window_size, sigma, k1, k2: the standard SSIM constants.
 
     Returns:
-        (B,) SSIM values.
+        `(B,)` SSIM in `[-1, 1]`. An image with no weight scores 0.
+
+    Raises:
+        ValueError: shapes disagree, or the image is smaller than the window.
     """
-    raise NotImplementedError
+    if pred.shape != target.shape:
+        raise ValueError(f"pred {tuple(pred.shape)} and target {tuple(target.shape)} must match")
+    if min(pred.shape[-2:]) < window_size:
+        raise ValueError(
+            f"image {tuple(pred.shape[-2:])} is smaller than the {window_size}x{window_size} "
+            "SSIM window"
+        )
+    pred, target = pred.float(), target.float()
+    b, c = pred.shape[:2]
+    win = _gaussian_window(window_size, sigma, pred.device, pred.dtype).expand(c, 1, -1, -1)
+    pad = window_size // 2
+
+    def blur(x: torch.Tensor) -> torch.Tensor:
+        # 'reflect' matches skimage's default edge handling closely enough that the interior,
+        # which is what the mask keeps, agrees to ~1e-6.
+        return F.conv2d(F.pad(x, (pad,) * 4, mode="reflect"), win, groups=c)
+
+    mu_x, mu_y = blur(pred), blur(target)
+    mu_xx, mu_yy, mu_xy = mu_x * mu_x, mu_y * mu_y, mu_x * mu_y
+    sigma_xx = blur(pred * pred) - mu_xx
+    sigma_yy = blur(target * target) - mu_yy
+    sigma_xy = blur(pred * target) - mu_xy
+
+    c1, c2 = (k1 * peak) ** 2, (k2 * peak) ** 2
+    ssim_map = ((2 * mu_xy + c1) * (2 * sigma_xy + c2)) / (
+        (mu_xx + mu_yy + c1) * (sigma_xx + sigma_yy + c2)
+    )
+    return masked_mean(ssim_map.mean(dim=1), mask)
+
+
+def lpips_distance(
+    pred_linear: torch.Tensor, target_linear: torch.Tensor, lpips_fn
+) -> torch.Tensor:
+    """LPIPS between two batches of **linear** RGB, per image.
+
+    LPIPS is an AlexNet/VGG feature distance trained on display-referred images, so the linear RGB
+    of the pipeline is converted to sRGB and then to the `[-1, 1]` range the released nets expect
+    (docs/conventions.md section 1, output boundary). Passing linear values straight in would
+    score a different, darker pair of images than a person would see.
+
+    There is no masked LPIPS: the metric is defined on whole images through a convolutional stack,
+    and zeroing pixels would introduce edges the network reads as structure. Report it on the
+    frame and read it next to the masked metrics, not instead of them.
+
+    Args:
+        pred_linear, target_linear: `(B, 3, H, W)` linear RGB in `[0, 1]`.
+        lpips_fn: a constructed `lpips.LPIPS(net=...)`, already on the right device.
+
+    Returns:
+        `(B,)` distances; lower is more alike.
+    """
+    from dawn.data.color import linear_to_srgb
+
+    pred = linear_to_srgb(pred_linear.float().clamp(0.0, 1.0)) * 2.0 - 1.0
+    target = linear_to_srgb(target_linear.float().clamp(0.0, 1.0)) * 2.0 - 1.0
+    return lpips_fn(pred, target).flatten()
 
 
 @torch.no_grad()
 def evaluate_batch(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    input_img: torch.Tensor | None = None,
+    lab_pred: torch.Tensor,
+    lab_target: torch.Tensor,
+    rgb_pred: torch.Tensor,
+    rgb_target: torch.Tensor,
+    mask: torch.Tensor,
+    vehicle_mask: torch.Tensor | None = None,
     lpips_fn=None,
-) -> dict[str, float]:
-    """Compute all metrics for a batch.
+) -> dict[str, torch.Tensor]:
+    """The plan's evaluation row for one batch, **per image** (not yet averaged).
+
+    Per image rather than reduced, so the caller can weight subsets (box-aligned against fallback)
+    and report percentiles rather than only a mean. `scripts/evaluate.py` does the aggregating.
+
+    Everything is computed in the units the plan evaluates in: structure on `L*` with the peak at
+    100, colour as CIEDE2000 over `L*a*b*`, colorfulness on 0-255 sRGB, LPIPS on sRGB `[-1, 1]`.
 
     Args:
-        pred: (B, 3, H, W) predicted sRGB.
-        target: (B, 3, H, W) ground-truth sRGB.
-        input_img: (B, 3, H, W) original night input (for hallucination audit).
-        lpips_fn: Pre-initialized LPIPS loss function (or None to skip).
+        lab_pred, lab_target: `(B, 3, H, W)` L*, a*, b*.
+        rgb_pred, rgb_target: `(B, 3, H, W)` **linear** RGB in `[0, 1]`, the same images.
+        mask: `(B, 1, H, W)` the pixel mask: `valid & ~moving` for box-aligned pairs,
+            `valid & ~vehicles` for fallback ones (docs/conventions.md section 5.3).
+        vehicle_mask: `(B, 1, H, W)` the vehicle region, for the "do vehicles survive?" row.
+            `None` leaves the `*_vehicles` keys out.
+        lpips_fn: a constructed `lpips.LPIPS`, or `None` to skip the LPIPS key.
 
     Returns:
-        dict of metric names to mean values.
+        `{metric: (B,)}`. Keys: `psnr`, `ssim`, `ciede2000`, `colorfulness`,
+        `colorfulness_target`, plus `lpips` and the three `*_vehicles` when asked for.
+
+    Raises:
+        ValueError: the Lab and RGB batches disagree on shape.
     """
-    raise NotImplementedError
+    if lab_pred.shape != lab_target.shape or rgb_pred.shape != rgb_target.shape:
+        raise ValueError("pred and target must have the same shape")
+    if lab_pred.shape[-2:] != rgb_pred.shape[-2:]:
+        raise ValueError(
+            f"Lab {tuple(lab_pred.shape[-2:])} and RGB {tuple(rgb_pred.shape[-2:])} "
+            "must be the same size: they are the same image in two spaces"
+        )
+    from dawn.data.color import linear_to_srgb
+
+    lightness = lambda x: x[:, 0:1]  # noqa: E731
+    out = {
+        "psnr": masked_psnr(lightness(lab_pred), lightness(lab_target), mask, peak=100.0),
+        "ssim": masked_ssim(lightness(lab_pred), lightness(lab_target), mask, peak=100.0),
+        "ciede2000": masked_mean(ciede2000(lab_pred, lab_target), mask),
+        "colorfulness": colorfulness(linear_to_srgb(rgb_pred.clamp(0, 1)) * 255.0),
+        "colorfulness_target": colorfulness(linear_to_srgb(rgb_target.clamp(0, 1)) * 255.0),
+    }
+    if lpips_fn is not None:
+        out["lpips"] = lpips_distance(rgb_pred, rgb_target, lpips_fn)
+    if vehicle_mask is not None:
+        # The vehicle region, intersected with the pixel mask: an invalid pixel never counts,
+        # whichever region it is in.
+        region = vehicle_mask.to(mask.dtype) * mask
+        out["psnr_vehicles"] = masked_psnr(
+            lightness(lab_pred), lightness(lab_target), region, peak=100.0
+        )
+        out["ssim_vehicles"] = masked_ssim(
+            lightness(lab_pred), lightness(lab_target), region, peak=100.0
+        )
+        out["ciede2000_vehicles"] = masked_mean(ciede2000(lab_pred, lab_target), region)
+    return out
 
 
 # --- the flow-phase metrics -----------------------------------------------------------------------

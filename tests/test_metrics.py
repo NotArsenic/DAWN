@@ -6,7 +6,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from dawn.eval.metrics import ciede2000, colorfulness, masked_mean, masked_psnr  # noqa: E402
+from dawn.eval.metrics import (  # noqa: E402
+    ciede2000,
+    colorfulness,
+    masked_mean,
+    masked_psnr,
+    masked_ssim,
+)
 
 
 def _random_lab(shape, seed):
@@ -123,3 +129,155 @@ def test_masked_mean_is_a_weighted_mean_per_image_and_zero_without_weight():
     half = masked_mean(torch.tensor([[[0.0, 4.0]]]), torch.tensor([[[[1.0, 0.5]]]]))
     assert torch.allclose(half, torch.tensor([2.0 / 1.5]))
     assert masked_mean(torch.ones(2, 4, 4), torch.ones(2, 1, 4, 4)).shape == (2,)
+
+
+# --- SSIM, LPIPS and the batch aggregator (the plan's evaluation table) -------------------------
+
+
+def _lab(batch=2, size=(32, 40), seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.cat(
+        [
+            torch.rand(batch, 1, *size, generator=g) * 100,
+            torch.rand(batch, 2, *size, generator=g) * 60 - 30,
+        ],
+        dim=1,
+    )
+
+
+def test_masked_ssim_matches_skimage_on_the_interior():
+    """skimage drops the window border; we keep it and let the mask decide. Mask it out -> equal."""
+    sk = pytest.importorskip("skimage.metrics")
+    torch.manual_seed(0)
+    pad = 11 // 2
+    for noise in (4, 12):
+        x = torch.rand(1, 1, 96, 96) * 100
+        y = (x + torch.randn(1, 1, 96, 96) * noise).clamp(0, 100)
+        interior = torch.zeros(1, 1, 96, 96)
+        interior[..., pad:-pad, pad:-pad] = 1.0
+        mine = float(masked_ssim(x, y, interior, peak=100.0))
+        theirs = sk.structural_similarity(
+            x[0, 0].numpy(),
+            y[0, 0].numpy(),
+            data_range=100.0,
+            gaussian_weights=True,
+            sigma=1.5,
+            use_sample_covariance=False,
+        )
+        assert mine == pytest.approx(theirs, abs=1e-6)
+
+
+def test_masked_ssim_is_one_for_identical_and_zero_for_an_empty_mask():
+    x = torch.rand(2, 1, 64, 64) * 100
+    assert torch.allclose(
+        masked_ssim(x, x.clone(), torch.ones(2, 1, 64, 64), 100.0), torch.ones(2), atol=1e-5
+    )
+    empty = masked_ssim(x, x * 0.5, torch.zeros(2, 1, 64, 64), 100.0)
+    assert torch.all(torch.isfinite(empty)) and torch.all(empty == 0)
+
+
+def test_masked_ssim_falls_as_the_images_diverge():
+    torch.manual_seed(0)
+    x = torch.rand(1, 1, 64, 64) * 100
+    m = torch.ones(1, 1, 64, 64)
+    scores = [
+        float(masked_ssim(x, (x + torch.randn_like(x) * n).clamp(0, 100), m, 100.0))
+        for n in (2, 8, 20)
+    ]
+    assert scores == sorted(scores, reverse=True), scores
+
+
+def test_masked_ssim_only_scores_the_masked_region():
+    """Corrupting pixels the mask excludes must not move the score (beyond the window rim)."""
+    torch.manual_seed(0)
+    x = torch.rand(1, 1, 64, 64) * 100
+    y = x.clone()
+    mask = torch.zeros(1, 1, 64, 64)
+    mask[..., :24, :24] = 1.0
+    y[..., 40:, 40:] = 0.0  # far from the masked region, outside any window that touches it
+    assert float(masked_ssim(x, y, mask, 100.0)) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_masked_ssim_rejects_an_image_smaller_than_its_window():
+    with pytest.raises(ValueError, match="smaller than the 11x11"):
+        masked_ssim(torch.rand(1, 1, 8, 8), torch.rand(1, 1, 8, 8), torch.ones(1, 1, 8, 8))
+
+
+def test_lpips_converts_to_srgb_before_scoring():
+    """LPIPS nets are trained on display-referred images; linear in would score the wrong pair."""
+    from dawn.data.color import linear_to_srgb
+    from dawn.eval.metrics import lpips_distance
+
+    seen = {}
+
+    def fake(a, b):
+        seen["a"], seen["b"] = a, b
+        return torch.zeros(a.shape[0], 1, 1, 1)
+
+    pred, target = torch.rand(2, 3, 16, 16), torch.rand(2, 3, 16, 16)
+    out = lpips_distance(pred, target, fake)
+    assert out.shape == (2,)
+    assert torch.allclose(seen["a"], linear_to_srgb(pred) * 2 - 1, atol=1e-6)
+    assert seen["a"].min() >= -1.0 and seen["a"].max() <= 1.0
+
+
+def test_evaluate_batch_returns_the_plans_table_per_image():
+    from dawn.eval.metrics import evaluate_batch
+
+    lab_t, lab_p = _lab(seed=0), _lab(seed=1)
+    rgb_t, rgb_p = torch.rand(2, 3, 32, 40), torch.rand(2, 3, 32, 40)
+    mask = torch.ones(2, 1, 32, 40)
+    out = evaluate_batch(lab_p, lab_t, rgb_p, rgb_t, mask)
+    assert set(out) == {"psnr", "ssim", "ciede2000", "colorfulness", "colorfulness_target"}
+    for k, v in out.items():
+        assert v.shape == (2,), k
+        assert torch.all(torch.isfinite(v)), k
+
+
+def test_evaluate_batch_adds_vehicle_and_lpips_keys_only_when_asked():
+    from dawn.eval.metrics import evaluate_batch
+
+    lab_t, lab_p = _lab(seed=0), _lab(seed=1)
+    rgb_t, rgb_p = torch.rand(2, 3, 32, 40), torch.rand(2, 3, 32, 40)
+    mask = torch.ones(2, 1, 32, 40)
+    veh = torch.zeros(2, 1, 32, 40)
+    veh[..., 8:24, 8:32] = 1.0
+    out = evaluate_batch(
+        lab_p,
+        lab_t,
+        rgb_p,
+        rgb_t,
+        mask,
+        vehicle_mask=veh,
+        lpips_fn=lambda a, b: torch.zeros(a.shape[0]),
+    )
+    assert {"lpips", "psnr_vehicles", "ssim_vehicles", "ciede2000_vehicles"} <= set(out)
+    assert out["psnr_vehicles"].shape == (2,)
+
+
+def test_the_vehicle_region_is_intersected_with_the_pixel_mask():
+    """An invalid pixel never counts, whichever region it falls in."""
+    from dawn.eval.metrics import evaluate_batch
+
+    lab_t = _lab(batch=1, seed=0)
+    lab_p = lab_t.clone()
+    lab_p[..., 0, :, 20:] = 0.0  # wreck the right half
+    rgb = torch.rand(1, 3, 32, 40)
+    veh = torch.ones(1, 1, 32, 40)
+    keep_left = torch.zeros(1, 1, 32, 40)
+    keep_left[..., :20] = 1.0
+    out = evaluate_batch(lab_p, lab_t, rgb, rgb, keep_left, vehicle_mask=veh)
+    assert float(out["ciede2000_vehicles"]) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_evaluate_batch_rejects_mismatched_lab_and_rgb_sizes():
+    from dawn.eval.metrics import evaluate_batch
+
+    with pytest.raises(ValueError, match="same image in two spaces"):
+        evaluate_batch(
+            _lab(size=(32, 40)),
+            _lab(size=(32, 40)),
+            torch.rand(2, 3, 16, 20),
+            torch.rand(2, 3, 16, 20),
+            torch.ones(2, 1, 32, 40),
+        )
