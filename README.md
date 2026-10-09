@@ -120,6 +120,12 @@ the 5.1 is structural (2-step generation from noise) and ~2 dB is generalization
 score the same as box-aligned ones (20.11 / 8.37), which justifies keeping the 44% of the data
 aligned by edge correlation alone.
 
+**What is good:** it generalises (no failure cluster hiding in the mean — PSNR p10 16.99, p90 23.89), its best decile nearly reaches the ceiling (CIEDE2000 5.07 against 3.25), structure survives (SSIM 0.556), the 44% of fallback pairs turned out to need none of the caution they were given, and it runs in real time.
+
+**What is weak:** colour reaches 64% of the real photo where the ceiling is 93%; vehicles carry ~50% more colour error than the frame as a whole; and LPIPS 0.535 has no oracle baseline to read it against, since `check_oracle.py` measures only PSNR and CIEDE2000.
+
+**One thread ties the weaknesses together.** The sample spread is small (`l_std` 2.18), averaging eight samples barely helps (+0.23 dB), and colour is muted — all three are the same thing: the model has collapsed toward the conditional mean, behaving like a regressor rather than a generator. Flow matching was chosen to avoid exactly that. It still works, but on this evidence the generative machinery is not yet earning its keep over a simpler direct predictor, and that is the single most interesting thing the run produced.
+
 Four things this run settled, each previously an argument: **euler beats midpoint** at NFE 2 on
 every accuracy metric; **bilinear colour upsampling beats BGU at edges** (63% worse) and not only
 on average (42%), answering the colour-bleeding objection; the **DINO attention gates** rose from
