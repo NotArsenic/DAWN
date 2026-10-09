@@ -31,6 +31,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import statistics
 import sys
 from collections import defaultdict
@@ -148,11 +149,17 @@ def score_subset(bundle, dataset, cfg, ecfg, mcfg, method, device, lpips_fn) -> 
 
 
 def summarize(rows: list[dict], percentiles) -> dict[str, dict[str, float]]:
-    """`{metric: {mean, p10, p50, p90}}` over the rows given."""
+    """`{metric: {mean, p10, p50, p90}}` over the rows given, non-finite values dropped.
+
+    NaN means "this image had nothing to score for this metric", which `evaluate_batch` uses
+    for the vehicle rows of a pair whose pixel mask deleted the vehicles (every fallback pair).
+    A metric left with no finite value at all is omitted from the table rather than printed as
+    a sentinel.
+    """
     keys = [k for k in rows[0] if isinstance(rows[0][k], float)] if rows else []
     out = {}
     for k in keys:
-        vals = sorted(r[k] for r in rows if k in r)
+        vals = sorted(r[k] for r in rows if k in r and math.isfinite(r[k]))
         if not vals:
             continue
         entry = {"mean": statistics.fmean(vals)}

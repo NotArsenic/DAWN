@@ -153,8 +153,9 @@ def run_one(
 ) -> tuple[SpreadResult, SpreadResult, torch.Tensor]:
     """One frame, end to end: read, one DINO pass, K members, render, then step 6.
 
-    Returns the unrefined result, the refined result, and the refiner's residual `(1, 1, h, w)` in `L = L*/100` units, so the
-    caller can report whether Stage 2 moved anything; with no refiner the residual is zeros.
+    Returns the unrefined result, the refined result, and the refiner's residual
+    `(1, 1, h, w)` in `L = L*/100` units, so the caller can report whether Stage 2 moved
+    anything; with no refiner the residual is zeros.
     """
     thermal = read_thermal(path, bundle.input_size).to(device)
     encoded = bundle.encoder.encode(thermal, return_attn=True)
@@ -202,7 +203,9 @@ def main() -> None:
         default=None,
         help="Stage 2 refiner checkpoint; without it the Stage 1 render is saved as it is",
     )
-    parser.add_argument("--input", nargs="+", required=True, help="Thermal image(s), or a directory")
+    parser.add_argument(
+        "--input", nargs="+", required=True, help="Thermal image(s), or a directory"
+    )
     parser.add_argument("--output", type=str, default="outputs/infer", help="Where to write")
     parser.add_argument("--limit", type=int, default=None, help="Only the first N of a directory")
     parser.add_argument(
@@ -271,7 +274,7 @@ def main() -> None:
         start = time.perf_counter()
         unrefined, refined, residual = run_one(bundle, path, device, args, refiner)
         times.append(time.perf_counter() - start)
-        
+
         write_outputs(unrefined, path.stem, directory, args)
         if refiner is not None:
             write_outputs(refined, path.stem, directory / "refined", args)
@@ -293,7 +296,9 @@ def main() -> None:
                 times[-1],
             )
         else:
-            logger.info("[%d/%d] %s%s  (%.2f s)", index, len(files), path.name, refined_str, times[-1])
+            logger.info(
+                "[%d/%d] %s%s  (%.2f s)", index, len(files), path.name, refined_str, times[-1]
+            )
 
     logger.info(
         "done: %d frame(s), %.2f s/frame (this is not a latency benchmark: see "

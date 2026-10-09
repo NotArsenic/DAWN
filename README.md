@@ -17,7 +17,7 @@ It treats thermal as a one-channel image and splits the job in two. Brightness i
 | Inference and the uncertainty maps | **Works, untested on a trained model.** `scripts/infer.py`, `dawn/uncertainty/spread.py` (the spread of K samples, in L\* and a\*b\* units) and `dawn/flow/inference.py` are implemented and tested against random weights |
 | Evaluation, calibration, latency | **Works, untested on a trained model.** `scripts/{evaluate,benchmark_latency}.py`, `configs/eval.yaml` and `dawn/eval/{metrics,calibration,visualize}.py`: L\* PSNR and SSIM, CIEDE2000, colorfulness, LPIPS, the uncertainty rank correlation, comparison sheets and per-component GMACs. See [`docs/inference_eval_phase.md`](docs/inference_eval_phase.md) |
 | The optional refiner (the plan's stage 2) | **Built and tested; nothing trained.** `dawn/models/refiner.py` (2,545 parameters, a 9×9 field, bounded at ±10 L\*), `scripts/train_refiner.py`, `configs/refiner.yaml`, and `--refiner` in `scripts/infer.py`. Whether it earns its place is one number, `psnr_L/improvement`; the plan still lists it first in its own cut order |
-| Results | None. No trained-model number is claimed here; the only measured numbers are the oracle ceilings below |
+| Results | **Measured.** One model trained 8 October 2026 on an RTX 5090: 20.05 dB L\* PSNR and 8.31 CIEDE2000 on the 781 box-aligned test pairs, 40 FPS with 8 uncertainty samples. Full numbers and what they settle: [`docs/results.md`](docs/results.md) |
 
 Few pairs survive the filter: of the 28,411 DroneVehicle pairs, about 8,500 are daytime and 5,385 pass alignment and dedup (3,662 train, 345 val, 1,378 test; `data/manifests/logs/summary.md`). 2,374 of them were aligned by the edge-correlation fallback instead of by boxes, so they are less trustworthy and have no moving mask (`data/manifests/fallback_pairs.txt`); for those a per-vehicle `vehicles` mask (every vehicle, stretched along its heading where it may have moved) stands in for it. Without the fallback it is 3,011. A small training set is the largest risk the plan names, and the audit exists to decide what else to loosen.
 
@@ -98,6 +98,35 @@ One DINOv3 ViT-S+ pass on the thermal frame (LoRA, rank 8) conditions a 7.6M-par
 | Assembled oracle image, grid only, bilinear colour: CIEDE2000 | 3.33 |
 
 These are the **best any model could do with this parametrization**, not results. The grid alone is above the plan's 24 dB bar; the correction is off by default pending the worst-10% sheet (`outputs/oracle/worst10_grid_only_*.jpg`: cluttered yards, rubble, painted containers and roofs, and shadows, i.e. fine texture and surface paint that thermal does not carry). Bilateral guided upsampling, as the plan specifies, was worse than bilinear at every grid swept, so `color.upsample` is `bilinear` (`bgu` stays as a switch).
+
+## Results
+
+One model, trained 8 October 2026 on a rented RTX 5090 (0.40 s/step, 17.1 GB peak, 20K steps in
+~2.3 h; best checkpoint at step 18,000). Headline is the **781 box-aligned test pairs**, euler at
+NFE 2. Full tables, the ceiling they are read against, and the design questions this run settled:
+[`docs/results.md`](docs/results.md).
+
+| | model | ceiling | |
+|---|---|---|---|
+| L\* PSNR | **20.05 dB** | 25.13 | 5.1 dB short |
+| CIEDE2000 | **8.31** | 3.25 | 5.06 short |
+| SSIM / LPIPS | 0.556 / 0.535 | | |
+| Colourfulness vs real | 0.64 | 0.93 | |
+| Vehicles (PSNR / CIEDE2000) | 16.44 / 12.54 | | the predicted weak point |
+| Latency | **40 FPS** at K=8, 58 at K=1 | | 25 ms/frame, 232 GMACs |
+
+The overfit gate finished 3.0 dB short of its own oracle on memorized frames, so roughly 3 dB of
+the 5.1 is structural (2-step generation from noise) and ~2 dB is generalization. Fallback pairs
+score the same as box-aligned ones (20.11 / 8.37), which justifies keeping the 44% of the data
+aligned by edge correlation alone.
+
+Four things this run settled, each previously an argument: **euler beats midpoint** at NFE 2 on
+every accuracy metric; **bilinear colour upsampling beats BGU at edges** (63% worse) and not only
+on average (42%), answering the colour-bleeding objection; the **DINO attention gates** rose from
+0 to as much as 0.85 while one block fell to 0.34, so the velocity net chose per block where that
+prior helps; and **patch retrieval** reached 0.92 within one patch against 0.49 exactly, showing
+the residual camera offset rather than features that fail to localize — which is why a contrastive
+`L_align` would have hurt.
 
 ## Training
 
@@ -253,7 +282,9 @@ dawn/
 2. **A small training set.** Only the pairs that pass a strict alignment filter are used, and the filter currently keeps about 63% of the day pairs (35% by boxes alone, the rest through the edge fallback). The thresholds are under review.
 3. **Residual misalignment.** The cameras are not co-registered; pairs are aligned to roughly a pixel or two, and vehicles that moved between the exposures are masked, not fixed.
 4. **Day only.** Night pairs and other thermal cameras are out of scope.
-5. **Nothing is trained yet.** The oracle ceilings above are measured; speed (latency) and the quality of a trained model come with the GPU run and the inference/eval phase.
+5. **Colour is washed out on unseen scenes.** The model reaches 64% of the real photo's colourfulness where the parametrization's own ceiling is 93%, so it hedges toward desaturated colour when unsure. The clearest target for a future run.
+6. **The uncertainty maps rank, they do not calibrate.** Measured: the sample spread averages 2.2 L\* units against a realized error of ~9.9. They show *where* the model disagrees with itself, which is not the same as how wrong it is (`docs/conventions.md` §11).
+7. **One model, no ablations.** The five in `configs/experiments.yaml` are parked; nothing here compares design choices that were not run.
 
 ## License
 

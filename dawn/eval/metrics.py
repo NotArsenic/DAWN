@@ -213,13 +213,27 @@ def evaluate_batch(
         # The vehicle region, intersected with the pixel mask: an invalid pixel never counts,
         # whichever region it is in.
         region = vehicle_mask.to(mask.dtype) * mask
-        out["psnr_vehicles"] = masked_psnr(
-            lightness(lab_pred), lightness(lab_target), region, peak=100.0
+        # An image left with no vehicle weight has nothing to score, and the masked metrics
+        # return sentinels rather than raising: `masked_psnr` gives its large-finite value
+        # (140 dB at peak 100) and `masked_mean` gives 0. Averaging those reports a fictional
+        # result -- and it is not an edge case, it is every FALLBACK pair, whose pixel mask is
+        # `valid & ~vehicles` and therefore deletes the exact region this row scores. NaN marks
+        # them; `scripts/evaluate.py: summarize` drops non-finite values, so the rows simply do
+        # not appear for that subset instead of appearing wrong.
+        scored = region.sum(dim=(1, 2, 3)) > 0
+
+        def only_where_scored(values: torch.Tensor) -> torch.Tensor:
+            return torch.where(scored, values, torch.full_like(values, float("nan")))
+
+        out["psnr_vehicles"] = only_where_scored(
+            masked_psnr(lightness(lab_pred), lightness(lab_target), region, peak=100.0)
         )
-        out["ssim_vehicles"] = masked_ssim(
-            lightness(lab_pred), lightness(lab_target), region, peak=100.0
+        out["ssim_vehicles"] = only_where_scored(
+            masked_ssim(lightness(lab_pred), lightness(lab_target), region, peak=100.0)
         )
-        out["ciede2000_vehicles"] = masked_mean(ciede2000(lab_pred, lab_target), region)
+        out["ciede2000_vehicles"] = only_where_scored(
+            masked_mean(ciede2000(lab_pred, lab_target), region)
+        )
     return out
 
 
