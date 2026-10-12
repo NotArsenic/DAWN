@@ -106,6 +106,13 @@ The four training losses are not drawn: **L_flow** (weighted MSE of the velocity
 
 **Figure 2 — the same two towers, block by block**, drawn in the idiom of Figure 1 of *Attention Is All You Need*. Left is the DINOv3 encoder: 12 identical blocks of self-attention — LoRA on the qkv and output projections, everything else frozen — and a gated MLP, each with its residual join. Right is the velocity transformer: 6 DiT blocks in which adaLN-Zero injects the flow time `t` and the residuals are *gated* rather than normalized, so a freshly initialised block is the identity. The blue paths are the two routes the thermal conditioning takes into the generator: patch tokens **added** to the input tokens alongside the thumbnail and the position embedding, and the encoder's own last-layer attention entering **every** block as an additive logit bias behind a per-block gate that starts at 0. Figure 1 shows what happens above the velocity; this one shows what is inside the two stacks.
 
+<p align="center">
+  <img src="docs/testing.svg" width="620"
+       alt="Dawn architecture as a single annotated sheet: the encoder and velocity towers with a component legend, the four training losses and the measured performance numbers.">
+</p>
+
+**Figure 3 — the whole thing on one sheet.** The same two towers again, but carrying their own legend (self-attention, feed-forward, conditioning, normalisation; and the four kinds of arrow), the four training losses with their weights, and the measured numbers from the trained model — 20.05 dB L\* PSNR, 8.31 CIEDE2000, 40 FPS at K=8, 232 GMACs. Figures 1 and 2 are the pipeline and the block interiors; this one is the reference card.
+
 One DINOv3 ViT-S+ pass on the thermal frame (LoRA, rank 8) conditions a 7.6M-parameter velocity transformer that generates, in 2 flow steps, one token per DINO patch: 16 values of its cell's brightness curve (8 thermal-intensity bins × gain and offset, mapping thermal to `L = L*/100`) and 32 values of its 4×4 block of a 128×160 a\*b\* map. The grid is applied at full resolution guided by the thermal; the colour map is upsampled bilinearly; the image is assembled in CIELAB and clipped to the sRGB gamut. Training uses four losses (flow, render, L_align on DINO features, L_color over 261 a\*b\* bins) on pairs whose pixel mask removes the invalid warp and the moving vehicles. Everything about layouts and units is in [`docs/conventions.md`](docs/conventions.md); the design and its reasons are in the plan.
 
 ## The oracle: the measured ceiling
