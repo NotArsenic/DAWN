@@ -84,6 +84,28 @@ The aligned pairs are served by `dawn.data.pairs.AlignedPairs` (thermal `(1, 512
 
 ## The model in one page
 
+<p align="center">
+  <img src="docs/architecture.svg" width="920"
+       alt="Dawn architecture: a thermal frame is encoded once by a LoRA-tuned DINOv3 ViT-S+/16, whose patch tokens condition a 6-block DiT that generates a brightness grid and an a*b* colour map, which are rendered in CIELAB into a daytime RGB frame.">
+</p>
+
+**Figure 1 — one frame, end to end.** Grey is what goes in, blue the conditioning encoder, orange the generative flow, green what the model actually generates and the render that assembles it, yellow the optional stage 2, pink the result. The thermal frame is encoded **once** by a frozen DINOv3 ViT-S+/16 carrying LoRA adapters on every block's attention. Its 1,280 patch tokens — one per 16×16 patch, which is also one brightness cell and one 4×4 block of the colour map — are added to the noisy flow tokens along with a thermal thumbnail and a learned position embedding, and a 6-block DiT predicts the velocity. Two Euler steps carry noise to data, and the result unpacks into the only two things the network generates: a per-cell curve of thermal intensity and a 128×160 a\*b\* map. Everything after that is deterministic given `z₀` — K uncertainty samples are K draws of it.
+
+Two things the boxes cannot show. **The conditioning is detached for the first 3,000 steps**,
+so LoRA is trained by L_align and L_color alone before it ever feels a velocity gradient, which
+is then ramped in over 500 steps rather than switched on. And **one encoder pass serves many
+velocity passes** — `timesteps_per_image` per optimizer step in training, `K × NFE` at inference
+— which is why K uncertainty samples cost one DINO pass, and why 40 FPS survives K = 8.
+
+The four training losses are not drawn: **L_flow** (weighted MSE of the velocity against `z₁ − z₀`, per token segment, ×1.0), **L_render** (masked L1 of Lab/100 at 256×320, ×0.1), **L_align** (1 − cosine between the thermal tokens and the *same backbone's* frozen features of the paired RGB, ×0.5) and **L_color** (per-patch cross-entropy over the 261 a\*b\* bins, ×0.2).
+
+<p align="center">
+  <img src="docs/architecture_blocks.svg" width="760"
+       alt="Dawn block diagram in the style of the Transformer paper: a 12-block DINOv3 encoder tower on the left feeding a 6-block DiT tower on the right, with residual joins, adaLN-Zero time conditioning and an attention-bias path.">
+</p>
+
+**Figure 2 — the same two towers, block by block**, drawn in the idiom of Figure 1 of *Attention Is All You Need*. Left is the DINOv3 encoder: 12 identical blocks of self-attention — LoRA on the qkv and output projections, everything else frozen — and a gated MLP, each with its residual join. Right is the velocity transformer: 6 DiT blocks in which adaLN-Zero injects the flow time `t` and the residuals are *gated* rather than normalized, so a freshly initialised block is the identity. The blue paths are the two routes the thermal conditioning takes into the generator: patch tokens **added** to the input tokens alongside the thumbnail and the position embedding, and the encoder's own last-layer attention entering **every** block as an additive logit bias behind a per-block gate that starts at 0. Figure 1 shows what happens above the velocity; this one shows what is inside the two stacks.
+
 One DINOv3 ViT-S+ pass on the thermal frame (LoRA, rank 8) conditions a 7.6M-parameter velocity transformer that generates, in 2 flow steps, one token per DINO patch: 16 values of its cell's brightness curve (8 thermal-intensity bins × gain and offset, mapping thermal to `L = L*/100`) and 32 values of its 4×4 block of a 128×160 a\*b\* map. The grid is applied at full resolution guided by the thermal; the colour map is upsampled bilinearly; the image is assembled in CIELAB and clipped to the sRGB gamut. Training uses four losses (flow, render, L_align on DINO features, L_color over 261 a\*b\* bins) on pairs whose pixel mask removes the invalid warp and the moving vehicles. Everything about layouts and units is in [`docs/conventions.md`](docs/conventions.md); the design and its reasons are in the plan.
 
 ## The oracle: the measured ceiling
