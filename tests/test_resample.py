@@ -1,4 +1,4 @@
-"""docs/conventions.md section 4a: every downsample is area averaging."""
+"""Tests for area downsampling and image resizing utilities."""
 
 import pytest
 

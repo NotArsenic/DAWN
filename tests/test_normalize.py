@@ -1,5 +1,4 @@
-"""docs/conventions.md section 5: raw vs standardized tokens (the pure maths; the layout is
-`test_tokens.py`, the stats over real targets `test_targets.py`)."""
+"""Tests for token standardization, unstandardization, and weighted moments estimation."""
 
 import pytest
 
@@ -69,8 +68,7 @@ def test_weighted_moments_without_data_is_an_error():
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an Apple GPU (MPS)")
 def test_weighted_moments_of_mps_tensors_match_the_cpu():
-    """Moving an MPS tensor to the CPU AND casting it in one `.to(cpu, float64)` call returned wrong
-    values on torch 2.14 (the token stats came out as garbage on a Mac): move first, then cast."""
+    """Verify MPS weighted moments agree with CPU calculations across device transfers."""
     g = torch.Generator().manual_seed(0)
     values = torch.randn(300, 16, generator=g).reshape(10, 30, 16).permute(0, 2, 1).reshape(-1, 30)
     weights = torch.rand(values.shape[0], generator=g)

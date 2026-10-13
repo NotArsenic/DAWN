@@ -1,4 +1,4 @@
-"""LR schedules: the plain cosine warmup and Smith's one cycle (`optim.schedule`)."""
+"""Tests for learning rate and momentum scheduling policies."""
 
 import pytest
 
@@ -46,14 +46,14 @@ def test_one_cycle_ramps_to_the_configured_lr_then_anneals_to_nearly_zero():
 
 
 def test_one_cycle_keeps_the_ratio_between_param_groups():
-    """LoRA's 1e-4 must stay half of the 2e-4 group at every step, peak included."""
+    """Verify constant learning rate ratio between parameter groups throughout training."""
     opt = _optimizer((2e-4, 1e-4))
     for fast, slow in _trace(opt, one_cycle_schedule(opt, TOTAL)):
         assert slow == pytest.approx(fast / 2, rel=1e-6)
 
 
 def test_one_cycle_has_a_much_longer_ramp_than_the_cosine_warmup():
-    """The point of the switch: 20% of the run spent ramping, not 5%."""
+    """Verify OneCycle schedule has a longer warmup phase than cosine warmup."""
     cos_opt, one_opt = _optimizer(), _optimizer()
     cos = [row[0] for row in _trace(cos_opt, cosine_warmup_schedule(cos_opt, 10, TOTAL))]
     one = [row[0] for row in _trace(one_opt, one_cycle_schedule(one_opt, TOTAL, pct_start=0.2))]
@@ -62,7 +62,7 @@ def test_one_cycle_has_a_much_longer_ramp_than_the_cosine_warmup():
 
 
 def test_stepping_past_the_budget_clamps_instead_of_raising():
-    """torch's OneCycleLR raises here; a resume that oversteps by one must not die."""
+    """Verify scheduler clamps learning rate instead of raising past total budget."""
     opt = _optimizer()
     scheduler = one_cycle_schedule(opt, TOTAL)
     _trace(opt, scheduler, steps=TOTAL + 25)
@@ -158,7 +158,7 @@ def test_an_unknown_schedule_name_is_a_clear_error():
 
 
 def test_a_budget_near_its_own_warmup_is_warned_about(caplog):
-    """Raising optim.batch_size without rescaling the step counts is the way in."""
+    """Verify warning is emitted when step budget is close to or below warmup duration."""
     import logging
 
     pytest.importorskip("omegaconf")

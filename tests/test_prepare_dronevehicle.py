@@ -1,8 +1,5 @@
-"""End to end: prepare_dronevehicle.py stats -> day -> align -> dedup -> write on the fake tree.
+"""End-to-end tests for prepare_dronevehicle.py on the fake dataset tree."""
 
-The pipeline is driven through the script's own `main()`, as a user would, with `--workers 1`.
-Nothing here reads data/DroneVehicle.
-"""
 
 import importlib.util
 import sys

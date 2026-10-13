@@ -1,4 +1,4 @@
-"""The four losses (docs/conventions.md section 5 and the plan's Stage 1 table)."""
+"""Tests for flow matching training loss functions and weighting schemes."""
 
 import pytest
 
@@ -74,7 +74,7 @@ def test_flow_is_logged_per_segment_and_the_segments_match_the_layout(correction
 
 
 def test_per_value_balance_is_the_plain_mean_over_the_token_so_colour_counts_double(correction):
-    """The stated default: colour has 32 values to brightness's 16, so it weighs twice as much."""
+    """Verify per-value balance weighs segments proportionally to their dimensionality."""
     loss = _loss(correction, segment_balance="per_value")
     z_0, z_1 = _tokens(loss.layout)
     out = loss.flow(torch.zeros_like(z_0), z_0, z_1, None)

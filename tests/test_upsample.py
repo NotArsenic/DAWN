@@ -1,4 +1,4 @@
-"""Bilateral guided upsampling (docs/conventions.md section 6.3)."""
+"""Tests for bilateral guided upsampling and bilinear spatial interpolation."""
 
 import pytest
 

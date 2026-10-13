@@ -1,9 +1,4 @@
-"""The Stage 2 local refiner: bounded, local and brightness only.
-
-The refiner is the one part of the pipeline that is allowed to invent detail, so what has to be
-pinned is what it cannot do: leave `+/- residual_scale` of the brightness it was given, leave
-`[0, 1]`, see further than its 9 x 9 field, or touch a* and b*.
-"""
+"""Tests for the LocalRefiner model architecture, bounded residuals, and receptive field."""
 
 from pathlib import Path
 
@@ -27,7 +22,7 @@ def _trained(std: float = 0.2, seed: int = 0, **kwargs) -> LocalRefiner:
 
 
 def _inputs(batch=B, size=(H, W), seed=0, scale=1.0):
-    """`L` and thermal, both (B, 1, H, W); `scale` > 1 pushes them out of their [0, 1] domain."""
+    """Generate synthetic lightness and thermal tensor inputs."""
     generator = torch.Generator().manual_seed(seed)
     lightness = torch.rand(batch, 1, *size, generator=generator)
     thermal = torch.rand(batch, 1, *size, generator=generator)
@@ -35,7 +30,7 @@ def _inputs(batch=B, size=(H, W), seed=0, scale=1.0):
 
 
 def _lab(batch=B, size=(H, W), seed=5):
-    """A plausible rendered L*a*b*: L* in [0, 100], a* and b* well inside the gamut."""
+    """Generate synthetic CIELAB tensor with values in standard gamut."""
     generator = torch.Generator().manual_seed(seed)
     values = torch.rand(batch, 3, *size, generator=generator)
     return torch.cat([100 * values[:, :1], 60 * values[:, 1:] - 30], dim=1)
@@ -52,7 +47,7 @@ def test_the_refined_lightness_has_the_shape_and_dtype_of_the_input():
 
 
 def test_the_residual_is_bounded_by_the_residual_scale_whatever_the_input():
-    """tanh is the bound: huge weights on huge inputs saturate it, they do not break it."""
+    """Verify residual outputs remain strictly bounded by residual_scale parameter."""
     model = _trained(std=3.0, seed=1)
     lightness, thermal = _inputs(scale=100.0, seed=2)
     residual = model.residual(lightness, thermal)
@@ -76,7 +71,7 @@ def test_a_relaxed_bound_is_the_only_thing_that_widens_the_residual():
 
 @pytest.mark.parametrize("level", [0.0, 1.0])
 def test_the_output_is_clamped_to_the_unit_range(level):
-    """A +10 L* delta on an already-white pixel must not render brighter than white."""
+    """Verify refined lightness outputs are clamped to unit interval [0, 1]."""
     model = _trained(std=3.0, seed=4)
     lightness = torch.full((B, 1, H, W), level)
     _, thermal = _inputs(seed=5)
@@ -86,7 +81,7 @@ def test_the_output_is_clamped_to_the_unit_range(level):
 
 
 def test_forward_is_the_clamped_sum_of_the_lightness_and_the_residual():
-    """The trainer penalises |residual| and must reuse this delta rather than re-run the net."""
+    """Verify forward method matches clamped sum of lightness and predicted residual."""
     model = _trained(std=2.0, seed=6)
     lightness, thermal = _inputs(seed=7)
     expected = (lightness + model.residual(lightness, thermal)).clamp(0.0, 1.0)
@@ -94,7 +89,7 @@ def test_forward_is_the_clamped_sum_of_the_lightness_and_the_residual():
 
 
 def test_an_untrained_refiner_is_the_exact_identity():
-    """The output 1x1 is zero-initialized: an untrained Stage 2 degrades to Stage 1, not noise."""
+    """Verify zero-initialized refiner acts as an exact identity operation."""
     lightness, thermal = _inputs()
     model = LocalRefiner()
     assert torch.equal(model.residual(lightness, thermal), torch.zeros_like(lightness))
@@ -122,10 +117,7 @@ def test_the_receptive_field_is_nine_pixels_at_the_plans_defaults():
 
 @pytest.mark.parametrize("field", ["lightness", "thermal"])
 def test_one_changed_input_pixel_moves_exactly_the_nine_by_nine_window_around_it(field):
-    """The 1x1 projections add no reach: a pixel 5 away is bit-identical, one 4 away is not.
-
-    A vehicle is tens of pixels across, so a refiner that cannot see one cannot invent one.
-    """
+    """Verify perturbations strictly propagate within the receptive field window."""
     model = _trained(std=0.2, seed=10)
     size = 25
     inputs = {
@@ -173,7 +165,7 @@ def test_from_config_falls_back_to_the_init_defaults_key_by_key():
 
 
 def test_from_config_builds_the_shipped_refiner_yaml():
-    """Skips until `configs/refiner.yaml` exists: the model is usable before the config is."""
+    """Verify refiner instantiation from refiner.yaml configuration."""
     omegaconf = pytest.importorskip("omegaconf")
     path = CONFIGS / "refiner.yaml"
     if not path.exists():
@@ -185,8 +177,7 @@ def test_from_config_builds_the_shipped_refiner_yaml():
 
 
 def test_the_parameter_count_stays_in_the_low_thousands():
-    """It runs once per 640x512 frame beside a 45-GMAC DINO pass, so it has to stay negligible;
-    5,000 parameters is the ceiling that keeps the plan's "1-2 GMACs for the refiner" honest."""
+    """Verify model parameter count stays within lightweight bound."""
     model = LocalRefiner()
     assert 2000 < model.num_params() < 5000, model.num_params()
 
@@ -215,7 +206,7 @@ def test_apply_refiner_moves_the_lightness_and_leaves_a_and_b_bit_identical():
 
 
 def test_apply_refiner_area_downsamples_a_larger_thermal():
-    """Inference renders below the frame size; the thermal is shrunk the one sanctioned way."""
+    """Verify apply_refiner downsamples higher-resolution thermal conditioning."""
     lab = _lab()
     big = _inputs(size=(4 * H, 4 * W), seed=13)[1]
     model = _trained(std=1.0, seed=14)
@@ -227,7 +218,7 @@ def test_apply_refiner_area_downsamples_a_larger_thermal():
 
 
 def test_apply_refiner_runs_on_what_the_one_render_path_returned():
-    """Step 6 of the plan's inference list: `render`'s lab at the render size, the frame thermal."""
+    """Verify apply_refiner integrates with pipeline render output."""
     settings = RenderSettings(layout=tiny_layout())
     layout = settings.layout
     generator = torch.Generator().manual_seed(15)

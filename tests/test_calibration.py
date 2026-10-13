@@ -1,9 +1,4 @@
-"""Uncertainty calibration: ranking the sample spread against the realized error.
-
-The plan's row is a RANK correlation, because the spread of K samples is a disagreement with no
-calibrated units. These tests pin that: rho must be invariant to rescaling the spread, and the
-ECE must carry the scale it was computed with.
-"""
+"""Tests for uncertainty calibration and rank correlation between spread and error."""
 
 import pytest
 
@@ -20,7 +15,7 @@ from dawn.eval.calibration import (  # noqa: E402
 
 
 def _pair(n=4000, noise=0.0, seed=0):
-    """A spread map and an error map whose magnitudes agree up to `noise`."""
+    """Generate a synthetic spread map and correlated absolute error map."""
     g = torch.Generator().manual_seed(seed)
     spread = torch.rand(1, 1, n, generator=g) * 10
     error = spread * 2.0 + torch.randn(1, 1, n, generator=g) * noise
@@ -33,7 +28,7 @@ def test_perfectly_ordered_maps_score_rho_one():
 
 
 def test_rho_is_invariant_to_rescaling_the_spread():
-    """The whole reason for a rank statistic: the spread's units are arbitrary."""
+    """Verify rank correlation is invariant to monotone rescaling of spread."""
     spread, error = _pair(noise=3.0)
     base = rank_correlation(spread, error)
     for factor in (0.01, 7.0, 1000.0):
@@ -73,7 +68,7 @@ def test_undefined_cases_return_zero_not_nan(spread, error):
 
 
 def test_the_mask_selects_which_pixels_count():
-    """Pixels the mask drops must not be able to change the answer."""
+    """Verify masked-out pixels do not influence rank correlation."""
     spread, error = _pair(n=2000, noise=0.0)
     mask = torch.ones_like(spread)
     mask[..., 1000:] = 0.0
@@ -129,7 +124,7 @@ def test_ece_reports_the_scale_it_used():
 
 
 def test_an_unscaled_ece_is_large_which_is_why_the_scale_exists():
-    """scale=1 on a spread that is half the error reports the unit mismatch, not calibration."""
+    """Verify unscaled ECE reflects scale mismatch when spread magnitude differs from error."""
     spread, error = _pair(n=5000, noise=0.0)
     fitted = expected_calibration_error(spread, error, num_bins=10)
     unscaled = expected_calibration_error(spread, error, num_bins=10, scale=1.0)

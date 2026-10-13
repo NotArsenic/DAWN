@@ -1,15 +1,4 @@
-"""A tiny raw DroneVehicle tree for tests: 840x712 frames with a white 100-px border, JPEG images
-and VOC-like XML in all three geometry forms (polygon, bndbox, point), the dataset's class typos,
-and a few pairs built to fail each filter. Tests never read data/DroneVehicle.
-
-Every pair is made from a known scene. The RGB content is the scene; the thermal content is the
-scene's luminance sampled at `T(x_thermal)`, so the ground-truth similarity `T` maps thermal pixel
-coordinates onto RGB ones (pixel-index coordinates, x = column, y = row, the convention of
-dawn/data/align.py). The thermal XML holds the RGB boxes pulled back through `T^-1`.
-
-`FAKE_PAIRS` lists what each stem is for, and `EXPECTED_FINAL` what the whole pipeline should
-decide about it.
-"""
+"""Synthetic DroneVehicle dataset generator for unit tests."""
 
 from __future__ import annotations
 
@@ -31,14 +20,14 @@ _GRID = [(x, y) for y in (110, 250, 400) for x in (80, 200, 320, 440, 560)]
 
 
 def similarity(scale: float, rot_deg: float, tx: float, ty: float) -> np.ndarray:
-    """3x3 similarity (rotation about the origin, then translation) in pixel-index coordinates."""
+    """Generate a 3x3 affine similarity transform matrix in pixel coordinates."""
     a, b = scale * math.cos(math.radians(rot_deg)), scale * math.sin(math.radians(rot_deg))
     return np.array([[a, -b, tx], [b, a, ty], [0.0, 0.0, 1.0]])
 
 
 @dataclass(frozen=True)
 class PairSpec:
-    """One fake stem. See the module docstring of the test that uses it for what it must do."""
+    """Specification defining synthetic image pair attributes and anomalies."""
 
     split: str
     stem: str
@@ -284,15 +273,15 @@ def _write_xml(path: Path, folder: str, filename: str, objects: list[str]) -> No
 
 
 def _labels(spec: PairSpec, warp: np.ndarray) -> tuple[list[str], list[str]]:
-    """XML object lists `(rgb, thermal)` for a spec."""
+    """Generate XML annotation strings for RGB and thermal modalities."""
     inverse = np.linalg.inv(warp)
     rgb, thermal = [], []
     for i, v in enumerate(_vehicles(spec)):
         poly = _box(v)
-        form = _bndbox_xml if spec.extras and i == 1 else _polygon_xml  # one RGB bndbox
+        form = _bndbox_xml if spec.extras and i == 1 else _polygon_xml
         rgb.append(_object_xml(v["cls"], form(poly)))
         if spec.all_copied or i < spec.copy_boxes:
-            thermal.append(_object_xml(v["cls"], form(poly)))  # an exact copy of the RGB box
+            thermal.append(_object_xml(v["cls"], form(poly)))
             continue
         bend = np.array([[1.0, 0, 0], [0, 1.0, 0], [spec.perspective, 0, 1.0]])
         pulled = []
@@ -305,7 +294,7 @@ def _labels(spec: PairSpec, warp: np.ndarray) -> tuple[list[str], list[str]]:
         pulled = [(x + offset[0], y + offset[1]) for x, y in pulled]
         name = "truvk" if spec.extras and v["cls"] == "truck" else v["cls"]
         thermal.append(_object_xml(name, _polygon_xml(pulled)))
-    if spec.extras:  # objects the reader must skip or drop
+    if spec.extras:
         rgb.append(_object_xml("*", _polygon_xml([(10, 10), (20, 10), (20, 20), (10, 20)])))
         rgb.append(
             _object_xml("car", "    <point>\n      <x>300</x>\n      <y>300</y>\n    </point>\n")
@@ -314,7 +303,7 @@ def _labels(spec: PairSpec, warp: np.ndarray) -> tuple[list[str], list[str]]:
 
 
 def make_fake_dronevehicle(root: Path, specs: list[PairSpec] | None = None) -> FakeTree:
-    """Write the raw tree under `root` (`<root>/<split>/<split>img/...`) and return its truth."""
+    """Construct and populate a synthetic DroneVehicle directory hierarchy."""
     specs = FAKE_PAIRS if specs is None else specs
     tree = FakeTree(root=root, specs=list(specs))
     for split in ("train", "val", "test"):
@@ -340,7 +329,7 @@ def make_fake_dronevehicle(root: Path, specs: list[PairSpec] | None = None) -> F
         if spec.bad_border:
             rgb_frame = _frame(rgb8, "RGB")
             frame = np.asarray(rgb_frame).copy()
-            frame[40:60, :] = 60  # a dark stripe inside the top border
+            frame[40:60, :] = 60
             rgb_frame = Image.fromarray(frame, mode="RGB")
         else:
             rgb_frame = _frame(rgb8, "RGB")
@@ -361,13 +350,12 @@ def make_fake_dronevehicle(root: Path, specs: list[PairSpec] | None = None) -> F
 
 
 def write_framed_jpeg(path: Path, content: np.ndarray, mode: str = "L") -> None:
-    """A bare JPEG for reader tests: uint8 `content` in the white frame, saved as `mode`."""
+    """Save image content centered within a standard border frame as JPEG."""
     _frame(content, "L" if content.ndim == 2 else "RGB").convert(mode).save(path, quality=95)
 
 
 def fake_config(base: Path, raw_root: Path) -> dict:
-    """The real configs/data.yaml with every path moved under `base` and the day cutoff set for
-    the fake scenes. Returns a plain dict (what the scripts get from OmegaConf)."""
+    """Generate test data configuration dictionary pointing to temporary directories."""
     from omegaconf import OmegaConf
 
     cfg = OmegaConf.to_container(

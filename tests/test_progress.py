@@ -1,8 +1,4 @@
-"""Progress reporting (dawn/progress.py).
-
-The rule worth pinning: a tqdm bar is for a terminal, lines are for a log file. An overnight run
-is redirected, and a bar there fills the file with carriage returns.
-"""
+"""Tests for progress logging, terminal bar detection, and duration formatting."""
 
 import logging
 import sys
@@ -28,7 +24,7 @@ def test_eta_line_reports_share_rate_and_remaining():
 
 
 def test_eta_line_omits_what_it_cannot_know():
-    """No total means no percentage and no ETA, rather than a guess."""
+    """Verify ETA line formatting when total count is unknown."""
     line = eta_line("stats", 300, None, 10.0)
     assert "300" in line and "30.0/s" in line
     assert "%" not in line and "ETA" not in line
@@ -61,7 +57,7 @@ def test_every_item_is_yielded_unchanged(monkeypatch):
 
 
 def test_a_generator_is_not_materialized(monkeypatch):
-    """Wrapping a stream must not pull it all into memory to count it first."""
+    """Verify progress wrapper streams iterators lazily without pre-materialization."""
     monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
     pulled = []
 
@@ -100,7 +96,7 @@ def test_an_explicit_total_overrides_a_missing_len(monkeypatch, caplog):
 
 
 def test_run_parallel_logs_a_rate_and_an_eta(caplog):
-    """The data-prep passes keep line logging whatever the terminal is: they are the record."""
+    """Verify parallel processing workers report progress and ETA to logger."""
     pytest.importorskip("torch")
     from dawn.data.sheets import run_parallel
 

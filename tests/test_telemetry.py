@@ -1,18 +1,4 @@
-"""The telemetry added for the first real run: diagnostics, held-out loss and the local mirrors.
-
-Three groups, in the order a run uses them:
-
-1. **Schedule smoothing** -- the EMA decay warmup and the conditioning ramp. Both are strict
-   generalizations: with their knobs off they must reproduce the old behaviour exactly, which is
-   what makes a baseline comparable.
-2. **Premise diagnostics** -- `patch_retrieval` and `edge_quantile_mask`. These exist to measure
-   claims made about the model rather than act on them (`docs/proposals_review.md`), so they are
-   tested against cases whose answer is known by construction.
-3. **The local record** -- `CsvLog` / `RunLog`. W&B owns the live curves; these files are what a
-   plot is rebuilt from, so the thing to pin is that they hold *the same keys* W&B got.
-
-Everything here runs on the CPU with tiny tensors and never reads the real dataset.
-"""
+"""Tests for training telemetry, schedule smoothing, evaluation diagnostics, and local log mirroring."""
 
 import json
 
@@ -41,7 +27,7 @@ def test_ema_without_warmup_is_the_old_fixed_decay():
 
 
 def test_ema_warmup_kills_the_initialization_in_a_handful_of_updates():
-    """The point of the warmup: at `val_every: 500` a fixed 0.999 would validate 61% noise."""
+    """Verify EMA warmup rapidly updates shadow weights towards real values in initial steps."""
     warm, warm_param = _ema()
     fixed, fixed_param = _ema(warmup=False)
     for _ in range(10):
@@ -66,7 +52,7 @@ def test_ema_warmup_only_ever_lowers_the_decay_and_converges_to_the_configured_o
 
 
 def test_a_checkpoint_without_an_update_count_does_not_restart_the_warmup():
-    """Resuming a converged run must not re-ramp the decay and let fresh weights swamp it."""
+    """Verify loading an older checkpoint without update count preserves target decay."""
     ema, _ = _ema()
     old_style = {"decay": 0.999, "shadow": ema.shadow}  # written before the warmup existed
     ema.load_state_dict(old_style)
@@ -117,11 +103,7 @@ def test_patch_retrieval_is_perfect_when_the_two_encoders_agree():
 
 
 def test_patch_retrieval_separates_a_one_patch_shift_from_real_confusion():
-    """The distinction the metric exists for: misaligned labels vs features that do not localize.
-
-    A frozen target shifted one column to the left retrieves the *neighbour*, so `top1`
-    collapses while `within_1` stays high. Shuffled targets lose both.
-    """
+    """Verify patch retrieval discriminates between small spatial shifts and feature confusion."""
     grid = (4, 5)
     tokens = torch.randn(1, grid[0] * grid[1], 16)
     shifted = tokens.view(1, *grid, 16).roll(shifts=1, dims=2).reshape(1, -1, 16)
@@ -187,11 +169,7 @@ def test_edge_mask_of_an_entirely_masked_image_is_empty_not_wrong():
 
 
 def test_edge_mask_concentrates_on_the_boundary_of_a_two_tone_frame():
-    """The case the oracle's `*_edge` metric is for: a sharp boundary in an otherwise flat frame.
-
-    More than 90% of this frame is flat, so the 0.9 quantile of gradient magnitude is exactly
-    zero. Thresholding on `>=` alone would mark every pixel -- the opposite of an edge mask.
-    """
+    """Verify edge mask isolates step edge boundary in predominantly flat frames."""
     image = torch.zeros(1, 1, 24, 24)
     image[..., 12:] = 1.0
     edge = edge_quantile_mask(image, torch.ones(1, 1, 24, 24), 0.9)
@@ -229,7 +207,7 @@ def test_budget_summary_reports_the_real_configuration_in_epochs():
 
 
 def test_budget_summary_exposes_the_rescaling_trap():
-    """Batch 128 at the same step count: 29 steps an epoch, and the detach never lifts."""
+    """Verify budget summary accounts for batch size scaling and warmup epochs."""
     out = budget_summary(_cfg(batch=128, steps=2900), 3662)
     assert out["steps_per_epoch"] == pytest.approx(28.6, abs=0.1)
     assert out["epochs"] < 102
@@ -250,7 +228,7 @@ def test_csv_log_writes_one_file_per_kind_with_a_stable_header(tmp_path):
 
 
 def test_a_column_that_appears_late_lands_in_the_header_retroactively(tmp_path):
-    """`beta1` and `peak_vram_gb` do not exist on every row; the file must stay readable."""
+    """Verify CSV logger accommodates columns added after initial rows."""
     from scripts.train_flow import CsvLog
 
     log = CsvLog(tmp_path)
@@ -261,7 +239,7 @@ def test_a_column_that_appears_late_lands_in_the_header_retroactively(tmp_path):
 
 
 def test_the_local_record_holds_exactly_the_keys_wandb_got(tmp_path):
-    """The whole point of `RunLog`: the mirrors cannot drift from the live curves."""
+    """Verify local CSV and JSONL loggers record identical metric keys."""
     from scripts.train_flow import RunLog
 
     cfg = {"logging": {"wandb_mode": "disabled", "metrics_csv": True}}
@@ -294,7 +272,7 @@ def test_the_run_config_is_written_beside_the_metrics(tmp_path):
 
 
 def test_every_selection_metric_names_a_key_validate_actually_returns():
-    """A typo here would surface as a KeyError at the first validation of an overnight run."""
+    """Verify all selection metrics match keys documented in FlowTrainer.validate."""
     from dawn.flow.trainer import FlowTrainer
     from scripts.train_flow import SELECTION
 

@@ -1,16 +1,4 @@
-"""Stage 2 end to end, on the CPU with tiny tensors: one step, the masked loss, the crops, the
-gate and the pinned checkpoint.
-
-The refiner is the real model (`dawn/models/refiner.py`), the targets, the grid fit and the masked
-metrics are the real ones, and the frames are the 64 x 80 synthetic pairs of `tests/flow_helpers.py`
-whose lightness is an exact affine map of the thermal -- so the fitted grid is near-perfect and
-`psnr_L/improvement` starts at exactly 0, which is the honest baseline the gate is read against.
-Nothing here reads data/DroneVehicle or data/dronevehicle_aligned.
-
-The output 1x1 of a fresh `LocalRefiner` is zero-initialized, so an untrained refiner is the EXACT
-identity. Tests that need a non-zero response `wake_up` it first ("one optimizer step happened");
-tests about the baseline deliberately do not.
-"""
+"""End-to-end tests for Stage 2 refiner training, loss functions, crops, validation, and checkpoints."""
 
 import pytest
 
@@ -45,16 +33,16 @@ PINNED_KEYS = {
     "optimizer",
     "scheduler",
 }
-TRAIN_PAIRS = 3662  # the aligned train manifest; the budget comment in refiner.yaml divides by it
+TRAIN_PAIRS = 3662
 
 
 def tiny_refiner_cfg(**updates) -> dict:
-    """`tiny_cfg` plus a tiny `refiner` section: a 9 px field, 16 px crops of the 64 x 80 frame."""
+    """Generate minimal test configuration for refiner model."""
     cfg = tiny_cfg()
     cfg["refiner"] = {
         "hidden_channels": 8,
         "num_blocks": 2,
-        "kernel_size": 5,  # a 9 px field, as the plan's defaults
+        "kernel_size": 5,
         "residual_scale": 0.1,
         "crop_size": 16,
         "residual_penalty": 0.01,
@@ -67,7 +55,7 @@ def tiny_refiner_cfg(**updates) -> dict:
 
 
 def _trainer(seed: int = 0, awake: float | None = None, **updates):
-    """A trainer and a batch; `awake` perturbs the zero-init head so the refiner responds."""
+    """Instantiate a refiner trainer and test batch."""
     torch.manual_seed(seed)
     trainer = RefinerTrainer.from_config(tiny_refiner_cfg(**updates), "cpu", seed=seed)
     if awake is not None:
@@ -76,13 +64,7 @@ def _trainer(seed: int = 0, awake: float | None = None, **updates):
 
 
 def rolled_batch(batch: int = 2, seed: int = 0, shift: int = 3) -> dict:
-    """A pair whose `L*/100` is an affine map of the thermal **shifted sideways**.
-
-    The brightness grid is pointwise in thermal per (cell, bin), so it cannot express a shift; a
-    9 px convolution over the thermal can. That makes the L1 term's optimum a non-zero residual,
-    which is what the residual penalty has to be measured against -- on the unshifted synthetic
-    pair the grid is already exact and every penalty drives the residual to 0 for free.
-    """
+    """Generate synthetic batch with spatially shifted lightness channel."""
     item = synthetic_batch(batch, seed=seed)
     lightness = 100 * (0.25 + 0.45 * torch.roll(item["thermal"], shifts=shift, dims=-1))
     flat = torch.zeros_like(lightness)
@@ -107,8 +89,7 @@ def test_one_cpu_step_runs_and_moves_every_parameter():
 
 
 def test_a_fresh_zero_init_refiner_still_moves_its_output_head():
-    """The honest version of the step test: the zero-init head blocks gradient to the layers
-    behind it, so the first step can only move the head -- and it must."""
+    """Verify initial training step updates zero-initialized output projection head."""
     trainer, batch = _trainer()
     before = {name: p.detach().clone() for name, p in trainer.refiner.named_parameters()}
     trainer.train_step(batch)
@@ -118,8 +99,7 @@ def test_a_fresh_zero_init_refiner_still_moves_its_output_head():
 
 
 def test_the_total_is_the_l1_plus_the_configured_weight_times_the_residual():
-    """The plan's loss is `L1 to RGB brightness + 0.01 * |residual|`: the weight has to be the
-    configured one, and both terms have to be reported, or a curve cannot be read."""
+    """Verify total loss computes weighted sum of L1 reconstruction and residual penalty."""
     for penalty in (0.0, 0.01, 2.0):
         trainer, batch = _trainer(awake=0.5, refiner={"residual_penalty": penalty})
         terms = {name: float(value.detach()) for name, value in
@@ -138,8 +118,7 @@ def test_the_step_log_reports_the_residual_in_l_star_units_too():
 
 
 def test_a_fully_masked_batch_gives_zero_not_nan():
-    """Every term is a masked mean with the weights never thresholded, so a batch with no weight
-    anywhere is 0 (`dawn/flow/loss.py` does the same). A NaN here would poison the whole run."""
+    """Verify fully masked batches produce finite zero losses without NaNs."""
     trainer, batch = _trainer(awake=0.5)
     batch["valid"] = torch.zeros_like(batch["valid"])  # the pixel mask is `valid & ~moving`
     losses = trainer.compute_losses(batch)
@@ -151,12 +130,7 @@ def test_a_fully_masked_batch_gives_zero_not_nan():
 
 
 def test_a_bigger_residual_penalty_leaves_a_smaller_residual():
-    """On a pair the grid cannot fit, the L1 term wants a non-zero residual; the penalty is what
-    holds it back, so raising it has to show up as a smaller |residual| after training.
-
-    Each run starts from the zero-init identity, so the residual is grown by L1 from exactly 0
-    rather than decayed from a perturbation: what is measured is how far the penalty let it get.
-    """
+    """Verify residual regularization penalty constrains learned residual magnitude."""
     batch = rolled_batch(2, seed=0, shift=3)
     tails = {}
     for penalty in (0.0, 0.01, 5.0):
@@ -180,7 +154,7 @@ def test_crop_windows_are_square_inside_the_frame_and_one_per_image():
 
 
 def test_a_frame_smaller_than_the_crop_falls_back_to_the_whole_frame_per_axis():
-    """The debug and mps overlays run at 256x320, where the height IS the crop size."""
+    """Verify crop window generator handles input dimensions equal to or smaller than crop size."""
     assert crop_windows((8, 10), 16, ["train_00000"]) == [(0, 0, 8, 10)]
     windows = crop_windows((256, 320), 256, ["train_00000", "train_00001"])
     for top, left, height, width in windows:
@@ -188,8 +162,7 @@ def test_a_frame_smaller_than_the_crop_falls_back_to_the_whole_frame_per_axis():
 
 
 def test_crop_offsets_are_per_image_without_a_generator_and_fresh_with_one():
-    """docs/conventions.md section 10.3: per-image seeding is reproducible anywhere, and a FRESH
-    draw is asked for by passing a generator, never by salting a counter into the image ID."""
+    """Verify crop offsets are deterministic per image without a generator and stochastic with one."""
     ids = [f"train_{i:05d}" for i in range(6)]
     assert crop_windows(TINY_INPUT, 16, ids) == crop_windows(TINY_INPUT, 16, ids)
     assert crop_windows(TINY_INPUT, 16, ids) != crop_windows(TINY_INPUT, 16, list(reversed(ids)))
@@ -201,8 +174,7 @@ def test_crop_offsets_are_per_image_without_a_generator_and_fresh_with_one():
 
 
 def test_crop_batch_takes_the_same_window_from_every_tensor():
-    """Thermal, the grid, the truth and the mask must see the same pixels or the loss compares a
-    window with its neighbour. Each tensor is filled with its pixel's own coordinate."""
+    """Verify identical spatial windows are extracted across all batch tensors."""
     height, width = TINY_INPUT
     rows = torch.arange(height).view(1, 1, height, 1).expand(3, 1, height, width)
     columns = torch.arange(width).view(1, 1, 1, width).expand(3, 1, height, width)
@@ -278,8 +250,7 @@ def test_validation_reports_the_grid_the_refined_image_and_their_difference():
 
 
 def test_an_untrained_refiner_scores_exactly_zero_improvement():
-    """The honest baseline: a zero-init refiner is the identity, so it cannot beat the grid and
-    must not appear to. Anything else in this number would be noise dressed as a result."""
+    """Verify zero-initialized refiner yields zero improvement over base grid."""
     trainer, batch = _trainer()
     scores = trainer.validate([batch])
     assert scores["psnr_L/improvement"] == pytest.approx(0.0, abs=1e-6)
@@ -288,14 +259,14 @@ def test_an_untrained_refiner_scores_exactly_zero_improvement():
 
 
 def test_validation_runs_on_the_full_frame_and_ignores_the_crop_size():
-    """A crop is a training device; the gate has to be the number inference would produce."""
+    """Verify validation evaluates on full frames independent of training crop size."""
     small, batch = _trainer(seed=1, awake=0.3, refiner={"crop_size": 8})
     big, _ = _trainer(seed=1, awake=0.3, refiner={"crop_size": 256})
     assert small.validate([batch]) == big.validate([batch])
 
 
 def test_the_validation_psnr_is_the_masked_one_on_l_star_with_a_peak_of_100():
-    """Recomputed by hand from the same targets, so the units cannot drift from `masked_psnr`."""
+    """Verify validation PSNR matches masked L* PSNR calculation with peak 100."""
     trainer, batch = _trainer(awake=0.3)
     prepared = prepare_batch(batch, trainer.input_size, trainer.policy)
     targets = build_targets(
@@ -338,8 +309,7 @@ def test_the_verdict_says_in_words_whether_the_refiner_earns_its_place():
 
 
 def test_the_checkpoint_holds_exactly_the_pinned_keys(tmp_path):
-    """Another agent's loader is written against this dict: adding a key is as breaking as
-    dropping one, so the set is asserted exactly."""
+    """Verify refiner checkpoint contains expected dictionary keys."""
     trainer, batch = _trainer(awake=0.2)
     trainer.train_step(batch)
     state = torch.load(trainer.save_checkpoint(tmp_path / "ckpt.pt"), weights_only=False)
@@ -377,8 +347,7 @@ def test_checkpoint_round_trip_restores_the_weights_the_step_and_the_schedule(tm
 
 
 def test_a_checkpoint_with_another_residual_bound_is_refused(tmp_path):
-    """`residual_scale` is not a parameter, so the weights would load and quietly mean a
-    different bound."""
+    """Verify checkpoint loading validates matching residual scale parameter."""
     trainer, batch = _trainer(awake=0.2)
     trainer.train_step(batch)
     state = trainer.state_dict()
@@ -422,8 +391,7 @@ def test_refiner_yaml_merges_on_flow_and_data_and_builds_a_working_refiner():
 
 
 def test_the_shipped_budget_is_the_one_its_comment_claims_in_epochs():
-    """`steps * batch_size / 3662` train pairs, the arithmetic of
-    docs/training_budget_and_changes.md section 1 -- the comment and the numbers must agree."""
+    """Verify training budget step count corresponds to expected epoch coverage."""
     cfg = _shipped()
     steps, batch = cfg["refiner"]["num_train_steps"], cfg["optim"]["batch_size"]
     assert (steps, batch) == (8000, 16)
@@ -443,15 +411,7 @@ def test_the_shipped_logging_goes_to_the_stage_two_workspace_with_a_valid_watch_
 
 
 def test_the_ema_shadow_is_keyed_the_way_the_inference_loader_reads_it(tmp_path):
-    """The cross-stage seam, which neither side can catch alone.
-
-    `scripts/train_refiner.py` writes the shadow and `dawn/flow/inference.py: _apply_ema` reads
-    it, and each is self-consistent in whatever keys it uses: the round-trip test above passes
-    EMA through itself, and the loader cannot know what it was handed. Only loading a checkpoint
-    this trainer really wrote proves the two agree. `use_ema=True` is the DEFAULT and the EMA
-    weights are the ones validation selected on, so a mismatch here breaks `infer.py --refiner`
-    for everyone who does not think to pass `--no-ema`.
-    """
+    """Verify EMA shadow key structure matches inference loader naming convention."""
     trainer, batch = _trainer(awake=0.2)
     for _ in range(3):
         trainer.train_step(batch)
@@ -506,8 +466,7 @@ def _tiny_tree_override(tmp_path):
 
 
 def test_main_runs_the_loop_and_writes_the_pinned_checkpoint_names(tmp_path, monkeypatch):
-    """The whole script on 4 tiny pairs: the names another agent's loader looks for, the run
-    records, and a --resume that picks the step back up."""
+    """Verify refiner training script execution, checkpoint generation, and resume functionality."""
     import sys
 
     from scripts.train_refiner import main
@@ -543,7 +502,7 @@ def test_main_runs_the_loop_and_writes_the_pinned_checkpoint_names(tmp_path, mon
 
 
 def test_the_shipped_config_drives_the_trainer():
-    """The config and the script are only really connected when the trainer is built from it."""
+    """Verify refiner trainer instantiation from shipped configuration."""
     cfg = _shipped()
     trainer = RefinerTrainer.from_config(cfg, "cpu")
     assert trainer.crop_size == 256 and trainer.num_train_steps == 8000

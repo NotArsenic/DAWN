@@ -1,4 +1,4 @@
-"""Contact-sheet and parallel-map helpers (dawn/data/sheets.py)."""
+"""Tests for contact sheet generation and parallel execution helpers."""
 
 import operator
 

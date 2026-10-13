@@ -1,4 +1,4 @@
-"""docs/conventions.md section 2: coefficient order. The token layout is `test_tokens.py`."""
+"""Tests for bilateral affine grid coefficient ordering and layout conventions."""
 
 from pathlib import Path
 
@@ -19,7 +19,7 @@ def test_output_channel_coefficients_are_gain_then_offset():
 
 
 def test_grid_code_never_imports_from_flow():
-    """The layout flows one way: flow/tokens.py imports grid/layout.py, never the reverse."""
+    """Verify grid module does not import from flow module."""
     grid_dir = Path(layout.__file__).parent
     for path in grid_dir.glob("*.py"):
         assert "dawn.flow" not in path.read_text(), path.name

@@ -1,5 +1,4 @@
-"""The 261 a*b* bins, Zhang et al.'s soft encoding and the per-patch histograms
-(docs/conventions.md section 6.1)."""
+"""Tests for discrete CIELAB colour bin centers, soft encoding, and patch histograms."""
 
 import pytest
 

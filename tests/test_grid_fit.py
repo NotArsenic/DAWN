@@ -1,11 +1,4 @@
-"""Fitting the one-input affine grid against cases with a known answer.
-
-`test_grid_rules.py` pins the conventions (coordinates, one trilinear implementation). This file
-asks the harder question: does the fit recover a transform, measured where it matters -- on the
-rendered image, not on the coefficients. Two different coefficient fields can render identically
-wherever the data does not constrain them, so comparing renders is the only test that fails for
-the right reason.
-"""
+"""Tests for bilateral affine grid least-squares fitting and iterative refinement."""
 
 import pytest
 
@@ -28,13 +21,7 @@ def _psnr(a, b, peak=1.0):
 
 
 def _smooth_grid(seed=0, cycles=1.0, gain=0.6, offset=0.2, channels=1):
-    """Gain and offset with a low-frequency ripple over (bin, row, col), for `channels` outputs.
-
-    Smooth: a grid that jumps between neighbouring nodes cannot be represented by a trilinear fit
-    from pixel data at all, so re-rendering it would fail for a reason that has nothing to do
-    with the fit being wrong. In range: the rendered target must stay inside [0, 1] or the fit
-    would chase a clamp (`_unclipped` checks it).
-    """
+    """Generate synthetic smoothly-varying gain and offset grid coefficients."""
     generator = torch.Generator().manual_seed(seed)
     k = torch.linspace(0, 1, K).view(1, K, 1, 1)
     y = torch.linspace(0, 1, GY).view(1, 1, GY, 1)
@@ -135,7 +122,7 @@ def test_output_channels_share_the_normal_equations_but_not_the_answer():
 
 
 def test_an_empty_bin_inherits_its_cell_rather_than_zero():
-    """Ridge pulls a starved node onto its cell's fit: "no data" is not "gain zero"."""
+    """Verify starved nodes inherit spatial cell parameters via ridge regularization."""
     thermal = torch.rand(1, 1, 96, 128, generator=torch.Generator().manual_seed(12)) * 0.05 + 0.01
     target = 3.0 * thermal + 0.05  # all of it lands in the darkest bin
     grid, node_weights = fit_affine_grid(thermal, target, compute_guidance(thermal), None, SIZE)

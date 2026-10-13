@@ -1,14 +1,4 @@
-"""Getting DroneVehicle off the Hub and into the layout the data pipeline expects.
-
-`McCheng/DroneVehicle` is three zip archives with no parquet and no loading script, and the Hub
-does not document what is inside them. So the code *discovers* the four folders of each split
-instead of assuming a path, and these tests are mostly about that discovery holding up against
-the layouts a mirror might plausibly use -- plus the two things that would be silently
-destructive: a zip member that escapes its directory, and an arrange step that clobbers a tree
-somebody already has.
-
-Nothing here touches the network: every archive is built in `tmp_path`.
-"""
+"""Tests for dataset archive discovery, safe extraction, and folder arrangement."""
 
 import zipfile
 
@@ -31,7 +21,7 @@ STEMS = [f"{i:05d}" for i in range(120)]  # over MIN_FILES_PER_FOLDER
 
 
 def _populate(directory, split, stems=STEMS, size=(840, 712), skip=()):
-    """A split's four folders, with real 840x712 JPEGs and XML stubs."""
+    """Populate directory with mock image and annotation files for split testing."""
     for name in folder_names(split):
         if name in skip:
             continue

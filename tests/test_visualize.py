@@ -1,8 +1,4 @@
-"""Comparison grids (dawn/eval/visualize.py).
-
-Two rules worth pinning: grids leave as sRGB (the output boundary), and uncertainty ramps are
-FIXED, so two frames' maps are comparable.
-"""
+"""Tests for evaluation comparison grids, color mapping, and visualization sheet export."""
 
 from pathlib import Path
 
@@ -38,7 +34,7 @@ def _batch(n=3, seed=0):
 
 
 def test_the_ramp_is_fixed_so_two_frames_are_comparable():
-    """The same value must get the same colour regardless of what else is in the image."""
+    """Verify color mapping uses fixed absolute scale independent of other pixel values."""
     quiet = torch.full((1, 1, 4, 4), 2.0)
     loud = torch.full((1, 1, 4, 4), 2.0)
     loud[0, 0, 0, 0] = 9.0
@@ -78,7 +74,7 @@ def test_colorize_rejects_bad_input(value, vmax, message):
 
 
 def test_thermal_is_repeated_not_false_coloured():
-    """Thermal is not sRGB and carries no temperature scale; show the codes as grey."""
+    """Verify single-channel thermal image is converted to grayscale RGB representation."""
     t = torch.rand(2, 1, H, W)
     out = grey_to_rgb(t)
     assert out.shape == (2, 3, H, W)

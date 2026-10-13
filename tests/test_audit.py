@@ -1,4 +1,4 @@
-"""dawn/data/audit.py: edge overlays, audit sheets and fit histograms."""
+"""Tests for alignment audit visualizations, edge overlays, and fit metric plots."""
 
 import dataclasses
 

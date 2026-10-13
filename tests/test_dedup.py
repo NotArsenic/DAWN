@@ -1,4 +1,4 @@
-"""dawn/data/dedup.py: 64-bit perceptual hashes and cross-split near-duplicate matching."""
+"""Tests for perceptual hashing and cross-split near-duplicate detection."""
 
 import numpy as np
 import pytest
@@ -10,7 +10,7 @@ from dawn.data import dedup  # noqa: E402
 
 
 def _scene(seed: int, h: int = 512, w: int = 640) -> torch.Tensor:
-    """A smooth random `(1, H, W)` image with a few rectangles: structure for the hash."""
+    """Generate synthetic patterned tensor for perceptual hash testing."""
     g = torch.Generator().manual_seed(seed)
     img = torch.nn.functional.avg_pool2d(torch.rand(1, 1, h, w, generator=g), 21, 1, 10)[0]
     for _ in range(6):

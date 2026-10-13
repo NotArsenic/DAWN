@@ -1,4 +1,4 @@
-"""Every module imports, and every script parses its command line."""
+"""Tests verifying that all package modules import cleanly and all scripts provide help."""
 
 import importlib
 import importlib.util

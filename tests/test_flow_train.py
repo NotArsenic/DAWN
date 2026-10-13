@@ -1,11 +1,5 @@
-"""Stage 1 end to end, on the CPU with tiny tensors: one step in each mode, the detach schedule,
-parameter groups, EMA, checkpoints, the loaders and a short overfit.
+"""End-to-end tests for flow training loop, schedules, EMA, checkpointing, and overfitting."""
 
-The encoder is a two-block randomly initialized DINOv3 at 64 x 80 (`tests/flow_helpers.py`), so
-nothing is downloaded; the velocity net, the targets, the render, the losses and the optimizer
-are the real ones. The tiny aligned tree is written to `tmp_path`: these tests never read
-data/DroneVehicle or data/dronevehicle_aligned.
-"""
 
 import pytest
 
@@ -263,7 +257,7 @@ def test_validation_reports_the_oracle_and_both_samplers_per_image():
 
 
 def test_validation_reports_the_retrieval_diagnostic_and_the_colourfulness_ratios():
-    """The two diagnostics added for the first run (docs/proposals_review.md section 6)."""
+    """Verify validation telemetry includes retrieval metrics and colorfulness ratios."""
     trainer, batch = _trainer()
     scores = trainer.validate([batch])
     for key in ("retrieval/top1", "retrieval/within_1", "retrieval/chance"):
@@ -280,8 +274,7 @@ def test_validation_reports_the_retrieval_diagnostic_and_the_colourfulness_ratio
 
 
 def test_every_selection_metric_is_a_key_validate_really_returns():
-    """A `logging.select_metric` whose key does not exist would KeyError at the first
-    validation -- 500 steps into an overnight run, after the data and the stats pass."""
+    """Verify all candidate selection metrics exist in the validation output dictionary."""
     from scripts.train_flow import SELECTION
 
     trainer, batch = _trainer()
@@ -296,7 +289,7 @@ def test_the_retrieval_diagnostic_can_be_switched_off():
 
 
 def test_held_out_loss_reports_every_term_and_is_repeatable():
-    """`validate_loss` is the overfitting curve: it has to be low-variance to be readable."""
+    """Verify validation loss components are finite and reproducible across runs."""
     trainer, batch = _trainer()
     first = trainer.validate_loss([batch])
     assert first["num_images"] == 2.0
@@ -331,7 +324,7 @@ def test_a_detailed_step_adds_per_module_gradients_and_loss_shares():
 
 
 def test_the_conditioning_ramp_hands_lora_a_fraction_of_the_velocity_gradient():
-    """Mid-ramp the gradient is scaled, not switched: the forward pass is unchanged either way."""
+    """Verify conditioning ramp progressively scales velocity gradient to LoRA parameters."""
     trainer, batch = _trainer(flow={"warmup_steps": 2, "warmup_ramp_steps": 4})
     wake_up(trainer.velocity)
     trainer.train()
@@ -360,15 +353,13 @@ def test_a_zero_ramp_reproduces_the_old_hard_gate_exactly():
 
 
 def test_the_ramp_defaults_to_a_sixth_of_the_warmup_when_it_is_not_set():
-    """So the short overlays, which scale `warmup_steps` down, scale the ramp with it."""
+    """Verify conditioning ramp duration defaults proportionally to warmup steps."""
     trainer, _ = _trainer(flow={"warmup_steps": 600, "warmup_ramp_steps": None})
     assert trainer.warmup_ramp_steps == 100
 
 
 def test_only_the_network_forwards_run_under_autocast_never_the_pixel_side(monkeypatch):
-    """bf16 autocast is for network forwards only: targets, the fit, the render and the metrics
-    (matmuls in `area_downsample`, the Lab einsum) must stay float32. CUDA is the only place the
-    trainer turns autocast on, so force CPU bf16 autocast and spy on who runs inside it."""
+    """Verify mixed-precision autocast executes neural network operations in float32 for pixel ops."""
     import dawn.flow.trainer as trainer_mod
 
     trainer, batch = _trainer()
@@ -467,13 +458,7 @@ def test_split_by_pair_kind_keeps_manifest_order(tmp_path):
 def test_a_short_overfit_learns_the_flow_closes_in_on_the_render_floor_and_teaches_the_colour_head(
     tmp_path,
 ):
-    """The whole loop on 2 tiny pairs.
-
-    L_render cannot go below what the ORACLE parts render to (the colour map's resolution sets a
-    floor), so it is compared with that floor: it falls by half and stays above it, while the flow
-    loss and the colour head's cross-entropy fall for real and L_align moves once LoRA has a
-    usable lr.
-    """
+    """Verify training convergence and loss reduction during a short multi-step overfit."""
     torch.manual_seed(0)
     steps = 100
     cfg = tiny_data_cfg(

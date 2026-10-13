@@ -1,4 +1,4 @@
-"""dawn/data/dronevehicle.py: layout, pair listing, raw readers, border check, XML parsing."""
+"""Tests for DroneVehicle dataset layout, raw file readers, border validation, and XML parsing."""
 
 import numpy as np
 import pytest

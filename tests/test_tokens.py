@@ -1,8 +1,4 @@
-"""docs/conventions.md section 2.3: the one token layout (dawn/flow/tokens.py).
-
-Everything asks the layout for its sizes, with one exception: `test_layout_matches_the_plan` pins
-the plan's numbers (16 brightness values, then 32 colour values, 1,280 tokens) as the spec.
-"""
+"""Tests for TokenLayout packing, unpacking, layout descriptors, and loss weighting."""
 
 import pytest
 
@@ -60,7 +56,7 @@ def test_the_base_layout_is_the_same_with_or_without_the_correction():
 
 @pytest.mark.parametrize("correction", [False, True])
 def test_token_n_is_cell_y_x_and_the_colour_block_it_covers(correction):
-    """A marker pixel lands in token y*gx + x at the value the layout says."""
+    """Verify pixel coordinates map deterministically to corresponding token indices."""
     layout = TokenLayout(**TINY, correction=correction)
     gy, gx = layout.grid
     block = layout.block

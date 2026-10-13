@@ -1,10 +1,4 @@
-"""The velocity transformer: shapes from the layout, the zero-init guarantee and the DINO
-attention gate.
-
-The conditioning streams (flow tokens, DINO patch tokens, thermal thumbnail) are added per token,
-so the only thing that can silently go wrong is an ordering or size mismatch; `test_tokens.py`
-pins the layout and these tests pin that the model derives its sizes from it.
-"""
+"""Tests for VelocityTransformer architecture, conditioning streams, zero-initialization, and attention gating."""
 
 import pytest
 
@@ -60,7 +54,7 @@ def test_output_shape_and_model_sizes_come_from_the_layout(layout, inputs):
 
 
 def test_parameter_count_is_about_seven_million_at_the_plans_size():
-    """48 values x 1,280 tokens: the plan's 'about 7M params' (built here, never run)."""
+    """Verify model parameter count is approximately seven million with full token layout."""
     from dawn.flow.tokens import TokenLayout
 
     model = VelocityTransformer(TokenLayout(num_bins=8, grid=(32, 40), block=4))
@@ -68,7 +62,7 @@ def test_parameter_count_is_about_seven_million_at_the_plans_size():
 
 
 def test_velocity_is_exactly_zero_at_init(layout, inputs):
-    """adaLN-Zero plus a zero-initialized output head: the flow starts as the identity ODE."""
+    """Verify velocity output is identically zero at initialization."""
     out = _call(VelocityTransformer(layout), inputs)
     assert torch.equal(out, torch.zeros_like(out))
 
@@ -79,7 +73,7 @@ def test_every_block_starts_with_a_zero_attention_gate(layout):
 
 
 def test_with_a_zero_gate_the_attention_bias_changes_nothing(layout, inputs):
-    """Two different attention maps must give bit-identical output while every gate is 0."""
+    """Verify attention bias has no effect when all attention gates are zero."""
     model = wake_up(VelocityTransformer(layout))
     other = torch.rand_like(inputs["dino_attn"])
     other = other / other.sum(dim=-1, keepdim=True)
@@ -122,7 +116,7 @@ def test_a_precomputed_bias_and_the_raw_attention_agree(layout, inputs):
 
 
 def test_dino_attn_wins_when_both_attention_forms_are_passed(layout, inputs):
-    """Callers pass one or the other; if both arrive the raw attention takes precedence."""
+    """Verify raw attention takes precedence when both attention forms are provided."""
     model = wake_up(VelocityTransformer(layout))
     n = layout.num_tokens
     with torch.no_grad():
@@ -158,7 +152,7 @@ def test_the_thumbnail_is_optional(layout, inputs):
 
 
 def test_the_thumbnail_is_added_per_token_in_row_major_order(layout, inputs):
-    """Pixel n of the thumbnail belongs to token n: scrambling its pixels changes the output."""
+    """Verify thumbnail spatial coordinates correspond to token ordering."""
     model = wake_up(VelocityTransformer(layout))
     gy, gx = layout.grid
     perm = torch.randperm(layout.num_tokens, generator=torch.Generator().manual_seed(1))

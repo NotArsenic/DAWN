@@ -1,10 +1,4 @@
-"""scripts/infer.py: reading thermal frames, the fixed uncertainty ramp, and the files written.
-
-Step 6, the optional Stage 2 refiner, is pinned from both sides: without `--refiner` the saved
-bytes must be the Stage 1 render exactly (not merely close), and with one the two images change
-while the two uncertainty PNGs do not -- the maps are the spread of the UNREFINED ensemble,
-which is the one judgement call in this script (see its module docstring).
-"""
+"""Tests for thermal inference script, uncertainty visualization, and optional refiner integration."""
 
 import argparse
 import sys
@@ -59,7 +53,7 @@ def _args(**updates):
 
 @pytest.fixture(scope="module")
 def flow_checkpoint(tmp_path_factory):
-    """A tiny Stage 1 checkpoint on disk, so `main` can be driven the way a user drives it."""
+    """Save a synthetic flow checkpoint for inference script testing."""
     torch.manual_seed(0)
     cfg = tiny_cfg()
     batch = synthetic_batch(2, seed=0, fallback=[False, True])
@@ -83,7 +77,7 @@ def bundle(flow_checkpoint):
 def _write_thermal(path: Path, size, value=120):
     path.parent.mkdir(parents=True, exist_ok=True)
     array = np.full(size, value, dtype=np.uint8)
-    array[: size[0] // 2] = 200  # something for the grid to key on
+    array[: size[0] // 2] = 200
     Image.fromarray(array).save(path)
     return path
 
@@ -103,7 +97,7 @@ def test_find_inputs_takes_a_file_a_directory_and_a_limit(tmp_path):
 
 
 def test_find_inputs_takes_several_paths_and_deduplicates(tmp_path):
-    """`--input` is `nargs="+"`, so a shell glob arrives as many paths, repeats and all."""
+    """Verify input path parsing handles multi-path arguments and deduplication."""
     one = _write_thermal(tmp_path / "a.png", TINY_INPUT)
     two = _write_thermal(tmp_path / "b.png", TINY_INPUT)
 
@@ -114,7 +108,7 @@ def test_find_inputs_takes_several_paths_and_deduplicates(tmp_path):
 
 
 def test_a_raw_dronevehicle_frame_loses_its_border(tmp_path):
-    """840x712 in, the 640x512 content window out, then down to the model's input."""
+    """Verify raw DroneVehicle frames have borders removed before resizing."""
     path = _write_thermal(tmp_path / "raw.png", (712, 840))
     thermal = read_thermal(path, TINY_INPUT)
     assert thermal.shape == (1, 1, *TINY_INPUT)
@@ -129,14 +123,14 @@ def test_a_frame_at_the_model_size_is_used_as_is(tmp_path):
 
 
 def test_a_frame_smaller_than_the_model_is_refused(tmp_path):
-    """Upsampling thermal would invent the texture the grid is guided by."""
+    """Verify frames smaller than model input dimensions are rejected."""
     path = _write_thermal(tmp_path / "small.png", (TINY_INPUT[0] // 2, TINY_INPUT[1] // 2))
     with pytest.raises(ValueError, match="does not upsample thermal"):
         read_thermal(path, TINY_INPUT)
 
 
 def test_the_uncertainty_ramp_is_fixed_not_per_image():
-    """The same value must give the same colour in two different frames."""
+    """Verify uncertainty color mapping uses a fixed scale across frames."""
     quiet = torch.full((1, 1, 4, 4), 1.0)
     loud = torch.full((1, 1, 4, 4), 1.0)
     loud[0, 0, 0, 0] = 9.0
@@ -186,11 +180,7 @@ def test_seeding_from_the_name_makes_a_frame_reproducible(tmp_path, bundle):
 
 
 def _stage_1(bundle, path, args, device=torch.device("cpu")):
-    """What `run_one` did before step 6 existed: read, one DINO pass, K members, render.
-
-    Kept as a separate, duplicated reference rather than calling `run_one(..., refiner=None)`,
-    because the thing being pinned is that the refiner-free path did not change at all.
-    """
+    """Reference stage 1 sampling helper without local refinement."""
     thermal = read_thermal(path, bundle.input_size).to(device)
     encoded = bundle.encoder.encode(thermal, return_attn=True)
     return sample_with_spread(
@@ -210,12 +200,12 @@ def _stage_1(bundle, path, args, device=torch.device("cpu")):
 
 
 def _png_bytes(directory: Path) -> dict:
-    """Every PNG in a directory, as raw bytes. PIL writes no timestamp, so these compare."""
+    """Read all PNG files in directory as raw byte mappings."""
     return {p.name: p.read_bytes() for p in sorted(directory.glob("*.png"))}
 
 
 def test_without_a_refiner_the_output_is_bit_identical_to_stage_1(tmp_path, bundle):
-    """`apply_refiner(..., None)` is an exact identity, so the default path must not move."""
+    """Verify unrefined output is identical to standalone stage 1 rendering."""
     path = _write_thermal(tmp_path / "plain.png", bundle.input_size)
     args = _args(save_mean=True, save_raw=True)
     out, refined, residual = run_one(bundle, path, torch.device("cpu"), args)
@@ -237,7 +227,7 @@ def test_without_a_refiner_the_output_is_bit_identical_to_stage_1(tmp_path, bund
 
 
 def test_with_a_refiner_the_images_change_and_the_maps_do_not(tmp_path, bundle):
-    """The spread stays the spread of the unrefined members (docs/conventions.md section 11)."""
+    """Verify refiner modifies rendered RGB while preserving uncertainty maps."""
     path = _write_thermal(tmp_path / "refined.png", bundle.input_size)
     args = _args(save_mean=True)
     refiner = wake_up(LocalRefiner(hidden_channels=4, num_blocks=1, kernel_size=3), std=0.5, seed=7)
@@ -267,8 +257,7 @@ def test_with_a_refiner_the_images_change_and_the_maps_do_not(tmp_path, bundle):
 
 
 def _save_refiner(path: Path, refiner: LocalRefiner, cfg: dict) -> Path:
-    """The pinned Stage 2 checkpoint, synthesized here: scripts/train_refiner.py is a separate
-    piece of work, and this file tests the script that *reads* one."""
+    """Synthesize and save a refiner checkpoint for inference testing."""
     torch.save(
         {
             "step": 5,
@@ -295,12 +284,7 @@ def _save_refiner(path: Path, refiner: LocalRefiner, cfg: dict) -> Path:
 def test_main_writes_the_same_maps_with_and_without_the_refiner(
     tmp_path, flow_checkpoint, monkeypatch
 ):
-    """The whole script, as a user runs it.
-
-    `main` writes the unrefined render to `--output` either way and puts the refined images in
-    an `refined/` subfolder, so switching step 6 on must leave the top level byte-identical and
-    add a folder whose image differs while its two uncertainty maps do not.
-    """
+    """Verify command-line execution produces consistent outputs with and without refiner."""
     frame = _write_thermal(tmp_path / "in" / "frame.png", TINY_INPUT)
     cfg = {"hidden_channels": 4, "num_blocks": 1, "kernel_size": 3}
     refiner = wake_up(LocalRefiner(**cfg), std=0.5, seed=7)

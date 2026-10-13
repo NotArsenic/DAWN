@@ -1,6 +1,4 @@
-"""
-dawn/data/color.py: sRGB <-> linear (docs/conventions.md section 1), luminance, CIELAB.
-"""
+"""Tests for sRGB and linear RGB colour conversions, luminance, and CIELAB transformations."""
 
 import pytest
 

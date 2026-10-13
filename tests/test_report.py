@@ -1,4 +1,4 @@
-"""dawn/data/report.py: final verdicts, the summary table and the stratified audit sample."""
+"""Tests for data pipeline reporting, stage summary tables, and stratified sampling."""
 
 import dataclasses
 
@@ -137,7 +137,7 @@ def test_summary_markdown_has_the_tables_the_thresholds_and_the_match_gate(world
     assert "| final pairs (manifests) | 1 | 1 | 1 | 3 |" in text
     assert "| scale | 1 | 0 | 0 | 1 |" in text
     assert "| near_duplicate | 0 | 1 | 0 | 1 |" in text
-    assert "max_match_dist_px: 40" in text  # the gate the plan does not state
+    assert "max_match_dist_px: 40" in text
     assert "min_lum_median: 0.1" in text and "max_hamming: 6" in text
     assert "homography" in text.lower()
     assert "\r" not in text

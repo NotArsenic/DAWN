@@ -1,4 +1,4 @@
-"""Training targets, the pixel mask and the token stats (docs/conventions.md section 5)."""
+"""Tests for training targets, pixel masking, and token statistics."""
 
 import pytest
 
@@ -113,7 +113,7 @@ def test_the_correction_target_is_the_masked_mean_of_true_minus_fitted_lightness
 
 
 def test_oracle_parts_reproduce_the_target_when_the_model_is_exact():
-    """Fit, render, compare: lightness exact by construction, colour limited by its resolution."""
+    """Verify oracle parts reproduce targets when model capacity matches."""
     layout, batch = tiny_layout(), _prepared()
     t = build_targets(batch["thermal"], batch["rgb"], batch["mask"], layout, FIT)
     settings = RenderSettings(layout, bgu_grid=(4, 8, 10))

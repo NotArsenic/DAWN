@@ -1,11 +1,4 @@
-"""The DINO encoder's contract: thermal in, tokens out, where LoRA landed, and the attention it
-hands on.
-
-Nothing here downloads weights. The backbone is randomly initialized and two blocks deep; every
-shape, the [CLS, 4 registers, patches] layout and the peft target names are the real ones, which
-is what the rest of the pipeline depends on. The tiny input is 64 x 80, a NON-square 4 x 5 patch
-grid, so a row/column mix-up cannot hide.
-"""
+"""Tests for DINO encoder feature extraction, token layout, LoRA adaptation, and attention."""
 
 import pytest
 
@@ -55,7 +48,7 @@ def test_attention_is_only_computed_when_asked_for(encoder, thermal):
 
 
 def test_attention_rows_sum_to_one_before_slicing(encoder, thermal):
-    """The raw softmax rows cover all 5 + N tokens; the patch block is renormalized after."""
+    """Verify raw attention softmax rows sum to one and normalized patch block sums to one."""
     full = encoder.last_layer_attention(thermal)
     assert full.shape == (2, 6, 5 + N, 5 + N)
     assert torch.allclose(full.sum(dim=-1), torch.ones(2, 6, 5 + N), atol=1e-5)
@@ -77,14 +70,11 @@ def test_attention_is_detached_from_the_encoder(encoder, thermal):
 
 
 def test_lora_on_and_off_give_identical_tokens_at_init(encoder, thermal):
-    """peft initializes B at zero, so the adapter is a bit-exact no-op before any step: thermal
-    through the adapters equals the SAME network's frozen pass on the same image."""
-    gray = thermal.expand(-1, 3, -1, -1)  # an RGB-shaped image with thermal's values
+    """Verify zero-initialized LoRA adapter is an exact identity at initialization."""
+    gray = thermal.expand(-1, 3, -1, -1)
     with torch.no_grad():
         adapted = encoder(thermal, return_attn=True)
         frozen_same_pixels = encoder.forward_frozen(gray, return_attn=True)
-    # forward_frozen preprocesses as sRGB, so it is NOT the thermal preprocessing: compare the
-    # adapter-off pass through the thermal path instead.
     with torch.no_grad(), encoder.backbone.disable_adapter():
         off = encoder(thermal, return_attn=True)
     assert torch.equal(adapted.patch_tokens, off.patch_tokens)
@@ -93,7 +83,7 @@ def test_lora_on_and_off_give_identical_tokens_at_init(encoder, thermal):
 
 
 def test_a_nonzero_adapter_changes_the_tokens(encoder, thermal):
-    """And the same comparison must fail once B is not zero, or the test above proves nothing."""
+    """Verify non-zero LoRA parameters alter output features."""
     target = next(param for name, param in encoder.named_parameters() if "lora_B" in name)
     with torch.no_grad():
         target.add_(0.05)
@@ -128,7 +118,7 @@ def test_encode_bundles_the_conditioning_tensors(encoder, thermal):
 
 
 def test_patch_map_is_the_row_major_reshape_of_the_tokens(encoder, thermal):
-    """Token n, DINO patch n and grid cell n must be the same region (conventions 2.3)."""
+    """Verify patch map retains row-major correspondence with output tokens."""
     bundle = encoder.encode(thermal, return_attn=False)
     tokens, patch_map = bundle["patch_tokens"], bundle["patch_map"]
     for y, x in ((0, 0), (0, GX - 1), (2, 3), (GY - 1, GX - 1)):
@@ -136,7 +126,7 @@ def test_patch_map_is_the_row_major_reshape_of_the_tokens(encoder, thermal):
 
 
 def test_a_marker_in_the_thermal_lands_in_the_right_row_major_token(encoder):
-    """Non-square: brighten ONE patch and check which token's features move most."""
+    """Verify spatial perturbations map to corresponding row-major tokens."""
     base = torch.full((1, 1, *TINY_INPUT), 0.4)
     marked = base.clone()
     marked[..., 16:32, 48:64] = 0.95  # patch row 1, patch column 3  -> token 1 * 5 + 3
@@ -160,7 +150,7 @@ def test_attention_bias_is_the_log_of_the_attention(encoder, thermal):
 
 
 def test_the_bias_of_zero_attention_is_finite():
-    """A zero-attention entry must not become -inf: a zero gate would then give NaN."""
+    """Verify zero attention values produce finite log-bias without NaNs."""
     bias = attention_to_bias(torch.zeros(1, 4, 4))
     assert torch.isfinite(bias).all()
     assert torch.allclose(bias, torch.full_like(bias, float(torch.log(torch.tensor(ATTN_FLOOR)))))
@@ -168,7 +158,7 @@ def test_the_bias_of_zero_attention_is_finite():
 
 
 def test_the_thermal_path_does_not_use_srgb(encoder):
-    """Thermal is camera codes, not light: no gamma. Only the RGB (L_align target) path has it."""
+    """Verify thermal preprocessing applies ImageNet normalization without sRGB transfer."""
     thermal = torch.rand(1, 1, *TINY_INPUT)
     processed = encoder._preprocess_thermal(thermal)
     expected = (thermal.expand(-1, 3, -1, -1) - encoder.imagenet_mean) / encoder.imagenet_std
@@ -182,7 +172,7 @@ def test_the_thermal_path_does_not_use_srgb(encoder):
 
 
 def test_the_rgb_path_is_srgb_encoded_not_linear(encoder):
-    """DINO is pretrained on sRGB; the L_align target must see it that way."""
+    """Verify RGB preprocessing applies sRGB conversion prior to normalization."""
     rgb = torch.rand(1, 3, *TINY_INPUT)
     processed = encoder._preprocess_rgb(rgb)
     expected = (linear_to_srgb(rgb) - encoder.imagenet_mean) / encoder.imagenet_std
@@ -193,8 +183,7 @@ def test_the_rgb_path_is_srgb_encoded_not_linear(encoder):
 
 
 def test_the_encoder_rejects_a_frame_of_the_wrong_size(encoder):
-    """A transposed frame gives the SAME token count, so without this it would silently
-    produce a scrambled geometry rather than fail. The channel counts are left to torch."""
+    """Verify encoder validates expected frame dimensions."""
     with pytest.raises(ValueError, match="64x80"):
         encoder(torch.rand(1, 1, 80, 64))
 
@@ -217,7 +206,7 @@ def test_only_lora_parameters_train(encoder):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_from_config_reads_the_encoder_section_of_flow_yaml(backend, thermal):
-    """Guards the config key names: a rename here is otherwise only caught on a GPU run."""
+    """Verify encoder instantiation from configuration dictionary."""
     pytest.importorskip("peft")
     pytest.importorskip(backend)
     cfg = load_configs()["encoder"] | {
@@ -235,7 +224,7 @@ def test_from_config_reads_the_encoder_section_of_flow_yaml(backend, thermal):
 
 
 def test_the_default_input_size_gives_the_plans_1280_tokens():
-    """The plan: 640x512 -> 40x32 = 1,280 patches (only the grid, no network is built)."""
+    """Verify default resolution produces expected patch grid dimensions."""
     cfg = load_configs()["encoder"]
     h, w = cfg["input_size"]
     assert (h // cfg["patch_size"], w // cfg["patch_size"]) == (32, 40)
@@ -243,7 +232,7 @@ def test_the_default_input_size_gives_the_plans_1280_tokens():
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_gradient_checkpointing_still_delivers_lora_gradients(backend, thermal):
-    """Reentrant checkpointing would drop them: the block inputs do not require grad."""
+    """Verify gradient checkpointing propagates gradients to LoRA parameters."""
     encoder = tiny_encoder(backend, grad_checkpointing=True)
     encoder.train()
     encoder(thermal).patch_tokens.square().mean().backward()
@@ -253,9 +242,7 @@ def test_gradient_checkpointing_still_delivers_lora_gradients(backend, thermal):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_checkpointed_backward_works_while_the_attention_is_captured(backend, thermal):
-    """The training step encodes with `return_attn=True` AND checkpointing. The recompute in the
-    backward pass must take the same attention path as the forward did, or torch raises a
-    CheckpointError about tensors with different metadata."""
+    """Verify gradient checkpointing backward pass operates with attention capture enabled."""
     encoder = tiny_encoder(backend, grad_checkpointing=True)
     encoder.train()
     out = encoder(thermal, return_attn=True)
@@ -267,8 +254,7 @@ def test_checkpointed_backward_works_while_the_attention_is_captured(backend, th
 
 
 def test_the_attention_with_and_without_the_capture_flag_gives_the_same_tokens(encoder, thermal):
-    """The last block always takes the explicit-softmax path, so asking for the attention cannot
-    change the features (it used to switch between a fused and an explicit kernel)."""
+    """Verify attention capture flag does not alter output token representations."""
     with torch.no_grad():
         plain = encoder(thermal).patch_tokens
         with_attn = encoder(thermal, return_attn=True).patch_tokens
@@ -276,7 +262,7 @@ def test_the_attention_with_and_without_the_capture_flag_gives_the_same_tokens(e
 
 
 def test_rope_position_augmentation_is_off(encoder, thermal):
-    """Two forwards of one image must agree, in train mode too, or L_align targets drift."""
+    """Verify deterministic forward passes without stochastic position augmentation."""
     encoder.train()
     try:
         with torch.no_grad():

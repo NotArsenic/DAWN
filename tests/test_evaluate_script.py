@@ -1,8 +1,5 @@
-"""scripts/evaluate.py: the plan's metric table, end to end on a tiny aligned tree.
+"""End-to-end evaluation pipeline and metrics reporting tests on a synthetic dataset tree."""
 
-Run against random weights, exactly as the flow phase was tested: this pins the plumbing and the
-report shape, not the quality of any model.
-"""
 
 import json
 import sys

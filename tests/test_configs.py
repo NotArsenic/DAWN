@@ -1,4 +1,4 @@
-"""Config sanity: the decided keys exist, and the debug overlay cannot silently do nothing."""
+"""Tests for configuration parsing, schema consistency, and overlay merges."""
 
 from pathlib import Path
 
@@ -93,23 +93,21 @@ def test_flow_config_has_the_decided_keys():
 
 def test_the_decided_values_hold():
     cfg = _load("flow.yaml")
-    assert cfg["brightness_correction"]["enabled"] is False  # off until the oracle sheet + GPU gate
+    assert cfg["brightness_correction"]["enabled"] is False
     assert cfg["grid"]["num_bins"] == 8 and cfg["grid"]["refine_steps"] == 1
     assert cfg["color"]["block"] == 4 and cfg["color"]["bin_step"] == 10
-    # The maintainer chose bilinear at Checkpoint A: the BGU ceiling is worse at every grid swept.
     assert cfg["color"]["upsample"] == "bilinear"
     assert (cfg["color"]["soft_k"], cfg["color"]["soft_sigma"]) == (5, 5.0)
     flow = cfg["flow"]
     assert (flow["velocity_weight"], flow["render_weight"]) == (1.0, 0.1)
     assert (flow["align_weight"], flow["color_weight"]) == (0.5, 0.2)
-    # 20K steps (~90 passes over ~3,660 pairs; 40K would be ~175) with a 3K-step detach warmup.
     assert flow["num_train_steps"] == 20000 and flow["warmup_steps"] == 3000
     assert flow["timesteps_per_image"] == 4 and flow["num_inference_steps"] == 2
-    assert flow["segment_balance"] == "per_value"  # a stated choice, see flow.yaml
+    assert flow["segment_balance"] == "per_value"
     assert cfg["optim"]["batch_size"] == 16 and cfg["optim"]["precision"] == "bf16"
     assert (
         cfg["optim"]["lr_warmup_steps"] == 1000
-    )  # the optimizer's warmup is not flow.warmup_steps
+    )
 
 
 def test_flow_config_records_the_pair_policy():
@@ -230,12 +228,7 @@ def test_the_correction_overlay_widens_the_token_and_the_overfit_overlay_keeps_t
 
 
 def test_the_refiner_config_adds_one_section_and_otherwise_only_overrides():
-    """`refiner.yaml` is a stage-2 CONFIG, not an overlay, so it is not in `OVERLAYS`.
-
-    It is merged as `flow.yaml + data.yaml + refiner.yaml`, so the same trap applies: a key that
-    exists nowhere else is a typo that silently does nothing. The one thing it may legitimately
-    add is its own `refiner:` section.
-    """
+    """Verify refiner config only introduces the refiner section and valid overrides."""
     base = {**_load("flow.yaml"), **_load("data.yaml")}
     stray = [
         ".".join(p)
@@ -247,8 +240,7 @@ def test_the_refiner_config_adds_one_section_and_otherwise_only_overrides():
 
 
 def test_the_refiner_config_matches_the_plans_architecture_and_loss():
-    """The plan: two depthwise-separable 5x5 blocks, width 24, L + 0.1 tanh(residual),
-    256x256 crops, L1 + 0.01 * |residual|."""
+    """Verify refiner architecture, receptive field, and loss configurations."""
     refiner = _load("refiner.yaml")["refiner"]
     assert (refiner["hidden_channels"], refiner["num_blocks"]) == (24, 2)
     assert refiner["kernel_size"] == 5
@@ -261,24 +253,17 @@ def test_the_two_stages_log_to_different_projects_under_one_entity():
     flow, refiner = _load("flow.yaml")["logging"], _load("refiner.yaml")["logging"]
     assert flow["wandb_entity"] == "my-team"
     assert (flow["wandb_project"], refiner["wandb_project"]) == ("dawn", "dawn-refiner")
-    # The entity is inherited through the merge, never repeated: one place to change it.
     assert "wandb_entity" not in refiner
 
 
 def test_the_5090_overlay_spends_its_headroom_on_timesteps_not_on_the_batch():
-    """32 GB buys velocity samples per optimizer step, not fewer optimizer steps.
-
-    Raising `optim.batch_size` instead would cut steps-per-epoch on a 3,662-pair training set
-    until the budget no longer clears `flow.warmup_steps`
-    (docs/training_budget_and_changes.md section 1).
-    """
+    """Verify 5090 hardware overlay scales timesteps per image while keeping batch size fixed."""
     base, gpu = _merged(), _merged("gpu_5090.yaml")
     assert gpu["flow"]["timesteps_per_image"] > base["flow"]["timesteps_per_image"]
     assert gpu["optim"]["batch_size"] == base["optim"]["batch_size"]
     for key in ("num_train_steps", "warmup_steps", "warmup_ramp_steps"):
         assert gpu["flow"][key] == base["flow"][key], "step counts stay put when the batch does"
     assert gpu["optim"]["precision"] == "bf16" and gpu["encoder"]["input_size"] == [512, 640]
-    # L_render would otherwise double with the timesteps; the subset keeps it at its old cost.
     subset = gpu["flow"]["render_subset"]
     assert subset == base["optim"]["batch_size"] * base["flow"]["timesteps_per_image"]
 
@@ -286,7 +271,6 @@ def test_the_5090_overlay_spends_its_headroom_on_timesteps_not_on_the_batch():
 def test_the_validation_resolution_and_selection_metric_are_the_decided_ones():
     log = _load("flow.yaml")["logging"]
     steps = _load("flow.yaml")["flow"]["num_train_steps"]
-    # 8 validation points over a 20K-step run was not enough to see a divergence begin.
     assert steps / log["val_every"] >= 40
     assert log["select_metric"] == "ciede2000"  # the full Lab difference, not L* alone
     assert log["watch_scope"] == "velocity" and log["watch_freq"] == 500
@@ -294,7 +278,7 @@ def test_the_validation_resolution_and_selection_metric_are_the_decided_ones():
 
 
 def test_the_schedule_defaults_stay_on_the_baseline():
-    """One cycle and the cosine floor are opt-in: the baseline run must be the plan's schedule."""
+    """Verify learning rate schedule and decay defaults for the baseline run."""
     optim = _load("flow.yaml")["optim"]
     assert optim["schedule"] == "cosine"
     assert optim["cosine"]["min_factor"] == 0.0
@@ -317,11 +301,7 @@ def test_the_old_regime_configs_are_gone():
 
 
 def test_the_fast_overlay_rescales_every_step_denominated_knob_together():
-    """The rescaling trap: a shorter budget that forgot one of these is a different experiment.
-
-    The SHAPE of the schedule must survive -- the detach still lifting at ~15% of the run, the
-    LR warmup at ~5% -- or the short run is not a shorter version of the long one.
-    """
+    """Verify the fast overlay proportionally rescales step-denominated parameters."""
     full, fast = _merged("gpu_5090.yaml"), _merged("gpu_5090.yaml", "fast.yaml")
     ratio = fast["flow"]["num_train_steps"] / full["flow"]["num_train_steps"]
     assert 0 < ratio < 1, "fast.yaml must actually shorten the budget"
@@ -337,14 +317,13 @@ def test_the_fast_overlay_rescales_every_step_denominated_knob_together():
 
 
 def test_the_fast_overlay_keeps_the_budget_clear_of_its_own_warmup():
-    """Below ~2x the warmup the conditioning detach eats the run (trainer warns, then wastes it)."""
+    """Verify fast overlay total train steps exceed the warmup phase."""
     fast = _merged("gpu_5090.yaml", "fast.yaml")["flow"]
     assert fast["num_train_steps"] > 4 * fast["warmup_steps"]
 
 
 def test_the_fast_overlay_cuts_time_without_touching_the_batch():
-    """Total work per epoch is independent of batch size and linear in timesteps, so the batch
-    is NOT the lever and raising it only costs optimizer steps."""
+    """Verify fast overlay reduces timesteps without modifying batch size or learning rate."""
     full, fast = _merged("gpu_5090.yaml"), _merged("gpu_5090.yaml", "fast.yaml")
     assert fast["optim"]["batch_size"] == full["optim"]["batch_size"]
     assert fast["optim"]["lr"] == full["optim"]["lr"]  # no LR rescale needed if the batch is fixed
@@ -352,13 +331,13 @@ def test_the_fast_overlay_cuts_time_without_touching_the_batch():
 
 
 def test_the_fast_overlay_must_be_applied_after_the_hardware_one():
-    """It puts timesteps_per_image back, so the order in the override list is load-bearing."""
+    """Verify overlay merge order preserves expected parameters when combining overlays."""
     assert _merged("fast.yaml", "gpu_5090.yaml")["flow"]["timesteps_per_image"] == 8
     assert _merged("gpu_5090.yaml", "fast.yaml")["flow"]["timesteps_per_image"] == 4
 
 
 def test_the_shipped_campaign_defaults_to_one_stage_1_run():
-    """A project ships a model; the ablations are research and are parked behind --ablations."""
+    """Verify experiments configuration defaults to the baseline run with ablations separated."""
     cfg = _load("experiments.yaml")
     assert [r["name"] for r in cfg["runs"]] == ["baseline"]
     assert not cfg["runs"][0].get("overrides"), "the baseline is the plain configuration"
@@ -367,7 +346,7 @@ def test_the_shipped_campaign_defaults_to_one_stage_1_run():
 
 
 def test_every_parked_ablation_still_moves_exactly_one_knob():
-    """They are parked, not abandoned: the rule has to hold whenever one is finally run."""
+    """Verify each ablation experiment modifies exactly one configuration variable."""
     from pathlib import Path
 
     repo = Path(__file__).resolve().parents[1]

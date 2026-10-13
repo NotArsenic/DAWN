@@ -1,12 +1,4 @@
-"""The training campaign: the plan it builds, what counts as finished, and whether gates gate.
-
-`scripts/run_pipeline.py` launches days of GPU time unattended, so the failure that matters is
-not a crash -- it is a campaign that quietly runs the wrong thing, skips a stage it should have
-resumed, or carries on past a gate whose whole job was to stop it. Everything here is about those.
-
-No torch, no GPU, no training: the module is subprocess orchestration and CSV reading, and the
-one test that actually executes a stage runs `python -c` rather than anything in `scripts/`.
-"""
+"""Tests for pipeline planning, stage execution, gates, and campaign state management."""
 
 import json
 
@@ -84,7 +76,7 @@ def _plan(tmp_path, **kwargs):
 
 
 def _write_val_csv(out_dir, rows, subset="box_aligned"):
-    """A `metrics/val_<subset>.csv` shaped exactly as `CsvLog` writes one."""
+    """Write synthetic validation metrics CSV file."""
     directory = out_dir / "metrics"
     directory.mkdir(parents=True, exist_ok=True)
     prefix = f"val_{subset}/"
@@ -99,14 +91,14 @@ def _write_val_csv(out_dir, rows, subset="box_aligned"):
 
 
 def test_the_default_plan_is_the_essentials_and_leaves_the_ablations_parked(tmp_path):
-    """A project needs a model, not a study: gates, ONE stage-1 run, stage 2, evaluation."""
+    """Verify default plan contains gates, baseline run, refiner, and evaluation."""
     stages = _plan(tmp_path)
     assert [s.name for s in stages] == ["oracle", "gpu_probe", "baseline", "refiner", "evaluation"]
     assert [s.kind for s in stages] == [GATE, GATE, TRAIN, REFINER, EVAL]
 
 
 def test_ablations_are_opt_in_and_come_after_the_baseline(tmp_path):
-    """The order IS the dependency: everything is read against `baseline`, so it goes first."""
+    """Verify ablation stages are scheduled after baseline."""
     names = [s.name for s in _plan(tmp_path, include_ablations=True)]
     assert names == ["oracle", "gpu_probe", "baseline", "one_cycle", "refiner", "evaluation"]
     assert names.index("baseline") < names.index("one_cycle")
@@ -121,7 +113,7 @@ def test_every_run_gets_the_common_overrides_and_its_own_directory(tmp_path):
 
 
 def test_an_ablation_adds_exactly_one_overlay_to_the_baseline(tmp_path):
-    """The campaign's one rule. Two knobs in a run makes its result unattributable."""
+    """Verify ablation stages add exactly one override to baseline command."""
     stages = {s.name: s for s in _plan(tmp_path, include_ablations=True)}
     baseline = set(stages["baseline"].command)
     extra = [c for c in stages["one_cycle"].command if c.endswith(".yaml") and c not in baseline]
@@ -129,22 +121,21 @@ def test_an_ablation_adds_exactly_one_overlay_to_the_baseline(tmp_path):
 
 
 def test_a_gate_that_trains_still_gets_the_campaigns_overrides(tmp_path):
-    """The probe must measure the configuration that will actually run, overlays included."""
+    """Verify hardware probe gate includes common campaign overlays."""
     probe = {s.name: s for s in _plan(tmp_path)}["gpu_probe"]
     assert "configs/gpu_5090.yaml" in probe.command and "configs/gpu_probe.yaml" in probe.command
     assert probe.command[probe.command.index("--out-dir") + 1].endswith("runs/gpu_probe")
 
 
 def test_the_essentials_still_include_stage_2_and_evaluation(tmp_path):
-    """Dropping the ablations must not drop the things that produce a shippable result."""
+    """Verify default plan preserves refiner and evaluation stages."""
     names = [s.name for s in _plan(tmp_path)]
     assert "baseline" in names and "one_cycle" not in names
     assert "refiner" in names and "evaluation" in names
 
 
 def test_a_summary_still_shows_an_ablation_somebody_ran_once(tmp_path):
-    """Results are read with ablations included whatever the plan was built with, or a row
-    would vanish from the table the moment the default stopped including it."""
+    """Verify completed ablation stages remain visible in summary results."""
     from dawn.pipeline import stage_one_runs
 
     assert {r["name"] for r in stage_one_runs(CAMPAIGN)} == {"baseline", "one_cycle"}
@@ -157,7 +148,7 @@ def test_no_gates_drops_only_the_gates(tmp_path):
 
 
 def test_the_evaluation_command_is_empty_until_a_winner_is_known(tmp_path):
-    """It cannot be built in advance: which checkpoint wins depends on every run's curve."""
+    """Verify evaluation command is constructed dynamically after selecting winner."""
     evaluation = {s.name: s for s in _plan(tmp_path)}["evaluation"]
     assert evaluation.command == ()
     built = evaluation_command(tmp_path / "flow_best.pt", tmp_path / "out", CAMPAIGN, "cuda")
@@ -168,8 +159,7 @@ def test_the_evaluation_command_is_empty_until_a_winner_is_known(tmp_path):
 
 
 def test_a_finished_run_is_skipped_and_a_half_finished_one_is_resumed(tmp_path):
-    """The property an overnight campaign lives on: dying at 4 a.m. must not cost
-    the runs that already finished."""
+    """Verify finished stages are skipped and interrupted runs are resumed."""
     stages = {s.name: s for s in _plan(tmp_path)}
     baseline = stages["baseline"]
     assert not baseline.is_done() and not baseline.can_resume()
@@ -197,7 +187,7 @@ def test_a_partial_run_resumes_from_its_own_checkpoint(tmp_path):
 
 
 def test_a_stage_with_no_done_files_never_counts_as_finished(tmp_path):
-    """The smoke test writes nothing, so it must re-run rather than be silently skipped."""
+    """Verify stages without output marker files are not marked as completed."""
     assert not Stage(name="smoke", kind=GATE, command=("x",)).is_done()
 
 
@@ -228,7 +218,7 @@ def test_a_missing_oracle_report_fails_the_gate_rather_than_passing_it(tmp_path)
 
 
 def test_the_overfit_gate_compares_the_run_against_its_own_oracle(tmp_path):
-    """Not an absolute dB bar: the question is whether the model approached the ceiling it had."""
+    """Verify overfit gate evaluates metric relative to oracle baseline."""
     out = tmp_path / "overfit"
     check = {
         "kind": "val_metric",
@@ -273,7 +263,7 @@ def test_a_stage_with_no_check_passes_on_its_exit_code(tmp_path):
 
 
 def test_the_probe_rescales_the_training_estimates_but_not_the_gates(tmp_path):
-    """Gates are short and dominated by data loading, so the step time does not scale them."""
+    """Verify hardware probe scaling applies to training runs without scaling gates."""
     stages = _plan(tmp_path)
     slow = rescale_hours(stages, measured=2.8, reference=1.4)
     quick = rescale_hours(stages, measured=1.4, reference=1.4)
@@ -282,8 +272,7 @@ def test_the_probe_rescales_the_training_estimates_but_not_the_gates(tmp_path):
 
 
 def test_an_unmeasured_probe_costs_the_real_step_count_at_the_reference_rate(tmp_path):
-    """`--list` before anything has run still has to respond to a budget overlay, so the step
-    count is used even when the step TIME is still the reference guess."""
+    """Verify unmeasured stage hour estimates are derived from step counts."""
     stages = _plan(tmp_path)
     baseline = next(s for s in stages if s.name == "baseline")
     assert baseline.steps == 20000, "read from the real configs/flow.yaml"
@@ -338,7 +327,7 @@ def test_the_winner_is_the_best_ciede2000_with_a_checkpoint_on_disk(tmp_path):
 
 
 def test_a_run_without_a_checkpoint_cannot_win(tmp_path):
-    """A curve with no `flow_best.pt` is a crashed run, not a candidate."""
+    """Verify runs missing checkpoint files cannot be selected as winner."""
     root = tmp_path / "runs"
     _write_val_csv(root / "baseline", [{"step": 1, "ciede2000/euler": 4.0}])
     for marker in ("flow_best.pt", "flow_last.pt"):
@@ -384,7 +373,7 @@ def test_state_round_trips_and_an_absent_file_is_an_empty_campaign(tmp_path):
 
 
 def test_running_a_stage_captures_its_output_and_its_exit_code(tmp_path):
-    """Executes a real subprocess, but `python -c`, never anything that trains."""
+    """Verify stage subprocess execution captures stdout and return code."""
     ok = Stage("ok", GATE, ("-c", "print('hello from the stage')"))
     result = run_stage(ok, tmp_path, tmp_path / "logs", echo=False)
     assert result.status == "ok" and result.ok
@@ -396,8 +385,7 @@ def test_running_a_stage_captures_its_output_and_its_exit_code(tmp_path):
 
 
 def test_the_shipped_campaign_names_real_configs_and_one_knob_per_ablation():
-    """The real configs/experiments.yaml, not a fixture: a typo'd overlay path would otherwise
-    only surface hours into an overnight run."""
+    """Verify configuration files referenced in experiments.yaml exist on disk."""
     from pathlib import Path
 
     repo = Path(__file__).resolve().parents[1]
@@ -451,7 +439,7 @@ def test_the_preflight_passes_once_the_data_phase_has_really_run(tmp_path):
 
 
 def test_committed_manifests_without_the_aligned_pngs_are_caught(tmp_path):
-    """The exact state of a fresh clone: manifests are in git, the 5,385 PNGs are not."""
+    """Verify preflight detects missing aligned images when manifests exist."""
     from dawn.pipeline import preflight_data
 
     _manifests(tmp_path)
@@ -467,7 +455,7 @@ def test_a_missing_manifest_names_the_command_that_writes_it(tmp_path):
 
 
 def test_a_half_written_aligned_tree_is_caught(tmp_path):
-    """`write` interrupted partway leaves ids with some of their five PNGs and not others."""
+    """Verify preflight detects incomplete image asset sets."""
     from dawn.pipeline import preflight_data
 
     _manifests(tmp_path)
@@ -485,7 +473,7 @@ def test_an_empty_manifest_is_not_mistaken_for_a_finished_one(tmp_path):
 
 
 def test_the_evaluation_stage_looks_for_the_file_evaluate_py_actually_writes(tmp_path):
-    """`evaluate.py` writes summary.json. A wrong marker here would silently re-run it forever."""
+    """Verify evaluation stage completion marker matches evaluate script output."""
     import re
     from pathlib import Path
 
@@ -506,7 +494,7 @@ def _repo():
 
 
 def test_a_stages_step_count_comes_from_its_own_merged_config(tmp_path):
-    """Not from the estimate in experiments.yaml: an overlay may change the budget."""
+    """Verify stage step counts are computed from merged configuration overlays."""
     from dawn.pipeline import resolve_steps
 
     full = resolve_steps(_repo(), ["configs/gpu_5090.yaml"], ("train_flow.py",))
@@ -536,7 +524,7 @@ def test_an_unreadable_overlay_falls_back_instead_of_crashing_the_plan():
 
 
 def test_extra_overrides_go_last_so_they_win(tmp_path):
-    """`--extra-override configs/fast.yaml` has to beat configs/gpu_5090.yaml."""
+    """Verify extra command-line overrides take precedence over default overlays."""
     stages = {
         s.name: s
         for s in build_plan(CAMPAIGN, root=tmp_path, repo=_repo(), extra_overrides=["b.yaml"])
@@ -546,7 +534,7 @@ def test_extra_overrides_go_last_so_they_win(tmp_path):
 
 
 def test_two_common_overrides_do_not_break_a_gates_command(tmp_path):
-    """Regression: this was `list.insert(i, *common)`, which only worked for exactly one."""
+    """Verify multiple common overrides are correctly positioned in gate commands."""
     stages = {
         s.name: s
         for s in build_plan(CAMPAIGN, root=tmp_path, repo=_repo(), extra_overrides=["b.yaml"])
@@ -570,7 +558,7 @@ def test_hours_are_costed_from_the_real_step_count(tmp_path):
 
 
 def test_a_shorter_budget_shows_as_fewer_hours_before_the_probe_has_run(tmp_path):
-    """The whole point of reading the step count: --list must respond to the overlay."""
+    """Verify duration estimates reflect shortened training budgets."""
     stages = [Stage("a", TRAIN, ("x",), hours=8.0, steps=20000)]
     shorter = [Stage("a", TRAIN, ("x",), hours=8.0, steps=12000)]
     assert rescale_hours(shorter, 0.0, 1.4)["a"] < rescale_hours(stages, 0.0, 1.4)["a"]
@@ -580,8 +568,7 @@ def test_a_shorter_budget_shows_as_fewer_hours_before_the_probe_has_run(tmp_path
 
 
 def test_only_pulls_a_parked_ablation_into_the_plan(tmp_path):
-    """`--only correction` is documented in four places; without this it hard-errors, because
-    `select()` validates names against a plan the ablations were never added to."""
+    """Verify stage selection includes specified ablation runs."""
     import argparse
 
     from scripts.run_pipeline import select
@@ -593,7 +580,7 @@ def test_only_pulls_a_parked_ablation_into_the_plan(tmp_path):
 
 
 def test_only_requires_at_least_one_name():
-    """A bare `--only` used to parse as [] and mean 'run everything' -- a two-day job."""
+    """Verify only flag requires at least one stage name argument."""
     import subprocess
     import sys
 
@@ -605,7 +592,7 @@ def test_only_requires_at_least_one_name():
 
 
 def test_the_winner_is_scoped_to_the_runs_that_were_planned(tmp_path):
-    """Otherwise the essentials campaign ships a parked ablation left over from an older run."""
+    """Verify winning run selection is restricted to planned stages when specified."""
     root = tmp_path / "runs"
     for name, delta in (("baseline", 4.0), ("one_cycle", 3.0)):
         _write_val_csv(root / name, [{"step": 1, "ciede2000/euler": delta}])
@@ -616,8 +603,7 @@ def test_the_winner_is_scoped_to_the_runs_that_were_planned(tmp_path):
 
 
 def test_an_unfinished_run_cannot_win(tmp_path):
-    """`flow_best.pt` is rewritten at every validation, so an aborted run has one -- and the
-    best of a 1,000-step curve can beat a finished run."""
+    """Verify aborted runs lacking final checkpoint markers cannot win."""
     root = tmp_path / "runs"
     _write_val_csv(root / "baseline", [{"step": 20000, "ciede2000/euler": 4.0}])
     (root / "baseline" / "flow_best.pt").write_bytes(b"x")
@@ -628,7 +614,7 @@ def test_an_unfinished_run_cannot_win(tmp_path):
 
 
 def test_the_summary_table_is_valid_markdown(tmp_path):
-    """GFM drops the whole block when the delimiter row does not match the header."""
+    """Verify summary table conforms to markdown table column structure."""
     root = tmp_path / "runs"
     _write_val_csv(root / "baseline", [{"step": 1, "ciede2000/euler": 4.0}])
     lines = summary_table(CAMPAIGN, root).splitlines()
@@ -637,7 +623,7 @@ def test_the_summary_table_is_valid_markdown(tmp_path):
 
 
 def test_a_duplicated_run_name_is_refused(tmp_path):
-    """Un-parking by COPYING into runs: would give two stages one output directory."""
+    """Verify duplicate run names across runs and ablations raise an error."""
     from dawn.pipeline import stage_one_runs
 
     clashing = {**CAMPAIGN, "runs": CAMPAIGN["runs"] + [{"name": "one_cycle", "overrides": []}]}
@@ -646,8 +632,7 @@ def test_a_duplicated_run_name_is_refused(tmp_path):
 
 
 def test_a_gate_resolves_its_own_overlays_step_count(tmp_path):
-    """configs/overfit_gpu.yaml sets 3,000 steps; costing it from the campaign's overrides
-    alone resolved it to the baseline's 20,000."""
+    """Verify command overrides extract override arguments from gate commands."""
     from dawn.pipeline import command_overrides
 
     command = ["scripts/train_flow.py", "--override", "a.yaml", "b.yaml", "--device", "cuda"]
@@ -656,14 +641,13 @@ def test_a_gate_resolves_its_own_overlays_step_count(tmp_path):
 
 
 def test_a_non_training_gate_has_no_step_count(tmp_path):
-    """smoke_dino and the oracle do not train, so a step count for them is meaningless."""
+    """Verify non-training gates have zero step counts."""
     stages = {s.name: s for s in _plan(tmp_path, include_gates=True)}
     assert stages["oracle"].steps == 0
 
 
 def test_the_refiner_does_not_inherit_a_stage_1_budget_overlay(tmp_path):
-    """train_refiner.py merges --override AFTER configs/refiner.yaml, so configs/fast.yaml
-    would rewrite stage 2's LR warmup and checkpoint spacing but not its step count."""
+    """Verify stage 1 budget overrides do not propagate to stage 2 refiner."""
     stages = {
         s.name: s
         for s in build_plan(
@@ -676,7 +660,7 @@ def test_the_refiner_does_not_inherit_a_stage_1_budget_overlay(tmp_path):
 
 
 def test_the_refiners_check_is_advisory_and_a_gates_is_not():
-    """"The refiner did not earn its place" is a result; halting would skip the evaluation."""
+    """Verify blocking status distinction between gates and advisory refiner checks."""
     from dawn.pipeline import is_blocking
 
     assert is_blocking(Stage("overfit", GATE, ("x",), check={"kind": "val_metric"}))
@@ -685,7 +669,7 @@ def test_the_refiners_check_is_advisory_and_a_gates_is_not():
 
 
 def test_the_shipped_refiner_check_does_not_block_the_campaign():
-    """The most likely single outcome of the night must not destroy the deliverable."""
+    """Verify refiner check in experiments.yaml is configured as non-blocking."""
     from pathlib import Path
 
     import omegaconf

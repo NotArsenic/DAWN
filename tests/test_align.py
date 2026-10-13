@@ -1,8 +1,4 @@
-"""dawn/data/align.py: box matching, similarity / homography fits, acceptance, warp and masks.
-
-The conventions under test (docs/conventions.md section 10): pixel-index coordinates (x = column,
-y = row), transforms map thermal onto RGB, the shift is the displacement of the frame centre.
-"""
+"""Tests for box matching, similarity and homography fitting, acceptance gates, and warp masks."""
 
 import math
 from pathlib import Path
@@ -22,12 +18,11 @@ from tests.fake_dronevehicle import similarity  # noqa: E402
 H, W = 512, 640
 SIZE = (H, W)
 CFG = align.AlignConfig()
-# The edge-check tests exercise the mechanics with the plan's original strict thresholds, not the
-# relaxed ones data.yaml ships (gain >= 0, best shift <= 1 px).
 EDGE_CFG = align.AlignConfig(grad_min_gain=0.0, grad_max_best_shift_px=1)
 
 
 def rect(cx, cy, w=22.0, h=12.0, cat="car") -> Box:
+    """Construct a rectangular Box centered at coordinates."""
     return Box(
         cat,
         (
@@ -41,12 +36,13 @@ def rect(cx, cy, w=22.0, h=12.0, cat="car") -> Box:
 
 
 def moved(box: Box, T: np.ndarray) -> Box:
+    """Transform box vertices using affine transform matrix."""
     pts = align.apply_transform(T, box.vertices)
     return Box(box.category, tuple(map(tuple, pts)), box.kind)
 
 
 def spread(n: int, cat="car") -> list[Box]:
-    """`n` well-separated RGB boxes spread over the frame (deterministic)."""
+    """Generate separated bounding boxes across the frame for testing."""
     rng = np.random.default_rng(0)
     cols = int(math.ceil(n / 3))
     out = []
@@ -63,7 +59,7 @@ def spread(n: int, cat="car") -> list[Box]:
 
 
 def assert_same_map(fit, T, tol_px=0.5):
-    """`fit` and `T` move a grid of points over the frame to within `tol_px` of each other."""
+    """Assert that two transforms map coordinates to within a pixel tolerance."""
     xs, ys = np.meshgrid(np.linspace(0, 640, 9), np.linspace(0, 512, 7))
     pts = np.stack([xs.ravel(), ys.ravel()], axis=1)
     err = np.abs(align.apply_transform(fit, pts) - align.apply_transform(T, pts)).max()
@@ -71,7 +67,7 @@ def assert_same_map(fit, T, tol_px=0.5):
 
 
 def pulled(rgb_boxes, T):
-    """The thermal boxes that `T` (thermal -> RGB) maps onto `rgb_boxes`."""
+    """Transform bounding boxes using the inverse of a spatial transform."""
     inv = np.linalg.inv(T)
     return [moved(b, inv) for b in rgb_boxes]
 
@@ -88,11 +84,11 @@ def test_config_reads_the_align_section_of_data_yaml():
     assert cfg.copy_tol_px == 0.5
     assert cfg.exclude_copied_boxes is True
     assert (cfg.min_matches, cfg.min_inlier_ratio) == (6, 0.6)
-    assert cfg.grad_min_gain == -0.2  # relaxed from the plan's 0.0 by the maintainer
+    assert cfg.grad_min_gain == -0.2
     assert (cfg.max_median_residual_px, cfg.max_scale_deviation) == (2.0, 0.05)
     assert (cfg.max_rotation_deg, cfg.max_shift_px) == (2.0, 30.0)
     assert (cfg.homography_min_matches, cfg.grad_search_px) == (10, 4)
-    assert cfg.grad_max_best_shift_px == 3  # relaxed from the plan's 1 by the maintainer
+    assert cfg.grad_max_best_shift_px == 3
     assert (cfg.moving_min_residual_px, cfg.moving_dilate_px) == (4, 3)
 
 

@@ -1,13 +1,4 @@
-"""Loading a trained checkpoint for inference (dawn/flow/inference.py).
-
-The rule this pins is docs/conventions.md section 5.1: the stats come out of the CHECKPOINT. A
-run that read `grid.stats_cache` instead would unstandardize with whatever the cache happens to
-hold today, which is a silent, plausible-looking wrongness rather than a crash.
-
-Stage 2 is a separate run with a separate checkpoint, so `load_refiner` is tested separately
-too, including that the two loaders refuse each other's files: a Stage 1 checkpoint has no
-`refiner` in it, and handing one over has to say so rather than build a random refiner.
-"""
+"""Tests for loading flow model and refiner checkpoints for inference."""
 
 import pytest
 
@@ -70,7 +61,7 @@ def test_round_trip_gives_back_the_layout_stats_and_sizes(tmp_path, correction):
 
 
 def test_the_stats_come_from_the_checkpoint_not_the_cache(tmp_path):
-    """Two checkpoints with different stats must load as different stats, same config."""
+    """Verify statistics are loaded directly from checkpoint state rather than external cache."""
     trainer, path = _saved(tmp_path)
     bumped = trainer.state_dict()
     bumped["stats"] = {
@@ -97,7 +88,7 @@ def test_weights_match_the_trainer_and_the_models_are_frozen(tmp_path):
 
 
 def test_use_ema_applies_the_shadow_and_changes_the_weights(tmp_path):
-    """After a step the EMA shadow is not the live weights, so the two loads must differ."""
+    """Verify loading with EMA applies shadow parameters over active model weights."""
     trainer, path = _saved(tmp_path, steps=2)
     live = load_checkpoint(path, "cpu", use_ema=False)
     ema = load_checkpoint(path, "cpu", use_ema=True)
@@ -132,7 +123,7 @@ def test_a_file_that_is_not_a_dawn_checkpoint_is_a_clear_error(tmp_path):
 
 
 def test_the_bundle_renders_through_sample_with_spread(tmp_path, correction):
-    """End to end on the loaded bundle: encode, K samples, maps, at the checkpoint's own size."""
+    """Verify sampling and uncertainty map generation with loaded model bundle."""
     from dawn.uncertainty.spread import sample_with_spread
 
     _, path = _saved(tmp_path, correction)
@@ -164,16 +155,12 @@ def test_the_bundle_renders_through_sample_with_spread(tmp_path, correction):
 
 
 def _refiner(**updates) -> LocalRefiner:
-    """A tiny refiner whose zero-initialized head has been perturbed: "a step happened"."""
+    """Generate a synthetic refiner model with non-zero initialized parameters."""
     return wake_up(LocalRefiner(**{**REFINER_CFG, **updates}), std=0.2, seed=4)
 
 
 def _shadow(refiner: LocalRefiner, offset: float = 1.0, prefix: str = "refiner.") -> dict:
-    """The EMA shadow the Stage 2 trainer writes: float32, keyed `refiner.<param>`.
-
-    `offset` is what separates the average from the live weights here, so a load that forgot to
-    apply the shadow cannot pass by accident.
-    """
+    """Synthesize an EMA shadow dictionary for refiner parameters."""
     return {
         f"{prefix}{name}": param.detach().clone().float() + offset
         for name, param in refiner.named_parameters()
@@ -181,11 +168,7 @@ def _shadow(refiner: LocalRefiner, offset: float = 1.0, prefix: str = "refiner."
 
 
 def _save_refiner(path, refiner: LocalRefiner, shadow=None, step: int = 11):
-    """The pinned Stage 2 checkpoint, built here rather than by running the Stage 2 trainer.
-
-    Synthesized on purpose: this file tests the loader, and depending on `scripts/train_refiner.py`
-    would make a loader bug and a trainer bug fail the same test.
-    """
+    """Save a synthetic refiner checkpoint to disk for loader verification."""
     torch.save(
         {
             "step": step,
@@ -241,7 +224,7 @@ def test_the_refiner_ema_shadow_is_applied_only_when_asked(tmp_path):
 
 
 def test_a_refiner_checkpoint_without_a_usable_shadow_says_so(tmp_path):
-    """Asking for the average and silently getting the live weights is the bad outcome."""
+    """Verify error handling when loading refiner with EMA shadow missing or mismatched."""
     refiner = _refiner()
     empty = _save_refiner(tmp_path / "no_ema.pt", refiner, shadow={})
     with pytest.raises(ValueError, match="no EMA shadow"):

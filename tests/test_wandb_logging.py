@@ -1,14 +1,4 @@
-"""The run-logging plumbing of `dawn.runlog`: Weights & Biases, and the local mirrors it fronts.
-
-wandb is an optional dependency and is not installed in CI, so a fake module stands in. These
-tests exist because `WandbRun` is otherwise only exercised by a real training run: a typo in it
-surfaces at the start of an overnight job, not here. The same goes for the two settings that
-decide *where* a run lands -- `wandb_project` and `wandb_entity` -- whose failure mode is a run
-that trains perfectly well into the wrong workspace.
-
-`dawn.runlog` is shared by both training stages, so nothing here imports torch except the one
-test that the stage-1 script still re-exports the names older code imports from it.
-"""
+"""Tests for Weights & Biases telemetry integration and local log mirroring in dawn.runlog."""
 
 import json
 import logging
@@ -55,7 +45,7 @@ def fake_wandb(monkeypatch):
 
 
 def _cfg(mode="online", scope="velocity", freq=500, **logging_extra):
-    """The `logging` section `WandbRun` reads. `wandb_entity` is absent unless asked for."""
+    """Return sample logging configuration for WandbRun tests."""
     cfg = {
         "logging": {
             "wandb_project": "dawn",
@@ -108,17 +98,13 @@ def test_the_entity_is_forwarded_when_one_is_configured(fake_wandb):
 
 @pytest.mark.parametrize("cfg", [_cfg(), _cfg(wandb_entity=None), _cfg(wandb_entity="")])
 def test_no_entity_means_the_kwarg_is_absent_not_none(cfg, fake_wandb):
-    """`entity=None` is not the same as not passing it: the account default must be left to win.
-
-    Someone without access to the configured entity has to be able to run the script unchanged,
-    which only works if wandb never sees the keyword at all.
-    """
+    """Verify entity keyword argument is omitted when unconfigured or empty."""
     WandbRun(cfg)
     assert "entity" not in fake_wandb.calls["init"][0]
 
 
 def test_the_init_line_names_the_project_and_the_entity(fake_wandb, caplog):
-    """A run that went to the wrong workspace must be visible in the log, not only in a browser."""
+    """Verify initialization logs project and entity names."""
     with caplog.at_level(logging.INFO, logger="dawn.runlog"):
         WandbRun(_cfg(mode="offline", wandb_entity="my-team"))
     assert "my-team" in caplog.text and "dawn" in caplog.text and "offline" in caplog.text
@@ -167,7 +153,7 @@ def test_watch_none_calls_nothing(fake_wandb):
 
 
 def test_a_bad_scope_is_caught_even_when_wandb_is_off(fake_wandb):
-    """It must fail at the start of the run, not silently log nothing for 20K steps."""
+    """Verify invalid watch scope raises ValueError during initialization."""
     for mode in ("online", "disabled"):
         cfg = _cfg(mode=mode, scope="trainable")  # the old name, now invalid
         with pytest.raises(ValueError, match="watch_scope must be one of"):
@@ -175,7 +161,7 @@ def test_a_bad_scope_is_caught_even_when_wandb_is_off(fake_wandb):
 
 
 def test_another_stage_supplies_its_own_scope_map(fake_wandb):
-    """Stage 2's trainer holds none of stage 1's nets, so the scope map travels with the caller."""
+    """Verify custom stage scopes can be supplied to WandbRun."""
 
     class _RefinerTrainer:
         def __init__(self):
@@ -191,7 +177,7 @@ def test_another_stage_supplies_its_own_scope_map(fake_wandb):
 
 
 def test_a_scope_naming_a_module_the_trainer_lacks_fails_at_the_start(fake_wandb):
-    """The wrong stage's map, caught where it is cheap rather than as a bare AttributeError."""
+    """Verify error when watch scope references missing trainer attribute."""
     cfg = _cfg(scope="velocity")
     with pytest.raises(ValueError, match="does not have"):
         WandbRun(cfg).watch(object(), cfg)
@@ -201,7 +187,7 @@ def test_a_scope_naming_a_module_the_trainer_lacks_fails_at_the_start(fake_wandb
 
 
 def test_a_run_log_round_trip_writes_the_jsonl_and_the_per_kind_csv(tmp_path):
-    """The point of `RunLog`: all three records hold the keys the caller handed it, verbatim."""
+    """Verify RunLog records identical metric entries to JSONL and CSV logs."""
     run = RunLog({"logging": {"wandb_mode": "disabled", "metrics_csv": True}}, tmp_path)
     values = {"loss/total": 1.5, "grad/velocity": 0.25, "contrib/flow": 0.8}
     run.log("train", 300, values)
@@ -237,7 +223,7 @@ def test_the_shipped_config_names_the_stage_1_project_and_the_entity():
 
 
 def test_the_stage_1_script_still_re_exports_the_names():
-    """`from scripts.train_flow import RunLog` is what the older tests and notes use."""
+    """Verify backward-compatible re-exports from scripts.train_flow."""
     pytest.importorskip("torch")
     from dawn import runlog
     from scripts import train_flow

@@ -1,4 +1,4 @@
-"""dawn/data/align.py, the per-pair I/O layer: align_pair, the log, re-evaluation (fake tree)."""
+"""Tests for multimodal image pair alignment I/O, logging, and evaluation."""
 
 import dataclasses
 import math
@@ -35,7 +35,7 @@ def rows(setup):
 
 @pytest.fixture(scope="module")
 def box_rows(setup):
-    """The same pairs with the edge fallback switched off: the box path's own verdicts."""
+    """Alignment rows computed with fallback disabled."""
     layout, cfg, tree = setup
     box_only = align.AlignConfig(**{**cfg.__dict__, "fallback_enabled": False})
     return {

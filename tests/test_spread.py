@@ -1,4 +1,4 @@
-"""Sample-spread uncertainty (docs/conventions.md section 11)."""
+"""Tests for sample-spread uncertainty estimation from sampled tokens."""
 
 import pytest
 
@@ -52,7 +52,7 @@ def test_shapes_and_dtypes_are_the_documented_ones():
 
 
 def test_identical_members_have_zero_spread():
-    """K copies of one draw disagree nowhere, so both maps are exactly 0."""
+    """Verify identical sample draws yield zero standard deviation."""
     settings = _settings()
     out = spread_from_parts(
         _parts(settings.layout, 5, spread=0.0), _thermal(), TINY_RENDER, settings
@@ -62,7 +62,7 @@ def test_identical_members_have_zero_spread():
 
 
 def test_one_sample_gives_zeros_not_nan():
-    """K=1 has nothing to disagree with: zeros, never NaN from an (n-1) divide."""
+    """Verify single sample produces zeros rather than NaN values."""
     settings = _settings()
     out = spread_from_parts(_parts(settings.layout, 1), _thermal(), TINY_RENDER, settings)
     assert out.num_samples == 1
@@ -84,7 +84,7 @@ def test_more_disagreement_means_more_spread():
 
 
 def test_the_maps_match_an_explicit_std_over_rendered_members():
-    """Welford must agree with stacking the renders and calling torch.std (unbiased, n-1)."""
+    """Verify online standard deviation matches direct torch.std calculation."""
     from dawn.flow.render import render
 
     settings = _settings()
@@ -104,13 +104,7 @@ def test_the_maps_match_an_explicit_std_over_rendered_members():
 
 @pytest.mark.parametrize("delta_a, delta_b", [(10.0, 0.0), (6.0, 8.0), (0.0, -10.0)])
 def test_ab_std_is_a_distance_in_the_ab_plane(delta_a, delta_b):
-    """Two members a known a*b* offset apart: only the offset's LENGTH may show up.
-
-    For K=2 the unbiased variance of two values d apart is d^2 / 2, so
-    sqrt(var_a + var_b) = |offset| / sqrt(2). Three offsets of length 10 pointing different ways
-    must all give the same number: that is what makes the map a chroma distance rather than a
-    per-channel quantity, and it is what lets it be ranked against CIEDE2000.
-    """
+    """Verify standard deviation in ab space represents Euclidean distance in chroma."""
     settings = _settings()
     layout, thermal = settings.layout, _thermal(batch=1)
     gy, gx = layout.grid
@@ -154,7 +148,7 @@ def test_the_correction_layout_is_carried_through():
 
 
 def test_sample_with_spread_runs_the_whole_path_off_one_encoder_pass():
-    """encode once -> K members -> maps, and the encoder is not touched again."""
+    """Verify entire spread sampling pipeline runs from a single encoder pass."""
     from dawn.models.velocity import VelocityTransformer
     from dawn.uncertainty.spread import sample_with_spread
     from tests.flow_helpers import wake_up

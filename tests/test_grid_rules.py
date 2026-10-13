@@ -1,8 +1,5 @@
-"""docs/conventions.md sections 3 and 8: one trilinear implementation, cell-center coordinates.
+"""Tests for grid coordinate conventions, trilinear interpolation weights, and slicing."""
 
-`fit.py` and `upsample.py` take their weights from `slice.trilinear_weights` only, and
-`slice_grid` (via `F.grid_sample`) must agree with it.
-"""
 
 import pytest
 

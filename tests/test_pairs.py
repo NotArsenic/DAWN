@@ -1,4 +1,4 @@
-"""dawn/data/pairs.py: the aligned-pair PNGs (writer) and AlignedPairs (dataset, augmentation)."""
+"""Tests for aligned pair file generation, dataset loading, and augmentations."""
 
 import os
 
@@ -24,7 +24,7 @@ H, W = 512, 640
 
 
 def _write_pair(layout, image_id, seed=0, thermal=None):
-    """The four PNGs of one pair with asymmetric content, so any flip is visible."""
+    """Write synthetic multimodal image pair and masks to disk."""
     rng = np.random.default_rng(seed)
     rgb = rng.integers(0, 256, (H, W, 3), dtype=np.uint8)
     thermal = (

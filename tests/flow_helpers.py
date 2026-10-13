@@ -1,13 +1,4 @@
-"""Builders shared by the flow-stage tests.
-
-Everything here stays offline and CPU-sized: the encoder is a randomly initialized DINOv3 with
-`depth` blocks instead of 12, so no gated weights are downloaded and a test is seconds, not
-minutes; the images are small synthetic ones whose brightness is an exact function of the thermal.
-Shapes, token layout, register count and the LoRA target names are the real ones.
-
-A tiny setup: a 64 x 80 input gives a 4 x 5 token grid and a 16 x 20 colour map; at the 32 x 40
-render size each patch covers 8 x 8 render pixels (render size / token grid).
-"""
+"""Test fixture helpers and mock model builders for flow model unit tests."""
 
 from __future__ import annotations
 
@@ -23,18 +14,18 @@ CONFIGS = ROOT / "configs"
 TIMM_TARGETS = r".*blocks\.\d+\.attn\.(qkv|proj)"
 HF_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-TINY_INPUT = (64, 80)  # (H, W) encoder input of the tiny setup
+TINY_INPUT = (64, 80)
 TINY_RENDER = (32, 40)
 
 
 def require_backend(backend: str):
-    """Skip unless peft and the backend's library are installed."""
+    """Skip test unless peft and the specified backend library are installed."""
     pytest.importorskip("peft")
     pytest.importorskip(backend)
 
 
 def tiny_encoder(backend: str = "timm", depth: int = 2, input_size=TINY_INPUT, **kwargs):
-    """A randomly initialized DINOv3 ViT-S+ with `depth` blocks, LoRA attached."""
+    """Construct lightweight random-weight DINOv3 encoder for testing."""
     require_backend(backend)
     from dawn.models.encoder import DINOEncoder
 
@@ -56,23 +47,18 @@ def tiny_encoder(backend: str = "timm", depth: int = 2, input_size=TINY_INPUT, *
 
 
 def wake_up(module, std: float = 0.05, seed: int = 0):
-    """Perturb every parameter except the 0-dim gates, so a zero-init net stops being a no-op.
-
-    adaLN-Zero and the zero-initialized output head make an untrained DiT return exactly zero
-    for every input, which makes it useless for testing that inputs reach the output. This is
-    "one optimizer step happened", not a trained model.
-    """
+    """Perturb parameters of a zero-initialized model to produce nonzero outputs."""
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for param in module.parameters():
-            if param.ndim == 0:  # dino_gate: the tests set it explicitly
+            if param.ndim == 0:
                 continue
             param.add_(torch.randn(param.shape, generator=generator) * std)
     return module
 
 
 def load_configs(*overrides: str) -> dict:
-    """flow.yaml + data.yaml + the named overrides (file names under configs/), as a plain dict."""
+    """Load base configuration files merged with optional override files."""
     omegaconf = pytest.importorskip("omegaconf")
     cfg = omegaconf.OmegaConf.merge(
         omegaconf.OmegaConf.load(CONFIGS / "flow.yaml"),
@@ -83,7 +69,7 @@ def load_configs(*overrides: str) -> dict:
 
 
 def tiny_cfg(correction: bool = False, **updates) -> dict:
-    """The real flow config at the tiny resolution, random-weight 2-block DINO, fp32, no wandb."""
+    """Generate minimal test configuration with small spatial dimensions."""
     cfg = load_configs()
     cfg["encoder"].update(
         input_size=list(TINY_INPUT),
@@ -105,20 +91,14 @@ def tiny_cfg(correction: bool = False, **updates) -> dict:
 
 
 def tiny_layout(correction: bool = False, num_bins: int = 8):
+    """Construct TokenLayout with small grid dimensions for unit testing."""
     from dawn.flow.tokens import TokenLayout
 
     return TokenLayout(num_bins=num_bins, grid=(4, 5), block=4, correction=correction)
 
 
 def synthetic_batch(batch: int = 2, size=TINY_INPUT, seed: int = 0, fallback=None) -> dict:
-    """A collated `AlignedPairs`-style batch whose L*/100 is an exact affine map of the thermal.
-
-    thermal  smooth field in [0.1, 0.9]
-    rgb      linear RGB of Lab(100 * (0.25 + 0.45 * thermal), a(x), b(y)): the brightness grid can
-             reproduce the lightness exactly, and the a*b* vary smoothly (inside the gamut)
-    valid / moving / vehicles   bool masks with odd-aligned edges (so a 2x downsample
-             gives fractional weights); `moving` and `vehicles` each cover one corner block
-    """
+    """Generate synthetic multimodal batch with deterministic lightness mappings."""
     import torch.nn.functional as F
 
     from dawn.data.color import lab_to_linear
@@ -153,12 +133,7 @@ def synthetic_batch(batch: int = 2, size=TINY_INPUT, seed: int = 0, fallback=Non
 
 
 def write_tiny_tree(root, n_box: int = 3, n_fallback: int = 1, size=TINY_INPUT) -> dict:
-    """A tiny aligned-pairs tree on disk (what `AlignedPairs` reads); returns the config patch.
-
-    `train_pairs` and `val_pairs` each hold `n_box` box-aligned and `n_fallback` fallback pairs
-    (listed in `fallback_pairs`). Merge the result into `cfg["dronevehicle"]`. Never touches
-    data/DroneVehicle or data/dronevehicle_aligned.
-    """
+    """Create mock directory structure of aligned image pairs for testing."""
     import numpy as np
     from PIL import Image
 
@@ -200,7 +175,7 @@ def write_tiny_tree(root, n_box: int = 3, n_fallback: int = 1, size=TINY_INPUT) 
 
 
 def tiny_data_cfg(root, correction: bool = False, n_box: int = 3, n_fallback: int = 1, **updates):
-    """`tiny_cfg` pointed at a tiny aligned tree under `root`."""
+    """Generate test configuration pointing to temporary aligned dataset directory."""
     cfg = tiny_cfg(correction, **updates)
     cfg["dronevehicle"].update(write_tiny_tree(root, n_box, n_fallback))
     cfg["dronevehicle"]["max_pairs"] = None

@@ -1,4 +1,4 @@
-"""The one render path (docs/conventions.md section 6.4)."""
+"""Tests for image rendering from predicted grid and color tokens."""
 
 import pytest
 
@@ -11,7 +11,7 @@ from tests.flow_helpers import TINY_INPUT, TINY_RENDER, load_configs, tiny_layou
 
 
 def _settings(correction=False, upsample="bgu"):
-    """BGU by default in these tests (the guided-edge ones need it); bilinear is tested below."""
+    """Instantiate test RenderSettings with specified upsampling mode."""
     return RenderSettings(
         layout=tiny_layout(correction), bgu_grid=(4, 2, 2), bgu_ridge=1e-3, upsample=upsample
     )
@@ -77,7 +77,7 @@ def test_a_constant_colour_map_renders_that_colour_everywhere():
 
 
 def test_colour_edges_follow_the_output_lightness_edge():
-    """The colour map is guided by the OUTPUT L: a sharp thermal edge gives a sharp colour edge."""
+    """Verify color edges follow lightness edges when using guided upsampling."""
     settings = _settings()
     layout = settings.layout
     thermal = torch.full((1, 1, *TINY_INPUT), 0.2)

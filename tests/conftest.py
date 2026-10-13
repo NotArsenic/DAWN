@@ -11,10 +11,7 @@ def _seed():
 
 @pytest.fixture(scope="session")
 def fake_dronevehicle(tmp_path_factory):
-    """Raw fake DroneVehicle tree (tests/fake_dronevehicle.py): a FakeTree with ground truth.
-
-    Read-only for tests: the pipeline stages write elsewhere (`fake_dv_config`).
-    """
+    """Construct and return a session-scoped mock DroneVehicle dataset tree."""
     pytest.importorskip("torch")
     pytest.importorskip("PIL")
     pytest.importorskip("scipy")

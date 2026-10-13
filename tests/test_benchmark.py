@@ -1,7 +1,5 @@
-"""scripts/benchmark_latency.py: per-component cost.
+"""Tests for component latency and computational cost benchmarking."""
 
-Uses the tiny two-block random-weight encoder; nothing here downloads DINOv3 weights.
-"""
 
 import json
 import sys
@@ -49,7 +47,7 @@ def bundle():
 
 
 def test_count_macs_matches_hand_arithmetic():
-    """A linear layer is 2*N*in*out flops, so N*in*out MACs."""
+    """Verify MAC counting against analytical linear layer cost."""
     m = torch.nn.Linear(64, 128, bias=False)
     x = torch.randn(8, 64)
     assert count_macs(lambda: m(x)) == pytest.approx(8 * 64 * 128 / 1e9, rel=1e-9)
@@ -86,7 +84,7 @@ def test_the_total_is_the_sum_of_the_components(bundle):
 
 
 def test_the_encoder_runs_once_however_many_samples_are_drawn(bundle):
-    """The architecture's central claim: K samples cost velocity passes, not DINO passes."""
+    """Verify encoder execution cost does not scale with sample count."""
     cfg, b = bundle
     one = benchmark(cfg, b, torch.device("cpu"), _args(samples=1))
     four = benchmark(cfg, b, torch.device("cpu"), _args(samples=4))
@@ -103,7 +101,7 @@ def test_more_nfe_costs_proportionally_more_velocity(bundle):
 
 
 def test_midpoint_at_the_same_nfe_costs_the_same_as_euler(bundle):
-    """2 NFE is two Euler steps or one midpoint step; the point is they cost the same."""
+    """Verify midpoint and Euler solvers have identical cost at matching NFE."""
     cfg, b = bundle
     e = benchmark(cfg, b, torch.device("cpu"), _args(method="euler", nfe=2))
     m = benchmark(cfg, b, torch.device("cpu"), _args(method="midpoint", nfe=2))

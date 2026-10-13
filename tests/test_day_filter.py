@@ -1,4 +1,4 @@
-"""dawn/data/day_filter.py: per-pair RGB stats, the day decision, the log and the sheets."""
+"""Tests for daytime filtering criteria, luminance statistics, and logging."""
 
 import dataclasses
 import math

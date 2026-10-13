@@ -1,9 +1,4 @@
-"""The ODE samplers: NFE accounting, the one un-standardization, and seeded noise.
-
-NFE is the number of velocity evaluations. Euler spends one per step and midpoint two, so a 2-NFE
-midpoint run is ONE step and costs the same as two Euler steps. Getting that wrong would make
-every "at 2 NFE" comparison a lie, so it is pinned here by counting calls.
-"""
+"""Tests for ODE samplers, NFE accounting, un-standardization, and deterministic seeded noise."""
 
 import pytest
 
@@ -94,7 +89,7 @@ def test_a_constant_unit_field_integrates_to_one(z_0, method, nfe):
 
 
 def test_samplers_integrate_from_noise_to_data(z_0):
-    """t runs 0 -> 1 and the step is +dt*v, so the field is evaluated at increasing times."""
+    """Verify integration advances forward from t=0 toward t=1."""
     fn = CountingVelocity()
     euler_sample(fn, z_0, num_steps=4)
     assert fn.times == sorted(fn.times) and fn.times[0] == 0.0 and fn.times[-1] < 1.0
@@ -183,7 +178,7 @@ def test_the_velocity_net_runs_nfe_times_and_the_encoder_never():
 
 
 def test_k_samples_are_batched_into_one_pass():
-    """K members cost K times the batch, not K times the number of velocity calls."""
+    """Verify multiple samples are batched into a single integration pass."""
     layout = tiny_layout()
     model = ConstantTokensModel(torch.zeros(1, layout.num_tokens, layout.dim))
     out = sample_parts(
@@ -239,5 +234,5 @@ def test_sample_parts_with_image_ids_is_independent_of_the_batch():
 
 
 def test_the_uncertainty_helper_of_the_old_regime_is_gone():
-    """Sample-spread uncertainty is the inference phase's (dawn/uncertainty)."""
+    """Verify obsolete render_spread helper is not in sampler module."""
     assert not hasattr(sampler_mod, "render_spread")

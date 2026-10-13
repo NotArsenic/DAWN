@@ -1,4 +1,4 @@
-"""The oracle (dawn/flow/oracle.py, scripts/check_oracle.py) on a tiny synthetic tree."""
+"""Tests for oracle evaluation benchmarks and contact sheet reporting."""
 
 import importlib.util
 import sys

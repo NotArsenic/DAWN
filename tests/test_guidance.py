@@ -1,4 +1,4 @@
-"""docs/conventions.md section 4: thermal guidance."""
+"""Tests for thermal guidance computation and spatial filtering."""
 
 import pytest
 

@@ -1,4 +1,4 @@
-"""Validation metrics: masked L* PSNR, CIEDE2000 and Hasler-Suesstrunk colorfulness."""
+"""Tests for image evaluation metrics including masked PSNR, SSIM, CIEDE2000, and colorfulness."""
 
 import math
 
@@ -37,7 +37,7 @@ def test_ciede2000_matches_skimage_on_random_lab_pairs():
 
 
 def test_ciede2000_matches_skimage_on_the_sharma_hard_cases():
-    """Hue wrap-around, near-zero chroma and the 180 degree case are where implementations drift."""
+    """Verify CIEDE2000 edge cases including hue wrap-around and low chroma match reference."""
     skimage_color = pytest.importorskip("skimage.color")
     pairs = [
         ((50.0, 2.6772, -79.7751), (50.0, 0.0, -82.7485)),
@@ -146,7 +146,7 @@ def _lab(batch=2, size=(32, 40), seed=0):
 
 
 def test_masked_ssim_matches_skimage_on_the_interior():
-    """skimage drops the window border; we keep it and let the mask decide. Mask it out -> equal."""
+    """Verify interior masked SSIM matches skimage reference implementation."""
     sk = pytest.importorskip("skimage.metrics")
     torch.manual_seed(0)
     pad = 11 // 2
@@ -188,7 +188,7 @@ def test_masked_ssim_falls_as_the_images_diverge():
 
 
 def test_masked_ssim_only_scores_the_masked_region():
-    """Corrupting pixels the mask excludes must not move the score (beyond the window rim)."""
+    """Verify pixels excluded by the mask do not affect SSIM scores outside window boundary."""
     torch.manual_seed(0)
     x = torch.rand(1, 1, 64, 64) * 100
     y = x.clone()
@@ -204,7 +204,7 @@ def test_masked_ssim_rejects_an_image_smaller_than_its_window():
 
 
 def test_lpips_converts_to_srgb_before_scoring():
-    """LPIPS nets are trained on display-referred images; linear in would score the wrong pair."""
+    """Verify LPIPS distance metric converts inputs to display-referred sRGB."""
     from dawn.data.color import linear_to_srgb
     from dawn.eval.metrics import lpips_distance
 
@@ -256,7 +256,7 @@ def test_evaluate_batch_adds_vehicle_and_lpips_keys_only_when_asked():
 
 
 def test_the_vehicle_region_is_intersected_with_the_pixel_mask():
-    """An invalid pixel never counts, whichever region it falls in."""
+    """Verify vehicle region is intersected with valid pixel mask during evaluation."""
     from dawn.eval.metrics import evaluate_batch
 
     lab_t = _lab(batch=1, seed=0)
