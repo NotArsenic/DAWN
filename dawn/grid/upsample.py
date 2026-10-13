@@ -1,23 +1,4 @@
-"""Upsampling the generated low-resolution maps (a*b*, the optional L correction).
-
-`upsample_map` is the one entry point of the render path (docs/conventions.md section 6.3), with
-two modes (`color.upsample` in flow.yaml):
-
-    bilinear   plain bilinear upsampling (align_corners=False). The default: on the real val pairs
-               its colour ceiling is 0.87 mean |delta a*b*| against the BGU's 1.3 to 2.1 at every
-               grid swept (scripts/check_oracle.py), and the maintainer chose it at Checkpoint A.
-    bgu        bilateral guided upsampling (Chen, Adams, Durand et al., SIGGRAPH Asia 2016): at low
-               resolution, fit a bilateral grid of `low ~ gain * guide + offset` (per cell and
-               guide-intensity bin), then slice that grid at the high-resolution guide and apply
-               it to it, so edges follow the guide's. Kept implemented and tested for the cases
-               where the guide explains the colour.
-
-BGU reuses `fit_affine_grid` and `slice_grid`, so its node weights come from
-`slice.trilinear_weights` like everything else (rule 1). Its guides are treated as constants (no
-gradient through the bin assignment); both modes are differentiable with respect to `low`, which is
-how L_render reaches the colour tokens. `F.interpolate` appears here and nowhere else as an upsample
-(the baseline in `scripts/check_oracle.py` is the same call); the downsampling rule is untouched.
-"""
+"""Spatial upsampling routines for low-resolution feature maps."""
 
 from __future__ import annotations
 
@@ -41,12 +22,23 @@ def upsample_map(
     ridge_alpha: float = 1e-1,
     refine_steps: int = 2,
 ) -> torch.Tensor:
-    """Upsample `low` `(B, C, h, w)` to the size of `guide_hi` `(B, 1, H, W)`.
+    """Upsample low-resolution tensor to match spatial size of guide_hi.
 
-    `bilinear` ignores the guides and the BGU settings; `bgu` is `bilateral_guided_upsample`.
+    Args:
+        low: (B, C, h, w) low-resolution feature tensor.
+        guide_lo: (B, 1, h, w) low-resolution guidance tensor.
+        guide_hi: (B, 1, H, W) high-resolution guidance tensor.
+        mode: Upsampling mode, either 'bilinear' or 'bgu'.
+        weights_lo: Optional (B, 1, h, w) fitting weights for BGU mode.
+        grid_size: (num_bins, grid_h, grid_w) dimensions for bilateral grid.
+        ridge_alpha: Regularization strength for grid fitting.
+        refine_steps: Number of residual refinement passes.
+
+    Returns:
+        (B, C, H, W) upsampled tensor.
 
     Raises:
-        ValueError: `mode` is not one of `UPSAMPLE_MODES`.
+        ValueError: If mode is not recognized.
     """
     if mode == "bilinear":
         return F.interpolate(low, size=guide_hi.shape[-2:], mode="bilinear", align_corners=False)
@@ -73,23 +65,22 @@ def bilateral_guided_upsample(
     ridge_alpha: float = 1e-3,
     refine_steps: int = 0,
 ) -> torch.Tensor:
-    """Upsample `low` guided by an image: edges in `guide_hi` become edges in the output.
+    """Upsample low-resolution tensor using bilateral guided upsampling (BGU).
 
     Args:
-        low: (B, C, h, w) the map to upsample (a*b*, or the L correction).
-        guide_lo: (B, 1, h, w) the guide at low resolution, in [0, 1]: the area average of
-            `guide_hi` over the same footprint (`area_downsample`).
-        guide_hi: (B, 1, H, W) the guide at the output resolution, in [0, 1] (the output `L`).
-        weights_lo: (B, 1, h, w) fit weights (the area-averaged mask), or None for ones.
-        grid_size: (bins, grid_h, grid_w) of the bilateral grid; `color.bgu` in flow.yaml.
-        ridge_alpha: Ridge strength of the fit, in units of the mean node weight.
-        refine_steps: Extra fit passes (see `fit_affine_grid`).
+        low: (B, C, h, w) feature tensor to upsample.
+        guide_lo: (B, 1, h, w) guidance tensor at low resolution in [0, 1].
+        guide_hi: (B, 1, H, W) guidance tensor at target high resolution in [0, 1].
+        weights_lo: Optional (B, 1, h, w) fitting weights.
+        grid_size: (num_bins, grid_h, grid_w) dimensions for bilateral grid.
+        ridge_alpha: Regularization strength for grid fitting.
+        refine_steps: Number of residual refinement passes.
 
     Returns:
-        (B, C, H, W) the upsampled map, NOT clamped.
+        (B, C, H, W) upsampled feature tensor.
 
     Raises:
-        ValueError: the guides do not match `low` and each other.
+        ValueError: If guidance tensor dimensions do not match expectations.
     """
     if low.ndim != 4:
         raise ValueError(f"low must be (B, C, h, w), got {tuple(low.shape)}")

@@ -1,10 +1,4 @@
-"""Image quality metrics.
-
-Current (flow phase, used by validation and `scripts/check_oracle.py`): `masked_psnr` (L* PSNR with
-the peak at 100), `ciede2000` (the colour difference, in torch) and `colorfulness`
-(Hasler & Suesstrunk). The rest of this module (SSIM, LPIPS, object-crop metrics) is the
-inference/eval phase's and is still a stub.
-"""
+"""Image quality evaluation metrics."""
 
 from __future__ import annotations
 
@@ -16,20 +10,14 @@ import torch.nn.functional as F
 
 @dataclass
 class MetricResults:
-    """The plan's evaluation table, for one subset of pairs.
+    """Evaluation metrics for a subset of image pairs."""
 
-    Structure is scored on L* (peak 100), colour as CIEDE2000, vividness as colorfulness and
-    perceptual likeness as LPIPS. Every pixel metric is masked; `lpips` is not (see
-    `lpips_distance`). `*_vehicles` repeat the pixel metrics over the vehicle region only, which
-    is the plan's "do vehicles survive?" row.
-    """
-
-    psnr: float = 0.0  # L* PSNR, peak 100, masked
-    ssim: float = 0.0  # L* SSIM, masked
-    ciede2000: float = 0.0  # mean colour difference, masked
-    colorfulness: float = 0.0  # Hasler & Suesstrunk, of the prediction
-    colorfulness_target: float = 0.0  # the same for the real RGB, to read it against
-    lpips: float = 0.0  # whole-frame, unmasked
+    psnr: float = 0.0
+    ssim: float = 0.0
+    ciede2000: float = 0.0
+    colorfulness: float = 0.0
+    colorfulness_target: float = 0.0
+    lpips: float = 0.0
     psnr_vehicles: float = 0.0
     ssim_vehicles: float = 0.0
     ciede2000_vehicles: float = 0.0
@@ -37,11 +25,11 @@ class MetricResults:
 
 
 def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """PSNR between two batches of sRGB images.
+    """Compute peak signal-to-noise ratio between two batches of RGB images.
 
     Args:
-        pred: (B, 3, H, W) in [0, 1].
-        target: (B, 3, H, W) in [0, 1].
+        pred: (B, 3, H, W) images in [0, 1].
+        target: (B, 3, H, W) images in [0, 1].
 
     Returns:
         (B,) PSNR values in dB.
@@ -51,7 +39,7 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def _gaussian_window(size: int, sigma: float, device, dtype) -> torch.Tensor:
-    """`(1, 1, size, size)` normalized separable Gaussian, as SSIM is conventionally defined."""
+    """Generate a normalized 2D Gaussian window for SSIM computation."""
     coords = torch.arange(size, device=device, dtype=dtype) - (size - 1) / 2.0
     g = torch.exp(-(coords**2) / (2.0 * sigma**2))
     g = g / g.sum()
@@ -68,35 +56,23 @@ def masked_ssim(
     k1: float = 0.01,
     k2: float = 0.03,
 ) -> torch.Tensor:
-    """SSIM over the pixels that count, per image.
-
-    Matches `skimage.metrics.structural_similarity(gaussian_weights=True, sigma=1.5,
-    use_sample_covariance=False)` to 1e-8 **on the interior**. skimage discards the
-    `window_size // 2` border; this keeps it (padded by reflection) and lets the mask decide, so
-    an all-ones mask differs from skimage by about 6e-4 -- that difference is the border and
-    nothing else. Mask the border out and the two agree exactly.
-
-
-    The plan evaluates structure as PSNR **and SSIM on L\\***, so the default `peak` is 100, not 1.
-    Pass the single L* channel, not RGB.
-
-    The SSIM map is computed over the whole image and then averaged with `masked_mean`. The local
-    statistics of a window that straddles the mask edge are therefore contaminated by pixels that
-    do not count: with `valid` and `moving`/`vehicles` masks, which are large contiguous regions,
-    only an 11-px rim is affected. Weighting the local moments by the mask instead would change
-    the definition and stop it matching `skimage`, which is the worse trade for a reported number.
+    """Compute masked structural similarity index (SSIM) per image.
 
     Args:
-        pred, target: `(B, C, H, W)`, the same units.
-        mask: `(B, 1, H, W)` weights in `[0, 1]`.
-        peak: the signal peak (100 for L*, 1 for `[0, 1]` images).
-        window_size, sigma, k1, k2: the standard SSIM constants.
+        pred: (B, C, H, W) predicted image tensor.
+        target: (B, C, H, W) target image tensor.
+        mask: (B, 1, H, W) pixel weights in [0, 1].
+        peak: Maximum dynamic range of the signal (default: 100.0 for L*).
+        window_size: Gaussian window size.
+        sigma: Gaussian standard deviation.
+        k1: First SSIM stability constant.
+        k2: Second SSIM stability constant.
 
     Returns:
-        `(B,)` SSIM in `[-1, 1]`. An image with no weight scores 0.
+        (B,) SSIM values in [-1, 1].
 
     Raises:
-        ValueError: shapes disagree, or the image is smaller than the window.
+        ValueError: If tensor shapes do not match or are smaller than window_size.
     """
     if pred.shape != target.shape:
         raise ValueError(f"pred {tuple(pred.shape)} and target {tuple(target.shape)} must match")
@@ -111,8 +87,6 @@ def masked_ssim(
     pad = window_size // 2
 
     def blur(x: torch.Tensor) -> torch.Tensor:
-        # 'reflect' matches skimage's default edge handling closely enough that the interior,
-        # which is what the mask keeps, agrees to ~1e-6.
         return F.conv2d(F.pad(x, (pad,) * 4, mode="reflect"), win, groups=c)
 
     mu_x, mu_y = blur(pred), blur(target)
@@ -131,23 +105,15 @@ def masked_ssim(
 def lpips_distance(
     pred_linear: torch.Tensor, target_linear: torch.Tensor, lpips_fn
 ) -> torch.Tensor:
-    """LPIPS between two batches of **linear** RGB, per image.
-
-    LPIPS is an AlexNet/VGG feature distance trained on display-referred images, so the linear RGB
-    of the pipeline is converted to sRGB and then to the `[-1, 1]` range the released nets expect
-    (docs/conventions.md section 1, output boundary). Passing linear values straight in would
-    score a different, darker pair of images than a person would see.
-
-    There is no masked LPIPS: the metric is defined on whole images through a convolutional stack,
-    and zeroing pixels would introduce edges the network reads as structure. Report it on the
-    frame and read it next to the masked metrics, not instead of them.
+    """Compute LPIPS perceptual distance between batches of linear RGB images.
 
     Args:
-        pred_linear, target_linear: `(B, 3, H, W)` linear RGB in `[0, 1]`.
-        lpips_fn: a constructed `lpips.LPIPS(net=...)`, already on the right device.
+        pred_linear: (B, 3, H, W) predicted linear RGB in [0, 1].
+        target_linear: (B, 3, H, W) target linear RGB in [0, 1].
+        lpips_fn: Initialized LPIPS model.
 
     Returns:
-        `(B,)` distances; lower is more alike.
+        (B,) perceptual distance values.
     """
     from dawn.data.color import linear_to_srgb
 
@@ -166,29 +132,22 @@ def evaluate_batch(
     vehicle_mask: torch.Tensor | None = None,
     lpips_fn=None,
 ) -> dict[str, torch.Tensor]:
-    """The plan's evaluation row for one batch, **per image** (not yet averaged).
-
-    Per image rather than reduced, so the caller can weight subsets (box-aligned against fallback)
-    and report percentiles rather than only a mean. `scripts/evaluate.py` does the aggregating.
-
-    Everything is computed in the units the plan evaluates in: structure on `L*` with the peak at
-    100, colour as CIEDE2000 over `L*a*b*`, colorfulness on 0-255 sRGB, LPIPS on sRGB `[-1, 1]`.
+    """Compute per-image evaluation metrics for a batch.
 
     Args:
-        lab_pred, lab_target: `(B, 3, H, W)` L*, a*, b*.
-        rgb_pred, rgb_target: `(B, 3, H, W)` **linear** RGB in `[0, 1]`, the same images.
-        mask: `(B, 1, H, W)` the pixel mask: `valid & ~moving` for box-aligned pairs,
-            `valid & ~vehicles` for fallback ones (docs/conventions.md section 5.3).
-        vehicle_mask: `(B, 1, H, W)` the vehicle region, for the "do vehicles survive?" row.
-            `None` leaves the `*_vehicles` keys out.
-        lpips_fn: a constructed `lpips.LPIPS`, or `None` to skip the LPIPS key.
+        lab_pred: (B, 3, H, W) predicted Lab image tensor.
+        lab_target: (B, 3, H, W) target Lab image tensor.
+        rgb_pred: (B, 3, H, W) predicted linear RGB image tensor in [0, 1].
+        rgb_target: (B, 3, H, W) target linear RGB image tensor in [0, 1].
+        mask: (B, 1, H, W) pixel evaluation mask.
+        vehicle_mask: Optional (B, 1, H, W) vehicle region mask.
+        lpips_fn: Optional LPIPS model instance.
 
     Returns:
-        `{metric: (B,)}`. Keys: `psnr`, `ssim`, `ciede2000`, `colorfulness`,
-        `colorfulness_target`, plus `lpips` and the three `*_vehicles` when asked for.
+        Dictionary mapping metric names to (B,) score tensors.
 
     Raises:
-        ValueError: the Lab and RGB batches disagree on shape.
+        ValueError: If tensor shapes do not match.
     """
     if lab_pred.shape != lab_target.shape or rgb_pred.shape != rgb_target.shape:
         raise ValueError("pred and target must have the same shape")
@@ -210,16 +169,7 @@ def evaluate_batch(
     if lpips_fn is not None:
         out["lpips"] = lpips_distance(rgb_pred, rgb_target, lpips_fn)
     if vehicle_mask is not None:
-        # The vehicle region, intersected with the pixel mask: an invalid pixel never counts,
-        # whichever region it is in.
         region = vehicle_mask.to(mask.dtype) * mask
-        # An image left with no vehicle weight has nothing to score, and the masked metrics
-        # return sentinels rather than raising: `masked_psnr` gives its large-finite value
-        # (140 dB at peak 100) and `masked_mean` gives 0. Averaging those reports a fictional
-        # result -- and it is not an edge case, it is every FALLBACK pair, whose pixel mask is
-        # `valid & ~vehicles` and therefore deletes the exact region this row scores. NaN marks
-        # them; `scripts/evaluate.py: summarize` drops non-finite values, so the rows simply do
-        # not appear for that subset instead of appearing wrong.
         scored = region.sum(dim=(1, 2, 3)) > 0
 
         def only_where_scored(values: torch.Tensor) -> torch.Tensor:
@@ -237,24 +187,19 @@ def evaluate_batch(
     return out
 
 
-# --- the flow-phase metrics -----------------------------------------------------------------------
-
-
 def masked_psnr(
     pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, peak: float = 1.0
 ) -> torch.Tensor:
-    """PSNR over the pixels that count, per image: `10 log10(peak^2 / masked MSE)`.
-
-    For lightness pass L* with `peak=100` (the plan evaluates structure as PSNR on L*).
+    """Compute masked peak signal-to-noise ratio per image.
 
     Args:
-        pred, target: (B, C, H, W), the same units.
-        mask: (B, 1, H, W) weights in [0, 1] (the pixel mask; fractional is fine).
-        peak: The signal peak.
+        pred: (B, C, H, W) predicted image tensor.
+        target: (B, C, H, W) target image tensor.
+        mask: (B, 1, H, W) pixel weights in [0, 1].
+        peak: Maximum dynamic range of the signal.
 
     Returns:
-        (B,) dB. An image with no weight has zero error and so a (large, finite) value; callers
-        that average should drop it.
+        (B,) PSNR values in dB.
     """
     weight = mask.to(torch.float32)
     channels = pred.shape[1]
@@ -264,12 +209,16 @@ def masked_psnr(
 
 
 def sobel_magnitude(image: torch.Tensor) -> torch.Tensor:
-    """Gradient magnitude of a one-channel image by a 3x3 Sobel pair, replicate-padded.
+    """Compute gradient magnitude of a single-channel image using 3x3 Sobel filters.
 
-    `(B, 1, H, W)` in, `(B, 1, H, W)` out, in the input's own units per pixel. Used to pick the
-    structural edges a region metric is restricted to (`edge_quantile_mask`); it is not a
-    resampling step, so the area-averaging rule of docs/conventions.md section 4a does not
-    apply. Replicate padding, so the frame border does not read as one long edge.
+    Args:
+        image: (B, 1, H, W) image tensor.
+
+    Returns:
+        (B, 1, H, W) gradient magnitude tensor.
+
+    Raises:
+        ValueError: If input tensor is not (B, 1, H, W).
     """
     if image.ndim != 4 or image.shape[1] != 1:
         raise ValueError(f"sobel_magnitude takes (B, 1, H, W), got {tuple(image.shape)}")
@@ -285,23 +234,18 @@ def sobel_magnitude(image: torch.Tensor) -> torch.Tensor:
 def edge_quantile_mask(
     image: torch.Tensor, mask: torch.Tensor, quantile: float = 0.9
 ) -> torch.Tensor:
-    """The structural edges of each image: pixels above the `quantile` of gradient magnitude.
-
-    A whole-frame mean |delta a*b*| is dominated by the flat asphalt, fields and roofs that make
-    up most of an aerial frame, so it cannot answer "does this upsampling bleed across sharp
-    boundaries?". Restricting the same metric to the top decile of gradient magnitude can
-    (docs/proposals_review.md section 3.B). The threshold is **per image** over the pixels
-    `mask` keeps, because frames differ enormously in how much structure they contain.
+    """Compute a binary edge mask selecting pixels in the top quantile of gradient magnitude.
 
     Args:
-        image: `(B, 1, H, W)` the structure to read edges from -- L* / 100, not a*b*.
-        mask: `(B, 1, H, W)` weights in [0, 1]; pixels with no weight never become edges and do
-            not enter the threshold.
-        quantile: Share of kept pixels treated as flat. 0.9 keeps the top decile.
+        image: (B, 1, H, W) single-channel image tensor.
+        mask: (B, 1, H, W) valid pixel weights in [0, 1].
+        quantile: Quantile threshold in [0, 1). Default is 0.9.
 
     Returns:
-        `(B, 1, H, W)` float 0/1. An image with no kept pixels, or no gradient at all, gets an
-        all-zero mask, so a metric over it has no weight rather than a wrong value.
+        (B, 1, H, W) binary mask tensor.
+
+    Raises:
+        ValueError: If quantile is outside [0, 1).
     """
     if not 0.0 <= quantile < 1.0:
         raise ValueError(f"quantile must be in [0, 1), got {quantile}")
@@ -313,23 +257,20 @@ def edge_quantile_mask(
         if values.numel() == 0:
             continue
         threshold = torch.quantile(values.flatten().float(), quantile)
-        # `> 0` as well as `>= threshold`: on an image that is flat over more than `quantile` of
-        # itself the quantile IS zero, and `>= 0` would mark every pixel -- the opposite of an
-        # edge mask. Flat frames then contribute no weight, which is the honest answer.
         selected = (magnitude[index] >= threshold) & (magnitude[index] > 0) & keep[index]
         out[index] = selected.to(out.dtype)
     return out
 
 
 def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Per-image mean of `value` over the pixels that count: `sum(value * w) / sum(w)`.
+    """Compute weighted spatial mean per image.
 
     Args:
-        value: (B, H, W) or (B, 1, H, W) per-pixel values (a colour difference, an error norm).
-        mask: (B, 1, H, W) weights in [0, 1].
+        value: (B, H, W) or (B, 1, H, W) per-pixel values.
+        mask: (B, 1, H, W) pixel weights in [0, 1].
 
     Returns:
-        (B,), 0 for an image with no weight.
+        (B,) mean values per image.
     """
     weight = mask.to(torch.float32).flatten(1)
     value = value.to(torch.float32).reshape(value.shape[0], -1)
@@ -341,13 +282,17 @@ def masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 def ciede2000(
     lab_1: torch.Tensor, lab_2: torch.Tensor, k_l: float = 1.0, k_c: float = 1.0, k_h: float = 1.0
 ) -> torch.Tensor:
-    """CIEDE2000 colour difference (Sharma, Wu & Dalal 2005), elementwise.
+    """Compute CIEDE2000 color difference elementwise.
 
     Args:
-        lab_1, lab_2: `(..., 3, H, W)` L*, a*, b* (the pipeline's layout).
+        lab_1: (..., 3, H, W) first Lab image tensor.
+        lab_2: (..., 3, H, W) second Lab image tensor.
+        k_l: Lightness parametric factor.
+        k_c: Chroma parametric factor.
+        k_h: Hue parametric factor.
 
     Returns:
-        `(..., H, W)` in the input's dtype. Matches `skimage.color.deltaE_ciede2000`.
+        (..., H, W) color difference map.
     """
     l1, a1, b1 = lab_1.unbind(dim=-3)
     l2, a2, b2 = lab_2.unbind(dim=-3)
@@ -395,19 +340,16 @@ def ciede2000(
 
 
 def colorfulness(srgb: torch.Tensor) -> torch.Tensor:
-    """Hasler & Suesstrunk (2003) colorfulness, per image.
-
-    `M = sqrt(std_rg^2 + std_yb^2) + 0.3 sqrt(mean_rg^2 + mean_yb^2)` with `rg = R - G` and
-    `yb = (R + G) / 2 - B`. A grey image scores 0.
+    """Compute Hasler and Suesstrunk (2003) colorfulness metric per image.
 
     Args:
-        srgb: (B, 3, H, W) sRGB in 0-255 (display units, not linear).
+        srgb: (B, 3, H, W) sRGB image tensor in [0, 255].
 
     Returns:
-        (B,) colorfulness.
+        (B,) colorfulness metric values.
 
     Raises:
-        ValueError: `srgb` is not (B, 3, H, W).
+        ValueError: If srgb is not (B, 3, H, W).
     """
     if srgb.ndim != 4 or srgb.shape[1] != 3:
         raise ValueError(f"colorfulness needs an RGB image (B, 3, H, W), got {tuple(srgb.shape)}")

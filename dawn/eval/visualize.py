@@ -1,15 +1,4 @@
-"""Comparison grids: thermal | generated | real RGB | uncertainty.
-
-The columns are the argument the project has to make visually. Thermal is one channel and is
-shown as grey; the generated and real RGB sit next to each other; the two spread maps say where
-the model disagreed with itself. Side-by-side is also the only honest way to read CIEDE2000,
-which punishes a plausible colour that is not the true one.
-
-Everything arrives as **linear** RGB and leaves as sRGB, because that is the output boundary
-(docs/conventions.md section 1). Uncertainty maps are coloured on a **fixed** `[0, vmax]` ramp,
-never per-image: two frames' maps are only comparable on a shared scale, and normalizing each
-one on its own makes the most confident frame look as uncertain as the worst.
-"""
+"""Visual comparison grid generation for qualitative evaluation."""
 
 from __future__ import annotations
 
@@ -20,25 +9,23 @@ import torch
 
 from dawn.data.color import linear_to_srgb
 
-# Defaults matched to scripts/infer.py, so a grid and a saved map mean the same thing.
-L_SCALE = 10.0  # L* units at the top of the ramp
-AB_SCALE = 10.0  # a*b* units
+L_SCALE = 10.0
+AB_SCALE = 10.0
 
 
 def colorize(value: torch.Tensor, vmax: float, cmap: str = "magma") -> torch.Tensor:
-    """`(B, 1, H, W)` single-channel map -> `(B, 3, H, W)` sRGB in `[0, 1]`, on a FIXED ramp.
+    """Colorize a single-channel map into an sRGB image tensor using a colormap.
 
     Args:
-        value: the map; negatives are clamped to 0.
-        vmax: the value at the top of the ramp. Anything above it saturates rather than
-            rescaling the image.
-        cmap: any matplotlib colormap name.
+        value: (B, 1, H, W) single-channel input map.
+        vmax: Maximum value corresponding to the top of the color ramp.
+        cmap: Colormap name supported by matplotlib.
 
     Returns:
-        `(B, 3, H, W)` float32 in `[0, 1]`.
+        (B, 3, H, W) float32 sRGB tensor in [0, 1].
 
     Raises:
-        ValueError: `value` is not `(B, 1, H, W)`, or `vmax` is not positive.
+        ValueError: If value is not (B, 1, H, W) or vmax is non-positive.
     """
     if value.ndim != 4 or value.shape[1] != 1:
         raise ValueError(f"colorize needs a (B, 1, H, W) map, got {tuple(value.shape)}")
@@ -55,11 +42,16 @@ def colorize(value: torch.Tensor, vmax: float, cmap: str = "magma") -> torch.Ten
 
 
 def grey_to_rgb(thermal: torch.Tensor) -> torch.Tensor:
-    """`(B, 1, H, W)` thermal codes in `[0, 1]` -> `(B, 3, H, W)`, repeated, not colour-mapped.
+    """Convert a single-channel image tensor to 3-channel grayscale.
 
-    Thermal is not sRGB and takes no gamma (docs/conventions.md section 1), so the codes are
-    shown as they are. A false-colour thermal would imply a temperature scale this project does
-    not have.
+    Args:
+        thermal: (B, 1, H, W) single-channel tensor in [0, 1].
+
+    Returns:
+        (B, 3, H, W) grayscale tensor.
+
+    Raises:
+        ValueError: If thermal is not (B, 1, H, W).
     """
     if thermal.ndim != 4 or thermal.shape[1] != 1:
         raise ValueError(f"expected (B, 1, H, W) thermal, got {tuple(thermal.shape)}")
@@ -76,21 +68,23 @@ def make_comparison_grid(
     l_scale: float = L_SCALE,
     ab_scale: float = AB_SCALE,
 ) -> torch.Tensor:
-    """One row per pair: thermal | generated | real RGB [| L\\* spread | a\\*b\\* spread].
+    """Build a side-by-side comparison grid of thermal, generated, and real images.
 
     Args:
-        thermal: `(N, 1, H, W)` thermal codes in `[0, 1]`.
-        generated, real: `(N, 3, H, W)` **linear** RGB in `[0, 1]`.
-        l_std: `(N, 1, H, W)` L\\* spread, in L\\* units. Omitted if None.
-        ab_std: `(N, 1, H, W)` a\\*b\\* spread, in a\\*b\\* units. Omitted if None.
-        pad: white pixels between panels.
-        l_scale, ab_scale: the tops of the two fixed colour ramps.
+        thermal: (N, 1, H, W) thermal image tensor in [0, 1].
+        generated: (N, 3, H, W) generated linear RGB tensor in [0, 1].
+        real: (N, 3, H, W) target linear RGB tensor in [0, 1].
+        l_std: Optional (N, 1, H, W) lightness uncertainty map.
+        ab_std: Optional (N, 1, H, W) chroma uncertainty map.
+        pad: Pixel padding between image panels.
+        l_scale: Lightness colormap maximum scale.
+        ab_scale: Chroma colormap maximum scale.
 
     Returns:
-        `(3, N*(H+pad)-pad, C*(W+pad)-pad)` **sRGB** in `[0, 1]`, ready to save.
+        (3, H_grid, W_grid) composite sRGB grid tensor in [0, 1].
 
     Raises:
-        ValueError: the panels disagree on batch size or spatial size.
+        ValueError: If input panels differ in batch size or spatial dimensions.
     """
     panels = [grey_to_rgb(thermal), _srgb(generated), _srgb(real)]
     if l_std is not None:
@@ -118,7 +112,7 @@ def _srgb(linear: torch.Tensor) -> torch.Tensor:
 
 
 def save_grid(grid: torch.Tensor, path: str | Path) -> Path:
-    """Write a `(3, H, W)` sRGB grid as PNG, through a temporary name."""
+    """Save an sRGB grid tensor to disk as a PNG image atomically."""
     import os
 
     import numpy as np
@@ -145,18 +139,22 @@ def save_comparison_sheets(
     prefix: str = "examples",
     **grid_kwargs,
 ) -> list[Path]:
-    """Split a batch into sheets of `rows_per_sheet` rows and write each as a PNG.
+    """Split comparison batches into multi-row PNG sheets and save to disk.
 
     Args:
-        output_dir: where the sheets go.
-        thermal, generated, real, l_std, ab_std: as `make_comparison_grid`.
-        image_ids: one per pair; written alongside as a `.txt` so a row can be traced back to
-            the frame it came from. A grid with no labels is hard to act on.
-        rows_per_sheet: pairs per sheet.
-        prefix: file stem; sheets are `<prefix>_000.png`, `_001.png`, ...
+        output_dir: Directory where sheets are saved.
+        thermal: (N, 1, H, W) thermal image tensor.
+        generated: (N, 3, H, W) generated linear RGB tensor.
+        real: (N, 3, H, W) target linear RGB tensor.
+        l_std: Optional (N, 1, H, W) lightness uncertainty map.
+        ab_std: Optional (N, 1, H, W) chroma uncertainty map.
+        image_ids: Optional sequence of identifier strings for each row.
+        rows_per_sheet: Number of image pairs per sheet.
+        prefix: Filename prefix for saved sheets.
+        **grid_kwargs: Additional keyword arguments for make_comparison_grid.
 
     Returns:
-        the paths written, in order.
+        List of saved PNG file paths in order.
     """
     output_dir = Path(output_dir)
     total = thermal.shape[0]

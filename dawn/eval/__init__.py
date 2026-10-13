@@ -1,1 +1,1 @@
-"""Evaluation: metrics, calibration, visualization."""
+"""Evaluation metrics, calibration, and visualization utilities."""

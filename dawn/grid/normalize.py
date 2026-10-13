@@ -1,18 +1,9 @@
-"""Token standardization.
-
-Flow matching targets should be roughly N(0, 1)-scaled. `standardize` and `unstandardize` are the
-only places tokens change space; where they are called is pinned in docs/conventions.md section 5.
-
-Tokens are (B, N, D); stats are (D,) vectors. They are built from per-segment stats (brightness
-per (coefficient, bin), colour per channel, correction) by `TokenLayout.stats_vector`, and
-`WeightedMoments` is the accumulator that produces those per-segment stats.
-"""
+"""Token standardization and running moment accumulators."""
 
 from __future__ import annotations
 
 import torch
 
-# std is floored by both standardize and unstandardize, so they stay exact inverses.
 STD_FLOOR = 1e-6
 
 
@@ -29,15 +20,15 @@ def _check(tokens: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> None:
 
 
 def standardize(tokens: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """Raw -> standardized: (tokens - mean) / std, per value of the token.
+    """Standardize tokens elementwise using mean and standard deviation vectors.
 
     Args:
-        tokens: (B, N, D) raw values.
-        mean: (D,) per-value mean.
-        std: (D,) per-value std.
+        tokens: (B, N, D) unnormalized token tensor.
+        mean: (D,) per-feature mean vector.
+        std: (D,) per-feature standard deviation vector.
 
     Returns:
-        Standardized tokens, same shape.
+        (B, N, D) standardized token tensor.
     """
     _check(tokens, mean, std)
     mean, std = mean.to(tokens), std.to(tokens)
@@ -45,15 +36,15 @@ def standardize(tokens: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> 
 
 
 def unstandardize(tokens: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """Standardized -> raw: tokens * std + mean, per value of the token.
+    """Unstandardize tokens elementwise using mean and standard deviation vectors.
 
     Args:
-        tokens: (B, N, D) standardized values.
-        mean: (D,) per-value mean.
-        std: (D,) per-value std.
+        tokens: (B, N, D) standardized token tensor.
+        mean: (D,) per-feature mean vector.
+        std: (D,) per-feature standard deviation vector.
 
     Returns:
-        Raw tokens, same shape.
+        (B, N, D) unstandardized token tensor.
     """
     _check(tokens, mean, std)
     mean, std = mean.to(tokens), std.to(tokens)
@@ -61,12 +52,7 @@ def unstandardize(tokens: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -
 
 
 class WeightedMoments:
-    """Streaming weighted mean and std of `dim` variables, in float64.
-
-    Only running sums are kept, so the memory cost does not grow with the number of samples.
-    Values with weight 0 do not count; the std is unbiased for unit weights (`n / (n - 1)`, to
-    match `torch.std`) and uses the total weight as `n` for fractional ones.
-    """
+    """Streaming accumulator for weighted mean and variance across variables."""
 
     def __init__(self, dim: int):
         self.total = torch.zeros((), dtype=torch.float64)
@@ -75,8 +61,7 @@ class WeightedMoments:
 
     @torch.no_grad()
     def add(self, values: torch.Tensor, weights: torch.Tensor | None) -> None:
-        """Add `values` (M, dim) with per-row `weights` (M,), or all ones when None."""
-        # Move first, then cast: one `.to("cpu", float64)` on an MPS tensor returns wrong values.
+        """Add a batch of values and optional weights to running sums."""
         values = values.detach().cpu().to(torch.float64)
         w = (
             torch.ones(values.shape[0], dtype=torch.float64)
@@ -88,10 +73,10 @@ class WeightedMoments:
         self.sum_sq += (values.pow(2) * w[:, None]).sum(dim=0)
 
     def finalize(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(mean, std)`, float32, `(dim,)` each.
+        """Compute final (mean, std) vectors as float32 tensors.
 
         Raises:
-            ValueError: nothing with positive weight was added.
+            ValueError: If no non-zero weights were added.
         """
         if float(self.total) <= 0:
             raise ValueError("no weight was added, so there are no statistics")

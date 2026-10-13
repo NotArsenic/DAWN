@@ -1,18 +1,4 @@
-"""Progress reporting that is readable both in a terminal and in a log file.
-
-Several passes here take minutes with nothing to show for it: the 28,439-stem `prepare` passes,
-the 2,000-pair token-stats fit at the start of every training run, the oracle over the val pairs.
-
-A tqdm bar is the right answer **interactively** and the wrong one in a log. tqdm redraws with a
-carriage return, so an overnight run under `nohup`, `tmux` or a CI job turns megabytes of `\\r`
-into the file the person debugging it later has to read. So:
-
-    stderr is a TTY   ->  a tqdm bar, if tqdm is installed
-    otherwise         ->  one log line every `every` of the work, with rate and ETA
-
-Callers do not choose; they call `progress(...)` and get whichever fits. `force_lines=True` opts
-out of the bar for a caller that is always logged rather than watched.
-"""
+"""Terminal and log file progress reporting utilities."""
 
 from __future__ import annotations
 
@@ -28,7 +14,7 @@ T = TypeVar("T")
 
 
 def format_duration(seconds: float) -> str:
-    """`7s`, `1m42s`, `3h05m`. Short enough to sit inside a log line."""
+    """Format elapsed duration in seconds into a concise string (e.g. 7s, 1m42s, 3h05m)."""
     if seconds < 60:
         return f"{seconds:.0f}s"
     if seconds < 3600:
@@ -37,10 +23,7 @@ def format_duration(seconds: float) -> str:
 
 
 def eta_line(desc: str, done: int, total: int | None, elapsed: float) -> str:
-    """`align: 4200/8534 (49%) 2m10s elapsed, 18.2/s, ETA 3m58s`.
-
-    With no `total` the share and the ETA are left out rather than guessed at.
-    """
+    """Format a progress status line with rate and estimated time of completion."""
     rate = done / elapsed if elapsed > 0 else 0.0
     head = f"{desc}: {done}" + (f"/{total}" if total else "")
     share = f" ({100 * done / total:.0f}%)" if total else ""
@@ -51,7 +34,7 @@ def eta_line(desc: str, done: int, total: int | None, elapsed: float) -> str:
 
 
 def use_bar(force_lines: bool = False) -> bool:
-    """Whether a tqdm bar would be seen by a person rather than written to a file."""
+    """Check whether an interactive progress bar should be displayed."""
     if force_lines:
         return False
     try:
@@ -68,17 +51,17 @@ def progress(
     every: float = 0.05,
     force_lines: bool = False,
 ) -> Iterator[T]:
-    """Yield from `iterable`, reporting progress the way the output stream wants.
+    """Yield items from iterable while logging progress or updating a progress bar.
 
     Args:
-        iterable: what to iterate. Consumed lazily; a generator stays a generator.
-        desc: the label, e.g. `"align"` or `"token stats"`.
-        total: how many items, when `len()` cannot say (a generator, a stream).
-        every: fraction of the work between log lines in the non-TTY path. 0.05 is 20 lines.
-        force_lines: never use a bar, even on a TTY. For passes whose output is always kept.
+        iterable: Iterable sequence or generator to wrap.
+        desc: Description prefix for status messages.
+        total: Optional total item count if len(iterable) is unavailable.
+        every: Interval fraction between progress log lines when not using a progress bar.
+        force_lines: If True, log lines periodically instead of displaying a bar.
 
     Yields:
-        the items of `iterable`, unchanged.
+        Items yielded from the input iterable.
     """
     if total is None and isinstance(iterable, Sized):
         total = len(iterable)

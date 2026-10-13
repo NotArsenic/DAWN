@@ -1,34 +1,4 @@
-"""The training campaign as data: build the plan, run it, resume it, read the results.
-
-`scripts/run_pipeline.py` is a thin CLI over this module, so the parts worth testing -- what the
-plan is, what counts as finished, whether a gate passed, how a stage resumes -- are testable
-without a GPU and without training anything.
-
-The shape of a campaign (`configs/experiments.yaml`):
-
-    gates       cheap checks, in order, each a gate for the next. smoke -> oracle -> probe ->
-                overfit. None of the expensive runs starts until these pass.
-    runs        stage 1. One run by default: the model that gets shipped.
-    ablations   PARKED. One extra run per open decision, each exactly one knob off the
-                baseline. Opt in with `--ablations`; they buy understanding of the method, not
-                a better model, and they are five times the GPU time of everything else.
-    refiner     stage 2, trained off the fitted grid so it does not depend on which run won.
-    evaluation  the winning checkpoint on the test split.
-
-Three properties the whole thing is built around:
-
-1. **Resumable.** A stage that finished is skipped; a training run with a partial `flow_last.pt`
-   is restarted with `--resume`. An overnight sequence that dies on stage 5 keeps stages 1-4. The
-   record is `pipeline_state.json`, written after every stage.
-2. **Gates really gate.** A failed check stops the campaign and prints the configured `on_fail`,
-   which says what to do rather than only what broke. The plan's own decision rules live there:
-   24 dB on the oracle, the overfit run approaching its oracle, the refiner earning its place.
-3. **The cost is known before it is spent.** `gpu_probe` measures seconds/step, and every later
-   estimate is rescaled from it, so "6 runs x 8 hours" stops being a guess made in a config file.
-
-Nothing here imports torch: it is subprocess orchestration and CSV reading, so it stays importable
-and testable anywhere.
-"""
+"""Experiment pipeline execution, stage orchestration, and campaign result reporting."""
 
 from __future__ import annotations
 
@@ -43,26 +13,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 STATE_FILE = "pipeline_state.json"
-# Stage kinds, in the order a campaign runs them.
 GATE, TRAIN, REFINER, EVAL = "gate", "train", "refiner", "eval"
 
 
 @dataclass(frozen=True)
 class Stage:
-    """One step of the campaign: a command, where it writes, and how to tell it finished.
+    """A pipeline execution stage defining command, output directory, and completion checks.
 
     Args:
-        name: Unique; also the directory under the campaign root and the `--only` selector.
-        kind: `gate`, `train`, `refiner` or `eval`.
-        command: argv WITHOUT the interpreter; `scripts/...` paths are resolved against the repo.
-        out_dir: Where the stage writes, or None for a stage that writes outside the campaign
-            root (the oracle and the smoke test do).
-        done: Files that must all exist for the stage to count as finished.
-        resumable_from: A checkpoint that, if present without `done`, restarts with `--resume`.
-        tests: One line: the question this stage answers. Printed in `--list`.
-        check: How to judge the result (`kind` plus its own keys), or None for exit-code only.
-        hours: Rough cost, rescaled once the probe has measured seconds/step.
-        ablates: For a stage-1 run, the single config key it moves off the baseline.
+        name: Unique identifier for the stage.
+        kind: Stage type ('gate', 'train', 'refiner', or 'eval').
+        command: Command argv tuple without the Python interpreter.
+        out_dir: Output directory path or None.
+        done: Expected artifact paths indicating completion.
+        resumable_from: Checkpoint path allowing resumption.
+        tests: Short description of the stage purpose.
+        check: Verification criteria mapping or None.
+        hours: Estimated duration in hours.
+        ablates: Configuration key modified from baseline, if applicable.
+        steps: Total optimizer training steps.
     """
 
     name: str
@@ -75,30 +44,34 @@ class Stage:
     check: Mapping | None = None
     hours: float = 0.0
     ablates: str = ""
-    steps: int = 0  # optimizer steps this stage really runs; 0 when it does not train
+    steps: int = 0
 
     def is_done(self) -> bool:
-        """Every `done` file exists. A stage with no `done` files never counts as finished."""
+        """Check whether all expected completion artifacts exist."""
         return bool(self.done) and all(path.exists() for path in self.done)
 
     def can_resume(self) -> bool:
+        """Check whether a valid checkpoint exists for resumption."""
         return self.resumable_from is not None and self.resumable_from.exists()
 
     def argv(self, python: str = sys.executable) -> list[str]:
-        """The full command, with `--resume` appended when a partial checkpoint is there."""
+        """Construct full command argument list including interpreter and resume flags."""
         argv = [python, *self.command]
         if not self.is_done() and self.can_resume():
             argv += ["--resume", str(self.resumable_from)]
         return argv
 
     def shell(self, python: str = sys.executable) -> str:
+        """Format the command as a shell-escaped string."""
         return " ".join(shlex.quote(part) for part in self.argv(python))
 
 
 @dataclass
 class StageResult:
+    """Execution result and status summary for a pipeline stage."""
+
     name: str
-    status: str  # ok | skipped | failed | gate_failed
+    status: str
     seconds: float = 0.0
     returncode: int = 0
     detail: str = ""
@@ -109,21 +82,11 @@ class StageResult:
         return self.status in ("ok", "skipped")
 
 
-# --- building the plan ---------------------------------------------------------------------------
-
-
 def stage_one_runs(cfg: Mapping, include_ablations: bool = True) -> list[Mapping]:
-    """The stage-1 runs: always `runs`, plus `ablations` when they are wanted.
-
-    Reading results always wants both -- a summary written after someone ran `--ablations` must
-    still show those rows -- so `summary_table` passes True while `build_plan` passes whatever
-    the caller asked for.
+    """Retrieve list of stage 1 runs, optionally including ablations.
 
     Raises:
-        ValueError: a name appears in both lists. `Stage.name` is the directory, the `--only`
-            selector and the key in `pipeline_state.json`, so a duplicate silently gives two
-            stages one output directory. The natural way in is un-parking an ablation by
-            copying it into `runs:` instead of moving it.
+        ValueError: If duplicate run names exist.
     """
     runs = list(cfg.get("runs") or [])
     if include_ablations:
@@ -136,11 +99,7 @@ def stage_one_runs(cfg: Mapping, include_ablations: bool = True) -> list[Mapping
 
 
 def command_overrides(command: Sequence[str]) -> list[str]:
-    """The `--override` values of a built command, so a gate's own overlay is not lost.
-
-    `configs/overfit_gpu.yaml` sets `num_train_steps: 3000`; costing that gate from the
-    campaign's overrides alone resolved it to the baseline's 20,000.
-    """
+    """Extract override arguments from a command sequence."""
     command = list(command)
     if "--override" not in command:
         return []
@@ -153,7 +112,7 @@ def command_overrides(command: Sequence[str]) -> list[str]:
 
 
 def _trains(command: Sequence[str]) -> bool:
-    """Whether a command runs a training loop at all (`smoke_dino` and the oracle do not)."""
+    """Check whether a command invokes a training script."""
     return any(c.endswith(("train_flow.py", "train_refiner.py")) for c in command)
 
 
@@ -175,17 +134,10 @@ def build_plan(
     repo: Path | None = None,
     extra_overrides: Sequence[str] = (),
 ) -> list[Stage]:
-    """Every stage of the campaign, in run order.
-
-    The order is the dependency: gates, then `baseline`, then the ablations, then stage 2, then
-    evaluation. Nothing runs in parallel -- there is one GPU, and two runs sharing it would make
-    both their seconds/step meaningless.
-    """
+    """Build the ordered list of pipeline stages for an experiment campaign."""
     root = Path(root or cfg.get("root", "runs"))
     repo = Path(repo or Path(__file__).resolve().parents[1])
     device = str(cfg.get("device", "cuda"))
-    # `extra_overrides` go last so they win: that is how `--extra-override configs/fast.yaml`
-    # puts back a key configs/gpu_5090.yaml changed.
     base_overrides = [str(p) for p in cfg.get("common_overrides") or []]
     common = base_overrides + [str(p) for p in extra_overrides]
     stages: list[Stage] = []
@@ -194,7 +146,6 @@ def build_plan(
         for gate in cfg.get("gates") or []:
             out_dir = root / gate["name"]
             command = list(gate["command"])
-            # A gate that trains gets the campaign's shared overrides and its own directory.
             if command[0].endswith("train_flow.py"):
                 command = _append_train_options(command, common, device, out_dir)
             stages.append(
@@ -236,11 +187,6 @@ def build_plan(
     refiner = cfg.get("refiner")
     if refiner:
         out_dir = root / refiner["name"]
-        # `common_overrides` only, NOT `extra_overrides`. `train_refiner.py` merges its
-        # `--override` files AFTER configs/refiner.yaml, so a stage-1 budget overlay like
-        # configs/fast.yaml would silently rewrite stage 2's LR warmup and checkpoint spacing
-        # while leaving its own step count alone -- on the one stage whose entire output is a
-        # go/no-go number. Hardware overlays belong in `common_overrides` and are fine here.
         command = ["scripts/train_refiner.py", "--device", device, "--out-dir", str(out_dir)]
         if base_overrides:
             command += ["--override", *base_overrides]
@@ -265,9 +211,9 @@ def build_plan(
             Stage(
                 name="evaluation",
                 kind=EVAL,
-                command=(),  # filled in at run time: it needs the winning checkpoint
+                command=(),
                 out_dir=out_dir,
-                done=(out_dir / "summary.json",),  # what scripts/evaluate.py writes
+                done=(out_dir / "summary.json",),
                 tests="The winning stage-1 checkpoint on the test split.",
                 hours=float(evaluation.get("hours", 0.0)),
             )
@@ -278,15 +224,12 @@ def build_plan(
 def _append_train_options(
     command: Sequence[str], common: Sequence[str], device: str, out_dir: Path
 ) -> list[str]:
-    """Merge the campaign's shared overrides into a gate's own `--override` list."""
+    """Append shared training arguments and overrides to a command."""
     command = list(command)
     if "--config" not in command:
         command = [command[0], "--config", "configs/flow.yaml", *command[1:]]
     if common:
         if "--override" in command:
-            # Slice assignment, not `insert(i, *common)`: that only ever worked while
-            # `common_overrides` held exactly one entry, and silently raised on the second.
-            # The campaign's overrides go FIRST so the gate's own overlay still wins.
             at = command.index("--override") + 1
             command[at:at] = list(common)
         else:
@@ -297,8 +240,7 @@ def _append_train_options(
 def evaluation_command(
     checkpoint: Path, out_dir: Path, cfg: Mapping, device: str
 ) -> tuple[str, ...]:
-    """`evaluate.py` on the winning checkpoint. Built late, because the winner is not known
-    until every stage-1 run has a validation curve."""
+    """Construct evaluation command arguments for a specified checkpoint."""
     evaluation = cfg.get("evaluation") or {}
     return (
         "scripts/evaluate.py",
@@ -313,11 +255,8 @@ def evaluation_command(
     )
 
 
-# --- reading what a run produced -----------------------------------------------------------------
-
-
 def read_csv_rows(path: Path) -> list[dict]:
-    """A `metrics/<kind>.csv` as a list of dicts, numbers parsed, blanks dropped."""
+    """Read a CSV file into a list of row dictionaries with parsed numeric values."""
     import csv
 
     if not path.exists():
@@ -338,11 +277,7 @@ def read_csv_rows(path: Path) -> list[dict]:
 
 
 def run_metrics(out_dir: Path, subset: str = "box_aligned") -> dict:
-    """The last validation row of a stage-1 run, keys stripped of their `val_<subset>/` prefix.
-
-    The last row, not the best: `flow_best.pt` already records the best, and a campaign table
-    comparing runs wants where each one ended up, with the best shown beside it.
-    """
+    """Extract metrics from the last validation row of a run directory."""
     prefix = f"val_{subset}/"
     rows = read_csv_rows(out_dir / "metrics" / f"val_{subset}.csv")
     if not rows:
@@ -350,7 +285,6 @@ def run_metrics(out_dir: Path, subset: str = "box_aligned") -> dict:
     last = rows[-1]
     out = {k[len(prefix) :]: v for k, v in last.items() if k.startswith(prefix)}
     out["step"] = last.get("step", 0)
-    # The best CIEDE2000 and L* PSNR seen at any validation, which is what flow_best.pt holds.
     for metric, better in (("ciede2000/euler", min), ("psnr_L/euler", max)):
         seen = [r[prefix + metric] for r in rows if prefix + metric in r]
         if seen:
@@ -359,7 +293,7 @@ def run_metrics(out_dir: Path, subset: str = "box_aligned") -> dict:
 
 
 def median_sec_per_step(out_dir: Path) -> float | None:
-    """Median `loss/sec_per_step` from a run's train CSV, skipping the first few warm-up steps."""
+    """Compute median seconds per step from a training log CSV."""
     rows = read_csv_rows(out_dir / "metrics" / "train.csv")
     values = [r["loss/sec_per_step"] for r in rows if "loss/sec_per_step" in r]
     values = values[2:] or values
@@ -367,12 +301,7 @@ def median_sec_per_step(out_dir: Path) -> float | None:
 
 
 def resolve_steps(repo: Path, overrides: Sequence[str], command: Sequence[str]) -> int:
-    """How many optimizer steps a stage will really run, from its own merged config.
-
-    Read rather than assumed, because `--extra-override configs/fast.yaml` changes
-    `flow.num_train_steps` and a cost table that still quoted the full budget would be worse
-    than no table. `--max-steps` on the command line wins, as it does in the trainer.
-    """
+    """Resolve total optimizer training steps from configuration overlays."""
     command = list(command)
     if "--max-steps" in command:
         return int(command[command.index("--max-steps") + 1])
@@ -386,30 +315,15 @@ def resolve_steps(repo: Path, overrides: Sequence[str], command: Sequence[str]) 
             merged = OmegaConf.merge(merged, OmegaConf.load(repo / path))
         section = "refiner" if any("train_refiner" in c for c in command) else "flow"
         return int(OmegaConf.to_container(merged, resolve=True)[section]["num_train_steps"])
-    except Exception:  # a missing or unreadable overlay: fall back to the declared estimate
+    except Exception:
         return 0
 
 
 def rescale_hours(stages: Sequence[Stage], measured: float, reference: float) -> dict[str, float]:
-    """Each stage's estimated hours, given the step time the probe measured.
-
-    A stage-1 run whose real step count is known is costed directly as `steps x seconds`,
-    which is exact once the probe has run and stays right when an overlay changes the budget.
-    Gates and the refiner keep their declared estimate whatever the probe measures -- see the
-    comment in the loop for why neither shares stage 1's per-step profile.
-    """
-    # Before the probe has run, the reference step time stands in. It is a single number, so it
-    # cannot know that an overlay halved `timesteps_per_image`; the probe measures the real one
-    # and every number here becomes exact.
+    """Rescale estimated runtime hours for stages using measured step durations."""
     seconds = measured if measured and measured > 0 else reference
     hours = {}
     for stage in stages:
-        # A stage with a real step count is costed directly. Gates keep their declared
-        # estimate: two of them do not train at all, and the two that do are short and
-        # dominated by data loading. So does the refiner -- it has no DINO pass, just two
-        # encoder passes' worth of grid fit against a 2,545-parameter conv on a crop, so its
-        # 8,000 steps cost nothing like stage 1's. Evaluation IS the probe's profile (one DINO
-        # pass plus NFE velocity passes per test pair), so it scales.
         if stage.steps and stage.kind in (TRAIN, EVAL):
             hours[stage.name] = stage.steps * seconds / 3600.0
         elif stage.kind in (TRAIN, EVAL) and measured and reference:
@@ -419,26 +333,13 @@ def rescale_hours(stages: Sequence[Stage], measured: float, reference: float) ->
     return hours
 
 
-# --- checks --------------------------------------------------------------------------------------
-
-
 def is_blocking(stage: Stage) -> bool:
-    """Whether a failed check should stop the campaign.
-
-    A gate is blocking: it exists to say the rest is not worth running. The refiner's check is
-    not -- "the refiner did not earn its place" is a RESULT, and halting on it would throw away
-    the evaluation that is the whole point of the night. `check.blocking: false` says so.
-    """
+    """Check whether failure in this stage should halt pipeline execution."""
     return bool((stage.check or {}).get("blocking", True))
 
 
 def check_stage(stage: Stage, root: Path) -> tuple[bool, str]:
-    """Judge a finished stage against its configured `check`. `(passed, detail)`.
-
-    A stage with no check passes on its exit code alone, which the caller has already seen.
-    Judged from the artifacts on disk, never from `pipeline_state.json`, so re-running a
-    campaign re-evaluates a gate that failed rather than skipping it as "done".
-    """
+    """Evaluate stage verification criteria against produced artifacts."""
     check = stage.check
     if not check:
         return True, ""
@@ -477,7 +378,6 @@ def _check_val_metric(stage: Stage, check: Mapping) -> tuple[bool, str]:
         return True, ""
     scores = run_metrics(stage.out_dir)
     if not scores:
-        # A refiner run writes its own subset file; fall back to whatever validation CSV exists.
         for path in sorted((stage.out_dir / "metrics").glob("val*.csv")):
             rows = read_csv_rows(path)
             if rows:
@@ -500,15 +400,8 @@ def _check_val_metric(stage: Stage, check: Mapping) -> tuple[bool, str]:
     return value >= floor, f"{metric} {value:.4f} (needs >= {floor})"
 
 
-# --- the comparison table ------------------------------------------------------------------------
-
-
 def summary_table(cfg: Mapping, root: Path, subset: str = "box_aligned") -> str:
-    """A markdown table of every stage-1 run that has a validation curve.
-
-    This is the payoff of the campaign: one table, read down the `CIEDE2000` column, with the
-    knob each row moved named beside it so a difference can be attributed to something.
-    """
+    """Format markdown summary table comparing metrics across stage 1 runs."""
     rows = []
     for run in stage_one_runs(cfg):
         scores = run_metrics(root / run["name"], subset)
@@ -553,22 +446,7 @@ def pick_winner(
     subset: str = "box_aligned",
     names: Iterable[str] | None = None,
 ) -> tuple[str, Path] | None:
-    """The run with the best `evaluation.select_by`, and its `flow_best.pt`.
-
-    Two restrictions, both of which cost a night when they are missing:
-
-    `names` scopes the candidates to the runs the campaign actually planned. Without it the
-    default essentials campaign would happily evaluate and ship a PARKED ablation left over
-    from an earlier `--ablations` run, so the 8 hours of `baseline` nobody had to re-run would
-    go unevaluated. `None` means every run in the file, which is what a bare `--summary` wants.
-
-    A run must also have **finished**: `flow_best.pt` is rewritten at every validation, so an
-    aborted run has one from step 500 and it can easily hold the best score of a short curve.
-    `flow_last.pt` only appears when the loop completes, so that is the test.
-
-    An ablation that moves the token layout (the correction) is still eligible when it is in
-    scope: a checkpoint is self-describing, so evaluation picks the layout up from it.
-    """
+    """Select the best-performing stage 1 run and its checkpoint path."""
     metric = str((cfg.get("evaluation") or {}).get("select_by", "ciede2000"))
     key = {"ciede2000": "best_ciede2000/euler", "psnr_L": "best_psnr_L/euler"}.get(metric)
     if key is None:
@@ -584,7 +462,7 @@ def pick_winner(
         if key not in scores or not checkpoint.exists():
             continue
         if not (root / run["name"] / "flow_last.pt").exists():
-            continue  # the run did not finish; its "best" is the best of a truncated curve
+            continue
         value = scores[key] * (1.0 if higher_is_better else -1.0)
         if best is None or value > best[0]:
             best = (value, run["name"])
@@ -593,22 +471,15 @@ def pick_winner(
     return best[1], root / best[1] / "flow_best.pt"
 
 
-# --- state ---------------------------------------------------------------------------------------
-
-
 def preflight_data(data_cfg: Mapping, sample: int = 25) -> list[str]:
-    """What is missing before any training can start. Empty means the data phase is done.
-
-    This is the cheapest possible check against the most expensive possible mistake: a campaign
-    that starts, spends a minute building token stats, and only then dies because the aligned
-    PNGs were never written. The manifests are committed to the repo, but
-    `data/dronevehicle_aligned/` is gitignored and has to be produced locally
-    (`scripts/fetch_dronevehicle.py` then `scripts/prepare_dronevehicle.py all`).
+    """Validate required dataset manifests and aligned image files exist on disk.
 
     Args:
-        data_cfg: the `dronevehicle` section of data.yaml.
-        sample: how many manifest entries to actually look for on disk. Spot-checking beats
-            stat-ing 5,385 ids x 5 files every time the pipeline starts.
+        data_cfg: Dataset configuration mapping.
+        sample: Number of samples per split to verify.
+
+    Returns:
+        List of missing file errors or empty list if valid.
     """
     manifest_dir = Path(str(data_cfg["manifest_dir"]))
     aligned_dir = Path(str(data_cfg["aligned_dir"]))
@@ -652,6 +523,7 @@ def preflight_data(data_cfg: Mapping, sample: int = 25) -> list[str]:
 
 
 def load_state(root: Path) -> dict:
+    """Load pipeline state dictionary from state file."""
     path = root / STATE_FILE
     if not path.exists():
         return {"stages": {}}
@@ -659,11 +531,13 @@ def load_state(root: Path) -> dict:
 
 
 def save_state(root: Path, state: Mapping) -> None:
+    """Save pipeline state dictionary to state file."""
     root.mkdir(parents=True, exist_ok=True)
     (root / STATE_FILE).write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
 def record(state: dict, result: StageResult) -> dict:
+    """Record a stage result entry in the pipeline state dictionary."""
     state.setdefault("stages", {})[result.name] = {
         "status": result.status,
         "seconds": round(result.seconds, 1),
@@ -674,9 +548,6 @@ def record(state: dict, result: StageResult) -> dict:
     return state
 
 
-# --- running -------------------------------------------------------------------------------------
-
-
 def run_stage(
     stage: Stage,
     repo: Path,
@@ -684,11 +555,7 @@ def run_stage(
     python: str = sys.executable,
     echo: bool = True,
 ) -> StageResult:
-    """Run one stage, streaming its output to the console and to `log_dir/<name>.log`.
-
-    Streaming to both is deliberate: an overnight campaign is watched through `tail -f`, and the
-    log is the record of what happened when nobody was watching.
-    """
+    """Execute a pipeline stage as a subprocess and stream logs."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{stage.name}.log"
     argv = stage.argv(python)
@@ -719,7 +586,7 @@ def run_stage(
 
 
 def plan_table(stages: Iterable[Stage], hours: Mapping[str, float] | None = None) -> str:
-    """The campaign as a table: what runs, whether it is already done, and what it costs."""
+    """Format markdown summary table of campaign execution plan and estimates."""
     stages = list(stages)
     hours = hours or {s.name: s.hours for s in stages}
     lines = ["| # | stage | kind | state | ~hours | what it answers |", "|---|---|---|---|---|---|"]
@@ -730,7 +597,7 @@ def plan_table(stages: Iterable[Stage], hours: Mapping[str, float] | None = None
             state = "**resume**"
         else:
             state = "to run"
-        knob = f"`{stage.ablates}` — " if stage.ablates else ""
+        knob = f"`{stage.ablates}`: " if stage.ablates else ""
         lines.append(
             f"| {index} | `{stage.name}` | {stage.kind} | {state} | {hours.get(stage.name, 0):.1f} "
             f"| {knob}{stage.tests} |"
