@@ -1,38 +1,5 @@
 #!/usr/bin/env python3
-"""Run a trained Dawn model on thermal frames: day RGB plus two uncertainty maps.
-
-The inference path of the plan, in order: read the thermal frame, run DINO once, draw K samples
-with 2 velocity evaluations each, render every member, and reduce them to one image and the
-spread of the ensemble (docs/conventions.md sections 6.4 and 11). The encoder runs once per
-frame however large K is, so K samples cost `nfe * K` velocity passes and nothing else.
-
-Everything about the model comes out of the checkpoint -- the token layout, the resolution, the
-upsampling mode and especially the normalization stats, which must never be read from
-`grid.stats_cache` (section 5.1). The only things this script decides are K, the sampler and
-where the files go.
-
-Usage:
-    python scripts/infer.py --checkpoint checkpoints/run1/flow_last.pt --input frame.jpg
-    python scripts/infer.py --checkpoint ... --input data/DroneVehicle/test/testimgr --limit 20
-    python scripts/infer.py --checkpoint ... --input frames/ --samples 8 --method midpoint
-    python scripts/infer.py --checkpoint ... --refiner checkpoints/refiner/refiner_last.pt ...
-
-Inputs may be raw DroneVehicle frames (840x712 with the 100-px border, cropped here) or frames
-already at the checkpoint's input size. The local refiner of the plan's step 6 is optional
-(`--refiner`, a Stage 2 checkpoint) and runs between the render and the save: it sharpens the
-rendered brightness and leaves a* and b* alone. Without it the saved image is exactly what
-Stage 1 renders.
-
-**The refiner does not touch the uncertainty maps, by choice.** It is applied to the two images
-this script writes -- the displayed member and the ensemble mean -- and not to the K members, so
-`l_std` and `ab_std` stay the spread of the *unrefined* ensemble: the maps that come out of a
-`--refiner` run describe the unrefined ensemble, and should be read that way. The reasoning is
-that the refiner is deterministic given `L`, so it adds no disagreement between members; refining
-each member would move `l_std` only through the refiner's own nonlinearity, a change in the
-reported spread that no extra uncertainty in the model stands behind. And docs/conventions.md
-section 11 makes `dawn/uncertainty/spread.py` the single place the spread is computed, which this
-path leaves untouched rather than recomputing a second spread here.
-"""
+"""Run inference on thermal frames to generate daytime RGB and uncertainty maps."""
 
 from __future__ import annotations
 
@@ -63,7 +30,7 @@ logger = logging.getLogger(__name__)
 SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 def find_inputs(paths: list[str], limit: int | None) -> list[Path]:
-    """One or more files/directories, sorted so runs are reproducible."""
+    """Find and return image paths from files or directories up to an optional limit."""
     files = set()
     for p_str in paths:
         p = Path(p_str)
@@ -83,12 +50,7 @@ def find_inputs(paths: list[str], limit: int | None) -> list[Path]:
 
 
 def read_thermal(path: Path, input_size: tuple[int, int]) -> torch.Tensor:
-    """`(1, 1, H, W)` thermal, `code / 255`, at `input_size` (docs/conventions.md section 1).
-
-    A raw 840x712 frame loses its border first. Anything larger than the model's input is area
-    averaged down (section 4a); anything smaller is an error, because upsampling a thermal frame
-    would invent the texture the grid is guided by.
-    """
+    """Read a thermal frame, crop borders if needed, and scale to the input resolution."""
     thermal = read_thermal8(path).to(torch.float32) / 255.0
     if tuple(thermal.shape[-2:]) == FRAME_SIZE:
         thermal = crop_border(thermal)
@@ -104,12 +66,7 @@ def read_thermal(path: Path, input_size: tuple[int, int]) -> torch.Tensor:
 
 
 def colorize(value: torch.Tensor, scale: float) -> np.ndarray:
-    """A `(1, 1, h, w)` map to an 8-bit RGB image on a FIXED `[0, scale]` ramp.
-
-    Fixed, not per-image: two frames' uncertainty maps are only comparable if they share a scale,
-    and a per-image normalization would make the most confident frame look as uncertain as the
-    worst. Values above `scale` saturate.
-    """
+    """Map a single-channel uncertainty map to an 8-bit RGB heatmap using a fixed scale."""
     from matplotlib import colormaps
 
     normalized = (value[0, 0].clamp(min=0.0) / scale).clamp(0.0, 1.0).cpu().numpy()
@@ -117,6 +74,7 @@ def colorize(value: torch.Tensor, scale: float) -> np.ndarray:
 
 
 def save_png(array: np.ndarray, path: Path) -> None:
+    """Save an array as a PNG image."""
     from PIL import Image
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,11 +82,12 @@ def save_png(array: np.ndarray, path: Path) -> None:
 
 
 def to_srgb8(linear: torch.Tensor) -> np.ndarray:
-    """`(1, 3, h, w)` linear RGB -> `(h, w, 3)` uint8 sRGB (section 1, output boundary)."""
+    """Convert a linear RGB tensor to an 8-bit sRGB array."""
     return linear_to_srgb8(linear)[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
 
 
 def write_outputs(out: SpreadResult, stem: str, directory: Path, args) -> None:
+    """Write output RGB images and uncertainty maps to disk."""
     save_png(to_srgb8(out.sample_rgb), directory / f"{stem}_rgb.png")
     if args.save_mean:
         save_png(to_srgb8(out.rgb), directory / f"{stem}_mean.png")
@@ -151,12 +110,7 @@ def run_one(
     args,
     refiner: LocalRefiner | None = None,
 ) -> tuple[SpreadResult, SpreadResult, torch.Tensor]:
-    """One frame, end to end: read, one DINO pass, K members, render, then step 6.
-
-    Returns the unrefined result, the refined result, and the refiner's residual
-    `(1, 1, h, w)` in `L = L*/100` units, so the caller can report whether Stage 2 moved
-    anything; with no refiner the residual is zeros.
-    """
+    """Run model inference on a single thermal frame, optionally applying refinement."""
     thermal = read_thermal(path, bundle.input_size).to(device)
     encoded = bundle.encoder.encode(thermal, return_attn=True)
     out = sample_with_spread(
@@ -173,13 +127,6 @@ def run_one(
         nfe=args.nfe,
         image_ids=[path.stem] if args.seed_from_name else None,
     )
-    # Step 6, between the render and the save, on the two IMAGES only: the displayed member and
-    # the ensemble mean. `l_std` and `ab_std` are carried through untouched on purpose -- the
-    # refiner is deterministic given L, so it adds no member-to-member disagreement, and the
-    # spread stays the one dawn/uncertainty/spread.py computed over the unrefined members
-    # (docs/conventions.md section 11, and the module docstring above). `apply_refiner` with no
-    # refiner is an exact identity, so this costs the no-refiner run nothing but the Lab -> RGB
-    # it would have done anyway.
     member = apply_refiner(out.sample_lab, thermal, refiner)
     ensemble = apply_refiner(out.lab, thermal, refiner)
     refined = replace(
@@ -193,6 +140,7 @@ def run_one(
 
 
 def main() -> None:
+    """Run model inference CLI."""
     parser = argparse.ArgumentParser(
         description="Dawn inference: thermal -> day RGB + uncertainty maps"
     )
@@ -279,8 +227,6 @@ def main() -> None:
         if refiner is not None:
             write_outputs(refined, path.stem, directory / "refined", args)
 
-        # The residual is in L = L*/100 units; report L*, the unit the maps and the metrics use,
-        # so "the refiner did nothing" is visible per frame rather than only in the images.
         refined_str = (
             "" if refiner is None else f", refiner |dL*| {100 * float(residual.abs().mean()):.2f}"
         )

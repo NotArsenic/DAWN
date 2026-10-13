@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a trained Dawn model on the real paired RGB: the plan's whole metric table.
-
-Scores `test_pairs` (or any manifest) against the daytime RGB those thermal frames are paired
-with, on whole frames and over the vehicle region, with the masked pixels excluded everywhere.
-
-    structure   L* PSNR (peak 100) and L* SSIM
-    colour      mean CIEDE2000
-    vividness   colorfulness (Hasler & Suesstrunk), beside the real image's own
-    perceptual  LPIPS
-    vehicles    the pixel metrics again over the vehicle region
-    spread      mean L* and a*b* sample spread, for dawn/eval/calibration.py to rank
-
-Two things this script does NOT decide. The **model** side -- token layout, resolution,
-upsampling mode, normalization stats -- all comes out of the checkpoint, never out of a config
-(docs/conventions.md section 5.1). And the headline is **box-aligned pairs only**: fallback pairs
-were aligned by edge correlation alone, so they are reported as a separate robustness number
-rather than averaged in.
-
-Colour difference punishes a plausible colour that is not the true one -- a blue car painted red
-scores badly -- so CIEDE2000 is read next to colorfulness and the example grids, never alone.
-
-Usage:
-    python scripts/evaluate.py --checkpoint checkpoints/run1/flow_best.pt --device cuda
-    python scripts/evaluate.py --checkpoint ... --split val_pairs --max-pairs 40 --device cpu
-"""
+"""Evaluate a trained model checkpoint against paired ground-truth RGB images."""
 
 from __future__ import annotations
 
@@ -57,19 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def vehicle_region(raw_batch, size, mode: str, min_pixels: int, device) -> torch.Tensor | None:
-    """The region the "do vehicles survive?" row is scored over, as a `(B, 1, H, W)` weight.
-
-    The plan asks for crops from the RGB boxes, but boxes are not persisted with the aligned
-    pairs (`ASSET_KINDS` is rgb/thermal/valid/moving/vehicles) and re-deriving them needs the raw
-    dataset plus the transform in `logs/align.csv`. `metrics.vehicle_region` picks the stand-in:
-
-        mask    the `vehicles` mask itself, area-averaged to the working size. Dilated 3 px and
-                stretched 17.4 px for vehicles that may have moved, so it is larger than the
-                true boxes.
-        boxes   the bounding box of each connected component of that mask, which is closer to a
-                crop. Vehicles that touch merge into one component.
-        none    no vehicle rows.
-    """
+    """Extract spatial vehicle evaluation mask weighting for a batch."""
     if mode == "none" or "vehicles" not in raw_batch:
         return None
     veh = raw_batch["vehicles"].to(device).float()
@@ -96,7 +60,7 @@ def vehicle_region(raw_batch, size, mode: str, min_pixels: int, device) -> torch
 
 @torch.no_grad()
 def score_subset(bundle, dataset, cfg, ecfg, mcfg, method, device, lpips_fn) -> list[dict]:
-    """One row per pair: every metric, plus the sample spread and the pair's kind."""
+    """Compute image quality and uncertainty metrics for all pairs in dataset subset."""
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=int(ecfg["batch_size"]),
@@ -128,9 +92,6 @@ def score_subset(bundle, dataset, cfg, ecfg, mcfg, method, device, lpips_fn) -> 
         veh = vehicle_region(
             raw, size, str(mcfg["vehicle_region"]), int(mcfg["min_vehicle_pixels"]), device
         )
-        # The single sample is the headline: it is what inference actually emits. The ensemble
-        # mean is reported beside it because averaging helps CIEDE2000 and hurts colorfulness,
-        # which is exactly the trade the plan warns about.
         scored = evaluate_batch(
             out.sample_lab, lab_target, out.sample_rgb, batch["rgb"],
             batch["mask"], vehicle_mask=veh, lpips_fn=lpips_fn,
@@ -149,13 +110,7 @@ def score_subset(bundle, dataset, cfg, ecfg, mcfg, method, device, lpips_fn) -> 
 
 
 def summarize(rows: list[dict], percentiles) -> dict[str, dict[str, float]]:
-    """`{metric: {mean, p10, p50, p90}}` over the rows given, non-finite values dropped.
-
-    NaN means "this image had nothing to score for this metric", which `evaluate_batch` uses
-    for the vehicle rows of a pair whose pixel mask deleted the vehicles (every fallback pair).
-    A metric left with no finite value at all is omitted from the table rather than printed as
-    a sentinel.
-    """
+    """Compute summary statistics for metric values over evaluated pairs."""
     keys = [k for k in rows[0] if isinstance(rows[0][k], float)] if rows else []
     out = {}
     for k in keys:

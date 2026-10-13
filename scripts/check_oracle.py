@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-"""The brightness and colour oracle: what the best possible model could reach.
-
-Fits the brightness grid (thermal -> L = L*/100) and the colour map to the real day pairs with the
-project's own targets code, renders them with the one render path, and measures against the RGB:
-
-    - L* PSNR (peak 100) of the grid alone at refine 0 and 1, with the generated-L correction
-      (BGU-upsampled, and bilinear as the plan's reference), by box-aligned and fallback pairs;
-    - the colour ceiling: the true a*b* at the colour-map size, bilinear vs bilateral guided
-      upsampling guided by the true L, whole-frame and restricted to structural edges;
-    - the assembled oracle image's L* PSNR and CIEDE2000;
-    - a small BGU grid-size sweep, to choose `color.bgu` in configs/flow.yaml;
-    - a contact sheet of the worst 10% of grid-only scenes: what the grid cannot express.
-
-Writes outputs/oracle/report.md, the per-pair numbers and the sheets. The decision rule of the plan
-(keep the grid alone at about 24 dB or more, else turn the correction on) is read off this report;
-`brightness_correction.enabled` is the maintainer's call (CLAUDE.md, open decisions).
-
-Usage:
-    python scripts/check_oracle.py                                  # all val pairs, 640x512, CPU
-    python scripts/check_oracle.py --device mps --train-sample 200
-    python scripts/check_oracle.py --override configs/mps.yaml      # half resolution
-"""
+"""Evaluate brightness and color oracle reconstruction ceilings on aligned pairs."""
 
 from __future__ import annotations
 
@@ -44,7 +23,6 @@ from dawn.flow.loaders import load_config  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# The numbers the handoff measured with a throwaway probe (120 random val pairs, seed 0, 640x512).
 PROBE_PAIRS, PROBE_SEED = 120, 0
 PROBE_GRID_ONLY_DB = 24.72
 PROBE_TOLERANCE_DB = 0.5
@@ -53,13 +31,14 @@ SWEEP_RIDGE, SWEEP_REFINE = (1e-3, 1e-1), (0, 2)
 
 
 def probe_ids(dataset) -> set[str]:
-    """The pairs the handoff's probe used: `random.sample(range(len), 120)` after `seed(0)`."""
+    """Sample fixed probe subset of image IDs for validation check."""
     random.seed(PROBE_SEED)
     picks = random.sample(range(len(dataset)), min(PROBE_PAIRS, len(dataset)))
     return {dataset.image_ids[i] for i in picks}
 
 
 def build_report(args, cfg, rows, train_rows, sweeps, sheets, checks) -> str:
+    """Format oracle evaluation metrics and verification results as Markdown."""
     size = cfg["encoder"]["input_size"]
     n_box = sum(not r["fallback"] for r in rows)
     lines = [
@@ -109,6 +88,7 @@ def build_report(args, cfg, rows, train_rows, sweeps, sheets, checks) -> str:
 
 
 def main():
+    """Run brightness and color oracle evaluation and output report."""
     parser = argparse.ArgumentParser(description="Brightness and colour oracle check")
     parser.add_argument("--config", type=str, default="configs/flow.yaml", help="Flow config")
     parser.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
@@ -187,10 +167,7 @@ def main():
         f"{cfg['color']['bgu']}) mean abs delta a*b*; `color.upsample` is "
         f"**{cfg['color']['upsample']}** (the maintainer chose bilinear at Checkpoint A)"
     )
-    # The same comparison restricted to structural edges. The whole-frame mean is dominated by
-    # flat asphalt, fields and roofs, so it cannot say whether bilinear bleeds colour across
-    # sharp thermal boundaries; this can. If BGU wins here while losing above, the choice of
-    # `color.upsample` is a trade rather than a clear call (docs/proposals_review.md, 3.B).
+    # Evaluate color ceiling on structural edge pixels.
     bgu_e = oracle.summarize(rows, "ab_err_bgu_edge")["mean"]
     bil_e = oracle.summarize(rows, "ab_err_bilinear_edge")["mean"]
     quantile = float(cfg["color"].get("edge_quantile", 0.9))

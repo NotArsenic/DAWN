@@ -1,39 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Dawn training campaign: the gates, the model, stage 2 and evaluation.
-
-One command, start to finish:
-
-    python scripts/run_pipeline.py --list       # what would run, in order, with the cost
-    python scripts/run_pipeline.py --dry-run    # the exact commands, run nothing
-    python scripts/run_pipeline.py --yes        # run it
-
-What runs is declared in `configs/experiments.yaml` and nowhere else. The order is the dependency:
-
-    smoke_dino -> oracle -> gpu_probe -> overfit      the gates, each a gate for the next
-    baseline                                          the model
-    refiner                                           stage 2
-    evaluation                                        the winning checkpoint on the test split
-
-The five ablations in `ablations:` are PARKED: they answer open decisions about the method, not
-about this model, and cost five times the rest put together. `--ablations` runs them all;
-`--only correction` runs one.
-
-Three things this buys over running the commands by hand:
-
-**It will not start the expensive runs until the cheap checks pass.** The oracle's 24 dB rule and
-the overfit gate's "approach your own oracle" are enforced, not suggested, and a failure prints
-what to do about it rather than only what broke.
-
-**It is resumable and idempotent.** A finished stage is skipped. A training run with a partial
-`flow_last.pt` restarts with `--resume`. A campaign that dies on stage 5 at 4 a.m. keeps stages 1
-to 4 and picks up where it stopped; `pipeline_state.json` is the record.
-
-**It costs what it says.** `gpu_probe` measures seconds/step on the real configuration and the
-stage-1 and evaluation estimates are rescaled from it (a gate and the refiner do not share that
-per-step profile, so they keep their declared numbers). Nothing launches without `--yes`.
-
-Afterwards, `--summary` prints the comparison table at any point, finished or not.
-"""
+"""Run and orchestrate the training and evaluation pipeline stages."""
 
 from __future__ import annotations
 
@@ -72,11 +38,12 @@ from dawn.progress import format_duration  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("pipeline")
 
-# The seconds/step the hours in experiments.yaml were written against. The probe replaces it.
+# Baseline seconds per step used for time estimation.
 REFERENCE_SEC_PER_STEP = 1.4
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Run the training campaign (gates, the model, stage 2, evaluation)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -131,14 +98,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def _guidance(stage: Stage) -> None:
-    """The configured `on_fail`: what to do about it, not only what broke."""
+    """Log guidance instructions associated with a failed stage."""
     text = " ".join(str((stage.check or {}).get("on_fail", "")).split())
     if text:
         logger.error("    %s", text)
 
 
 def select(stages: list[Stage], args: argparse.Namespace) -> list[Stage]:
-    """Apply `--only`, `--skip` and `--from`, keeping the declared order."""
+    """Filter and order stages based on command-line inclusion and exclusion flags."""
     known = {s.name for s in stages}
     named = list(args.only or []) + list(args.skip) + ([args.start_from] if args.start_from else [])
     for name in named:
@@ -152,6 +119,7 @@ def select(stages: list[Stage], args: argparse.Namespace) -> list[Stage]:
 
 
 def main() -> int:
+    """Execute pipeline orchestration workflow."""
     args = parse_args()
     cfg = OmegaConf.to_container(OmegaConf.load(ROOT / args.experiments), resolve=True)
     if args.device:
@@ -202,8 +170,6 @@ def main() -> int:
     if args.dry_run:
         for stage in stages:
             if stage.kind == EVAL and not stage.command:
-                # Built late on purpose: which checkpoint wins is not known until every stage-1
-                # run has a validation curve, so there is no command to print yet.
                 winner = pick_winner(cfg, root)
                 target = str(winner[1]) if winner else "<the winning run>/flow_best.pt"
                 print(f"# evaluation, once the runs above have curves: --checkpoint {target}")
@@ -218,8 +184,6 @@ def main() -> int:
         )
         return 0
 
-    # The cheapest check against the most expensive mistake: a campaign that starts, builds
-    # token stats for a minute, and only then dies because the aligned PNGs were never written.
     data_cfg = OmegaConf.to_container(OmegaConf.load(ROOT / "configs/data.yaml"), resolve=True)
     problems = preflight_data(data_cfg["dronevehicle"])
     if problems:
@@ -239,9 +203,6 @@ def main() -> int:
     for index, stage in enumerate(stages, 1):
         head = f"[{index}/{len(stages)}] {stage.name}"
 
-        # Evaluation needs the winner, which is not known until the stage-1 runs have curves,
-        # so it is resolved BEFORE the is-it-done test: an evaluation of yesterday's winner is
-        # stale, not finished.
         expected = None
         if stage.kind == EVAL:
             winner = pick_winner(cfg, root, names=planned)
@@ -271,9 +232,6 @@ def main() -> int:
                     expected,
                 )
             else:
-                # A finished stage is still JUDGED. Its check reads the artifacts on disk, and
-                # a gate that failed wrote its checkpoint anyway, so without this one re-run
-                # of the same command walks straight past it.
                 passed, detail = check_stage(stage, root)
                 if not passed and is_blocking(stage):
                     logger.error("%s: already finished, but its CHECK FAILS -- %s", head, detail)
@@ -302,8 +260,6 @@ def main() -> int:
                 logger.error("%s: CHECK FAILED -- %s", head, detail)
                 _guidance(stage)
             elif not passed:
-                # Advisory: "the refiner did not earn its place" is a RESULT. Stopping here
-                # would throw away the evaluation that is the point of the night.
                 result.status = "check_failed"
                 logger.warning("%s: check did not pass -- %s", head, detail)
                 _guidance(stage)

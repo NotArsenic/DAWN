@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""Download DroneVehicle from the Hugging Face Hub and arrange it for `prepare_dronevehicle.py`.
-
-    python scripts/fetch_dronevehicle.py              # download, extract, arrange, verify
-    python scripts/fetch_dronevehicle.py --verify     # just check what is already on disk
-    python scripts/fetch_dronevehicle.py --archives ~/Downloads   # zips you already have
-
-`McCheng/DroneVehicle` holds three zip archives (`train.zip`, `val.zip`, `test.zip`, about
-14 GB) and **no parquet shards and no loading script**, so `load_dataset("McCheng/DroneVehicle")`
-does not work on it. It has to be downloaded, unpacked and put where `configs/data.yaml` expects:
-
-    data/DroneVehicle/<split>/{<split>img, <split>imgr, <split>label, <split>labelr}/<stem>.*
-
-The inner structure of those archives is not documented on the Hub, so this **searches** the
-extracted tree for the four folders by name rather than assuming a path, and links whatever it
-finds into place. Extraction is guarded against members that would write outside their own
-directory, because this is downloaded data.
-
-Nothing is copied by default: the four folders are symlinked, so the 14 GB is not duplicated.
-Use `--mode copy` on a filesystem without symlinks, or `--mode move` to consume the extracted
-tree. Re-running is idempotent and resumes: an archive already extracted is not unpacked again.
-
-Then, as the README says:
-
-    python scripts/prepare_dronevehicle.py all        # stats, day, align, dedup, write
-"""
+"""Download and unpack the DroneVehicle dataset archives for preprocessing."""
 
 from __future__ import annotations
 
@@ -54,6 +30,7 @@ logger = logging.getLogger("fetch")
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Download and arrange DroneVehicle for the data pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -81,6 +58,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Run dataset download, extraction, and verification workflow."""
     args = parse_args()
     cfg = OmegaConf.to_container(OmegaConf.load(ROOT / args.data_config), resolve=True)
     root = Path(args.root or cfg["dronevehicle"]["root"])

@@ -1,48 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare DroneVehicle day thermal / RGB pairs in stages; dawn/data/ does the work.
-
-    stats   Slow, once. Every stem of every split: existence, frame, border and thermal-channel
-            checks, RGB luminance stats on the cropped frame, folder and file names from the XML,
-            and 64-bit perceptual hashes of both modalities
-            -> `dronevehicle.stats_csv` (not committed, regenerable).
-    day     Instant, rerun freely. The day filter at `day_filter.min_lum_median`: a luminance
-            histogram, contact sheets (random, just above / just below the cutoff, night
-            folders), a per-folder day-share table and the per-pair day log
-            -> <outputs_dir>, <manifest_dir>/logs/day.csv.
-            *** Choose the cutoff by looking at these before running `align`. ***
-    align   Box matching, RANSAC similarity (homography fallback), acceptance and the
-            independent edge check for the day pairs -> <manifest_dir>/logs/align.csv, with the
-            fitted transform of every pair. Pairs the boxes cannot judge (`labels_copied`,
-            `few_matches`) get the edge-correlation fallback (`align.fallback`). Incremental: only
-            pairs missing from the log are computed, unless the align thresholds changed (then
-            all) or `--force`.
-            `--include-copied` is a dry run with copied boxes allowed to count as evidence: it
-            writes <outputs_dir>/align_include_copied.csv and touches nothing else.
-    dedup   Accepted val and test pairs against the train pairs that passed the day filter
-            (RGB and thermal hashes both within `dedup.max_hamming`) -> logs/dedup.csv and an
-            example sheet just under / over the threshold.
-    write   Warp, mask and write the PNGs of the surviving pairs under `aligned_dir`, the three
-            manifests <manifest_dir>/{train,val,test}_pairs.txt, <manifest_dir>/fallback_pairs.txt
-            (the ones aligned by edge correlation instead of boxes), logs/vehicles.csv (the share
-            of each frame its vehicles mask covers, dense frames flagged, and how many vehicles
-            took each branch of the per-vehicle rule) and logs/summary.md. The vehicles masks
-            are recomputed on every run (they are deterministic), the other PNGs only when missing.
-    vehicle-dilation   Read-only. The displacement of the vehicles that moved between the two
-            exposures, over the box-aligned pairs, and its 95th percentile: how far the vehicles
-            mask extends a vehicle that may have moved. Run after `align`; put the result in
-            `masks.vehicles.extend_px`.
-    all     stats, day, align, dedup, write, with no pause. Look at `day` first on a new dataset.
-
-Paths and thresholds come from configs/data.yaml. Every stage skips work already on disk unless
-`--force`, except `day`, `dedup` and the summary, which are cheap and always recomputed.
-
-Usage:
-    python scripts/prepare_dronevehicle.py stats --workers 8
-    python scripts/prepare_dronevehicle.py day
-    python scripts/prepare_dronevehicle.py align
-    python scripts/prepare_dronevehicle.py dedup
-    python scripts/prepare_dronevehicle.py write
-"""
+"""Prepare DroneVehicle day thermal and RGB pairs across pipeline stages."""
 
 from __future__ import annotations
 
@@ -56,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def _setup(cfg: dict, args: argparse.Namespace):
+    """Load DroneVehicle layout and alignment configurations."""
     from dawn.data import align
     from dawn.data import dronevehicle as dv
 
@@ -64,10 +22,12 @@ def _setup(cfg: dict, args: argparse.Namespace):
 
 
 def _split_of(image_id: str) -> str:
+    """Extract split name from an image identifier."""
     return image_id.split("_", 1)[0]
 
 
 def _stems(layout, split: str, limit: int | None) -> list[str]:
+    """List image stems for a split up to an optional limit."""
     from dawn.data import dronevehicle as dv
 
     listing = dv.list_pairs(layout, split)
@@ -80,6 +40,7 @@ def _stems(layout, split: str, limit: int | None) -> list[str]:
 
 
 def run_stats(cfg: dict, args: argparse.Namespace) -> None:
+    """Compute frame statistics and perceptual hashes across dataset splits."""
     from dawn.data import day_filter as df
     from dawn.data.sheets import run_parallel
 
@@ -106,6 +67,7 @@ def run_stats(cfg: dict, args: argparse.Namespace) -> None:
 
 
 def run_day(cfg: dict, args: argparse.Namespace) -> None:
+    """Filter pairs by daytime luminance and write logs and histograms."""
     from dawn.data import day_filter as df
 
     layout, _ = _setup(cfg, args)
@@ -159,6 +121,7 @@ def run_day(cfg: dict, args: argparse.Namespace) -> None:
 
 
 def run_align(cfg: dict, args: argparse.Namespace) -> None:
+    """Align multimodal image pairs using bounding boxes and edge correlation."""
     import dataclasses
 
     from dawn.data import align
@@ -208,12 +171,14 @@ def run_align(cfg: dict, args: argparse.Namespace) -> None:
 
 
 def _stem_split(image_id: str) -> tuple[str, str]:
+    """Split image identifier into split and stem components."""
     from dawn.data import dronevehicle as dv
 
     return dv.parse_image_id(image_id)
 
 
 def _sort_key(image_id: str) -> tuple[int, str]:
+    """Generate sorting key prioritizing standard splits."""
     from dawn.data import dronevehicle as dv
 
     split = _split_of(image_id)
@@ -221,6 +186,7 @@ def _sort_key(image_id: str) -> tuple[int, str]:
 
 
 def run_dedup(cfg: dict, args: argparse.Namespace) -> None:
+    """Detect and remove cross-split duplicate pairs using perceptual hashes."""
     import numpy as np
 
     from dawn.data import align, dedup
@@ -233,8 +199,6 @@ def run_dedup(cfg: dict, args: argparse.Namespace) -> None:
     aligned = align.read_align_log(layout.log("align"))
     section = cfg["dedup"]
     max_hamming = int(section["max_hamming"])
-    # Train pairs that passed the day filter: independent of every alignment threshold, so
-    # loosening alignment later cannot let a duplicate of an aligned-and-rejected train pair in.
     references = [
         stats[i] for i, (is_day, _) in sorted(day_log.items()) if is_day and _split_of(i) == "train"
     ]
@@ -270,6 +234,7 @@ def run_dedup(cfg: dict, args: argparse.Namespace) -> None:
 
 
 def run_write(cfg: dict, args: argparse.Namespace) -> None:
+    """Warp, mask, and save final aligned image pairs and manifests."""
     from dawn.data import align, dedup, pairs, report
     from dawn.data import day_filter as df
     from dawn.data.sheets import run_parallel
@@ -340,6 +305,7 @@ def run_write(cfg: dict, args: argparse.Namespace) -> None:
 
 
 def run_vehicle_dilation(cfg: dict, args: argparse.Namespace) -> None:
+    """Measure moving vehicle displacement to configure mask extension."""
     from dawn.data import align
     from dawn.data.sheets import run_parallel
 
@@ -368,11 +334,13 @@ def run_vehicle_dilation(cfg: dict, args: argparse.Namespace) -> None:
 
 
 def run_all(cfg: dict, args: argparse.Namespace) -> None:
+    """Execute all data preparation stages sequentially."""
     for stage in (run_stats, run_day, run_align, run_dedup, run_write):
         stage(cfg, args)
 
 
 def _common() -> argparse.ArgumentParser:
+    """Construct shared argument parser for preparation subcommands."""
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
     common.add_argument("--splits", nargs="+", default=None, help="Override dronevehicle.splits")
@@ -387,14 +355,7 @@ def _common() -> argparse.ArgumentParser:
 
 
 def default_workers(cap: int = 16) -> int:
-    """Processes to fork by default: the cores this process may actually use, capped.
-
-    NOT `os.cpu_count()`. Inside a container that reports the HOST's core count -- 100+ on a
-    rented GPU box -- so the default forked ~100 workers, each importing torch, and the OOM
-    killer took one and the pool died with `BrokenProcessPool`. `sched_getaffinity` respects
-    the cgroup's CPU set, and the cap keeps memory sane on a machine that really does have
-    that many cores: these jobs are JPEG decode and PNG encode, which saturate well before 16.
-    """
+    """Return default worker process count based on CPU affinity capped at a maximum."""
     try:
         available = len(os.sched_getaffinity(0))
     except AttributeError:  # not Linux
@@ -403,6 +364,7 @@ def default_workers(cap: int = 16) -> int:
 
 
 def main() -> None:
+    """Execute DroneVehicle data preparation CLI."""
     parser = argparse.ArgumentParser(
         description="Prepare DroneVehicle day thermal/RGB pairs: stats, day, align, dedup, write",
         epilog="Run `<stage> --help` for the options of each stage.",

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Per-frame comparison sheets plus a 'best cases' sheet, from outputs_final/infer.
-
-Only frames that have saved inference outputs can be drawn (no trained checkpoint is needed).
-The best-case sheet ranks frames by L* correlation minus mean Lab error / 10.
-"""
+"""Generate per-frame comparison sheets and best-case summaries from inference outputs."""
 import argparse
 from pathlib import Path
 
@@ -19,6 +15,7 @@ W, H, PAD, HEAD = 320, 256, 6, 34
 
 
 def font(size):
+    """Load a preferred TrueType font or fall back to the default font."""
     for p in ("/System/Library/Fonts/Helvetica.ttc", "/Library/Fonts/Arial.ttf"):
         try:
             return ImageFont.truetype(p, size)
@@ -28,6 +25,7 @@ def font(size):
 
 
 def paths(i, aligned=ALIGNED, infer=INFER):
+    """Return image file paths for a given test frame stem."""
     s = f"test_{i}"
     return [aligned / f"{s}_thermal.png", infer / f"{s}_thermal_rgb.png",
             infer / f"{s}_thermal_l_std.png", infer / f"{s}_thermal_ab_std.png",
@@ -35,6 +33,7 @@ def paths(i, aligned=ALIGNED, infer=INFER):
 
 
 def lab(a):
+    """Convert sRGB image array to CIELAB colour space."""
     a = a / 255.0
     a = np.where(a > 0.04045, ((a + 0.055) / 1.055) ** 2.4, a / 12.92)
     m = np.array([[.4124, .3576, .1805], [.2126, .7152, .0722], [.0193, .1192, .9505]])
@@ -44,7 +43,7 @@ def lab(a):
 
 
 def score(i, aligned=ALIGNED, infer=INFER):
-    """Higher is better: L* structure correlation minus mean Lab error / 10 (perceptual, not PSNR)."""
+    """Score pair based on structure correlation and colour error."""
     p = paths(i, aligned, infer)
     load = lambda q: lab(np.asarray(Image.open(q).convert("RGB").resize((W, H)), float))
     a, b = load(p[1]), load(p[4])
@@ -53,6 +52,7 @@ def score(i, aligned=ALIGNED, infer=INFER):
 
 
 def sheet(ids, out, aligned=ALIGNED, infer=INFER):
+    """Composite and save a grid image sheet for a list of frame IDs."""
     c = Image.new("RGB", (len(COLS) * (W + PAD) + PAD, HEAD + len(ids) * (H + PAD) + PAD), "white")
     d, f = ImageDraw.Draw(c), font(17)
     for k, n in enumerate(COLS):
@@ -66,6 +66,7 @@ def sheet(ids, out, aligned=ALIGNED, infer=INFER):
 
 
 def parse_args(argv=None):
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aligned", type=Path, default=ALIGNED, help="Aligned test pairs")
     parser.add_argument("--infer", type=Path, default=INFER, help="Saved inference outputs")
@@ -75,6 +76,7 @@ def parse_args(argv=None):
 
 
 def main():
+    """Generate and save comparison sheets."""
     args = parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     ids = sorted(p.name[5:10] for p in args.infer.glob("test_*_thermal_rgb.png"))

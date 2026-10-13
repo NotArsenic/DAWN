@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the README comparison figure: thermal in, Dawn RGB, two uncertainty maps, true RGB."""
+"""Build comparison figure showing thermal input, model RGB, uncertainty maps, and ground truth."""
 import argparse
 from pathlib import Path
 
@@ -14,6 +14,7 @@ W, H, PAD, HEAD = 320, 256, 6, 34
 
 
 def font(size):
+    """Load a preferred TrueType font or fall back to the default font."""
     for p in ("/System/Library/Fonts/Helvetica.ttc", "/Library/Fonts/Arial.ttf"):
         try:
             return ImageFont.truetype(p, size)
@@ -23,6 +24,7 @@ def font(size):
 
 
 def parse_args(argv=None):
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aligned", type=Path, default=ALIGNED, help="Aligned test pairs")
     parser.add_argument("--infer", type=Path, default=INFER, help="Saved inference outputs")
@@ -37,6 +39,7 @@ def parse_args(argv=None):
 
 
 def main():
+    """Generate and save the comparison figure."""
     args = parse_args()
     rows = args.ids
     size = (len(COLS) * (W + PAD) + PAD, HEAD + len(rows) * (H + PAD) + PAD)

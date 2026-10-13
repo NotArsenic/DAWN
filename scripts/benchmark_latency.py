@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the inference cost the plan estimates: GMACs and milliseconds, per component.
-
-The plan's table is estimates until this runs:
-
-    DINOv3 ViT-S+ at 640x512 (1,280 tokens)   ~45 GMACs   once per frame
-    velocity transformer, 1,280 tokens        ~10 GMACs   NFE times (x K for the samples)
-    grid slice + colour upsampling            ~1-2 GMACs  once
-                                              ~65 GMACs total at 2 NFE
-
-Per component, not just end to end, because the whole architecture rests on "expensive work runs
-once": DINO is a single pass and only the small velocity net repeats. If that ratio is not what
-the plan assumes, the 2-NFE design is the thing to revisit.
-
-**No trained model is needed.** Cost depends on architecture and shapes, not on weight values, so
-random weights benchmark identically. `--checkpoint` is accepted only to pin the exact layout and
-resolution a run was trained at.
-
-MACs are reported as flops/2, which is the convention the plan's figures use. The counter is
-torch's own `FlopCounterMode`, so there is no new dependency and no hand-maintained op table.
-
-Usage:
-    python scripts/benchmark_latency.py --device cuda
-    python scripts/benchmark_latency.py --device cuda --checkpoint checkpoints/run1/flow_best.pt
-    python scripts/benchmark_latency.py --device cuda --samples 8    # the uncertainty path
-"""
+"""Measure inference computational cost (GMACs) and runtime latency per component."""
 
 from __future__ import annotations
 
@@ -53,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def sync(device: torch.device) -> None:
-    """CUDA and MPS queue work asynchronously; without this every timing is of the enqueue."""
+    """Synchronize compute device streams for accurate timing."""
     if device.type == "cuda":
         torch.cuda.synchronize()
     elif device.type == "mps":
@@ -61,7 +37,7 @@ def sync(device: torch.device) -> None:
 
 
 def count_macs(fn) -> float:
-    """GMACs of one call to `fn`, via torch's own counter. `flops / 2`, the plan's convention."""
+    """Measure GMACs for a single invocation of fn."""
     from torch.utils.flop_counter import FlopCounterMode
 
     with FlopCounterMode(display=False) as counter:
@@ -70,10 +46,7 @@ def count_macs(fn) -> float:
 
 
 def time_ms(fn, device: torch.device, warmup: int, trials: int) -> dict[str, float]:
-    """Median, p90 and min milliseconds over `trials` calls, after `warmup` untimed ones.
-
-    Median rather than mean: one scheduler hiccup should not set the headline number.
-    """
+    """Measure median, p90, and minimum execution time in milliseconds."""
     for _ in range(warmup):
         fn()
     sync(device)
@@ -93,7 +66,7 @@ def time_ms(fn, device: torch.device, warmup: int, trials: int) -> dict[str, flo
 
 @torch.no_grad()
 def benchmark(cfg, bundle, device, args) -> list[dict]:
-    """One row per component, plus the assembled total."""
+    """Benchmark execution time and GMACs for each model component."""
     layout = bundle["layout"]
     encoder, velocity = bundle["encoder"], bundle["velocity"]
     size = bundle["input_size"]
@@ -146,7 +119,7 @@ def benchmark(cfg, bundle, device, args) -> list[dict]:
         row |= time_ms(fn, device, args.warmup, args.trials)
         try:
             row["gmacs"] = count_macs(fn)
-        except Exception as exc:  # the counter does not know every backend kernel
+        except Exception as exc:
             logger.warning("MAC count failed for %s: %s", name, exc)
             row["gmacs"] = float("nan")
         rows.append({k: (v / b if k.startswith(("ms_", "gmacs")) else v) for k, v in row.items()})
@@ -159,6 +132,7 @@ def benchmark(cfg, bundle, device, args) -> list[dict]:
 
 
 def table(rows: list[dict]) -> str:
+    """Format benchmark results as a Markdown table."""
     head = f"| {'component':<42} | {'GMACs':>8} | {'ms':>8} | {'p90 ms':>8} | {'FPS':>7} |"
     out = [
         head,
@@ -174,6 +148,7 @@ def table(rows: list[dict]) -> str:
 
 
 def main() -> None:
+    """Run inference latency and compute benchmark."""
     parser = argparse.ArgumentParser(description="Dawn inference cost, per component")
     parser.add_argument(
         "--checkpoint",

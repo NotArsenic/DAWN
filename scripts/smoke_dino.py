@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for the DINO encoder backend (and, on CUDA, the velocity net's memory). Run before
-any training.
-
-For the backend chosen in configs/flow.yaml (override with --backend), checks that:
-    1. The weights load (HF token and gated-repo access are fine).
-    2. A random (B, 1, H, W) thermal frame at `encoder.input_size` gives patch_tokens (B, N, 384),
-       cls_token (B, 384) and patch_attn (B, N, N), with CLS + 4 register tokens stripped
-       (N = 1,280 at 512 x 640).
-    3. peft attached LoRA to the attention qkv / output projections only: prints the matched
-       module names (patch_embed.proj must not be among them).
-    4. Trainable parameters are about 0.22M, and the adapters are a no-op at init (every LoRA B is
-       zero), so thermal through them equals the same network with them disabled; the frozen RGB
-       path (`forward_frozen`, the L_align target) runs at the same size.
-    5. CUDA only: peak VRAM and seconds for a forward + backward of the encoder at --batch-size
-       with gradient checkpointing, and for the velocity transformer at batch x timesteps with the
-       DINO attention passed as a float mask (the 1,280-token attention must pick an affordable
-       kernel: this is where you find out).
-
-Usage:
-    python scripts/smoke_dino.py --backend timm
-    python scripts/smoke_dino.py --backend transformers --batch-size 16
-    python scripts/smoke_dino.py --device cpu --no-pretrained     # plumbing only, no download
-"""
+"""Smoke test for the DINO encoder backend and velocity transformer memory usage."""
 
 from __future__ import annotations
 
@@ -47,11 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 def _sync(device: torch.device) -> None:
+    """Synchronize CUDA device operations if using CUDA."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
 
 def main():
+    """Execute DINO encoder and velocity transformer smoke tests."""
     parser = argparse.ArgumentParser(description="Smoke-test the DINO encoder backend")
     parser.add_argument("--config", type=str, default="configs/flow.yaml", help="Flow config")
     parser.add_argument(
@@ -179,7 +159,7 @@ def main():
     thumb = torch.rand(count, 1, gy, gx, device=device)
     with torch.no_grad():
         for block in velocity.blocks:
-            block.dino_gate.fill_(0.1)  # a nonzero gate: the mask really enters the attention
+            block.dino_gate.fill_(0.1)
     with autocast:
         v = velocity(z_t, t, feats, None, thumb, bias)
     v.float().square().mean().backward()

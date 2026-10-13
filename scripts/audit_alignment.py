@@ -1,35 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the alignment (plan step 11): look at what was accepted and what was rejected.
-
-Reads the align log written by `prepare_dronevehicle.py align` and writes, under
-`<dronevehicle.outputs_dir>/audit/`:
-
-    accepted_NN.jpg   contact sheets of random accepted pairs (default 100)
-    rejected_NN.jpg   contact sheets of rejected pairs (default 100), stratified by reason so a
-                      rare reason is not drowned by the common ones
-    fit_histograms.png  histograms of the median inlier residual, scale, rotation, shift and the
-                      edge-check gain, accepted against rejected, with the thresholds marked
-    sampled.csv       which pair is on which sheet, and why it was rejected
-    fallback_accepted_NN.jpg / fallback_rejected_NN.jpg   the pairs the edge-correlation fallback
-                      aligned (no boxes behind them) and the ones it looked at and rejected, on
-                      sheets of their own: audit these separately from the box-aligned pairs
-    vehicles_dense_01.jpg  the frames whose vehicles mask covers the most (flagged over 30% in
-                      vehicles.csv), mask tinted red: check what a dense frame loses
-    usable_luminance.png  luminance of the usable pairs (the final manifests) against the day
-                      pairs that were rejected later, per split
-    usable_darkest.jpg / usable_random.jpg   RGB | thermal of the 24 darkest and of 24 random
-                      usable pairs, from the written PNGs: the darkest are where dusk and night
-                      frames that passed the day filter hide
-
-On every tile the edges of the warped thermal are drawn in magenta over the RGB: on an aligned
-pair they sit on the RGB edges of the same objects. Rejected pairs are shown with their best
-attempted fit (the unwarped thermal when no fit was made), so a wrongly rejected good pair is
-visible too. Sampling is seeded, so the same seed gives the same sheets.
-
-Usage:
-    python scripts/audit_alignment.py
-    python scripts/audit_alignment.py --accepted 100 --rejected 100 --seed 1 --workers 8
-"""
+"""Audit alignment outputs by generating diagnostic sheets and fit histograms."""
 
 from __future__ import annotations
 
@@ -44,11 +14,13 @@ logger = logging.getLogger(__name__)
 
 
 def _read_manifest(pairs, layout, split: str) -> list[str]:
+    """Read image IDs from a split manifest file if it exists."""
     path = layout.manifest(f"{split}_pairs")
     return pairs.read_manifest(path) if path.exists() else []
 
 
 def main() -> None:
+    """Generate diagnostic contact sheets, histograms, and sampling reports."""
     parser = argparse.ArgumentParser(
         description="Audit the alignment: contact sheets with thermal edges over the RGB"
     )
@@ -140,7 +112,7 @@ def main() -> None:
             vehicle_rows = list(csv.DictReader(f))
         fractions = {r["image_id"]: float(r["vehicles_fraction"]) for r in vehicle_rows}
         densest = sorted(fractions.items(), key=lambda kv: (-kv[1], kv[0]))[: args.dense]
-        over = sum(r["dense"] == "1" for r in vehicle_rows)  # the flag as logged, not re-derived
+        over = sum(r["dense"] == "1" for r in vehicle_rows)
         sheet = audit.save_vehicle_sheet(
             layout,
             densest,

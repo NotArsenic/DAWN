@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 1: train the flow model (day thermal -> brightness grid + colour map).
-
-Trains the LoRA-tuned DINOv3 encoder, the velocity transformer and the training-only colour head
-by conditional flow matching on the aligned DroneVehicle day pairs (`dawn.data.pairs`).
-
-Usage:
-    python scripts/train_flow.py --config configs/flow.yaml                  # the real run (CUDA)
-    python scripts/train_flow.py --config configs/flow.yaml \
-        --override configs/debug.yaml --device cpu          # tiny end-to-end run on real pairs
-    python scripts/train_flow.py --config configs/flow.yaml \
-        --override configs/mps.yaml --device mps --overfit 100   # overfit-100 on a Mac, fp32
-    python scripts/train_flow.py --config configs/flow.yaml \
-        --override configs/gpu_probe.yaml --device cuda --max-steps 50   # VRAM + sec/step probe
-
-The loop itself lives in `dawn.flow.trainer` and the run records (W&B, train_log.jsonl,
-metrics/<kind>.csv) in `dawn.runlog`; this file is configuration, logging and checkpoint
-plumbing. Token layout, raw vs standardized and the pixel masks: docs/conventions.md.
-"""
+"""Train the Stage 1 flow matching model on aligned thermal and RGB image pairs."""
 
 from __future__ import annotations
 
@@ -40,9 +23,7 @@ from dawn.flow.tokens import TokenLayout  # noqa: E402
 from dawn.flow.trainer import FlowTrainer, budget_summary  # noqa: E402
 from dawn.progress import format_duration  # noqa: E402
 
-# The run-logging plumbing moved to dawn.runlog when stage 2 needed the same three records (W&B,
-# train_log.jsonl, metrics/<kind>.csv). Re-exported so `from scripts.train_flow import RunLog`
-# keeps resolving. `RunLog.watch` defaults to stage 1's scope map, so the call site is unchanged.
+# Re-exported for backward compatibility with external imports.
 from dawn.runlog import CsvLog, JsonlLog, RunLog, WandbRun, write_run_config  # noqa: E402, F401
 
 # How `logging.select_metric` picks the best checkpoint: (validation key, higher is better).
@@ -56,11 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def token_stats(cfg: dict, layout: TokenLayout, device: torch.device):
-    """Per-segment stats of the targets: cached, except when `dronevehicle.max_pairs` is set.
-
-    A debug run on a handful of pairs must never poison `grid.stats_cache` with stats that would
-    silently become the standardization of the next real run.
-    """
+    """Compute or load target token mean and standard deviation statistics."""
     fit, size = FitSettings.from_config(cfg), tuple(cfg["encoder"]["input_size"])
     count = int(cfg["grid"]["stats_num_samples"])
     make = lambda: stats_batches(cfg, count, device)  # noqa: E731
@@ -74,6 +51,7 @@ def token_stats(cfg: dict, layout: TokenLayout, device: torch.device):
 
 
 def main():
+    """Execute Stage 1 flow training workflow."""
     parser = argparse.ArgumentParser(description="Train the flow model (Stage 1)")
     parser.add_argument("--config", type=str, default="configs/flow.yaml", help="Config file")
     parser.add_argument("--data-config", type=str, default="configs/data.yaml", help="Data config")
@@ -218,8 +196,6 @@ def main():
                     for name in sorted(losses)
                     if name.startswith("flow_")
                 )
-                # An ETA on every logged line, because a 20K-step run on a remote box is watched
-                # through `tail -f` and "is this finishing tonight?" should not need arithmetic.
                 left = (total_steps - step) * losses["sec_per_step"]
                 logger.info(
                     "step %6d/%d (%2.0f%%) | total %.4f | flow %.4f (%s) | render %.4f | "
@@ -240,8 +216,6 @@ def main():
 
             if (step + 1) % log_cfg["val_every"] == 0 or trainer.step == total_steps:
                 nfe = cfg["flow"]["num_inference_steps"]
-                # The EMA at 0.999 needs a few thousand steps to be worth looking at, which is
-                # exactly what an overfit run does not have.
                 with nullcontext() if args.overfit else trainer.ema.applied():
                     for subset, loader in loaders.val.items():
                         scores = trainer.validate(loader, nfe=nfe)
@@ -263,11 +237,6 @@ def main():
                             best = value
                             trainer.save_checkpoint(out_dir / "flow_best.pt")
 
-                # The training objective on held-out pairs: a train curve falling while this one
-                # turns up is the memorization signal, and nothing else in the run reports it.
-                # Deliberately OUTSIDE the EMA context -- the train curve it is read against is
-                # on the live weights, and comparing an averaged model with an instantaneous one
-                # would put a gap between the two that has nothing to do with overfitting.
                 for subset, loader in loaders.val.items():
                     held = trainer.validate_loss(loader, max_batches=val_loss_batches)
                     logger.info(
