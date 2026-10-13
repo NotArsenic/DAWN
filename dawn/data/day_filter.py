@@ -1,16 +1,4 @@
-"""Per-pair RGB statistics and the day filter (plan steps 1-2).
-
-`compute_pair_stats` measures one pair on the **cropped** 640x512 frame: the RGB luminance
-percentiles (linear Rec. 709 luminance, docs/conventions.md section 1), the existence, frame,
-border and thermal-channel checks, the folder and file names from the XML, and a 64-bit
-perceptual hash of each modality for the cross-split dedup. Rows go to the stats CSV.
-
-The day decision is one pure comparison, `lum_median >= day_filter.min_lum_median`. The
-distribution has a bright day mode and a continuum of dusk below it with no clean gap, so the
-cutoff is a human decision; the histogram, the contact sheets and the per-folder table here are
-what that decision is made from. Defects (a missing file, a bad border, differing thermal
-channels) are reason codes of their own so a pair is never silently dropped.
-"""
+"""RGB luminance statistics and day/night filtering."""
 
 from __future__ import annotations
 
@@ -33,9 +21,9 @@ from dawn.data.sheets import run_parallel, thumbnail, tile_sheet
 
 logger = logging.getLogger(__name__)
 
-LOG_FLOOR = 1e-4  # luminance floor before a log10, as in the old guidance map
-SHEET_BOX = (180, 240)  # contact-sheet thumbnails fit inside (height, width)
-# Chart palette: the dataviz reference instance (light surface, ink, categorical slots 1 and 2).
+LOG_FLOOR = 1e-4
+SHEET_BOX = (180, 240)
+
 _SURFACE, _GRID, _INK, _INK_2 = "#fcfcfb", "#e4e3de", "#0b0b0b", "#52514e"
 _SERIES, _CUTOFF = "#2a78d6", "#eb6834"
 _REC709 = (0.2126, 0.7152, 0.0722)
@@ -43,30 +31,23 @@ _REC709 = (0.2126, 0.7152, 0.0722)
 
 @dataclass(frozen=True)
 class PairStats:
-    """One row of the stats CSV: one stem of one split, paired or not.
-
-    `status` is `ok` when both images and both label files exist and decode; otherwise the first
-    thing that failed (`missing_thermal`, `missing_rgb`, `missing_label`, `bad_frame`,
-    `read_error`) and every measurement is NaN / empty. `border_*` is "" for a clean border,
-    else `dark` or `wide` (`dronevehicle.check_border`). Luminance is linear Rec. 709 of the
-    cropped RGB frame, in [0, 1].
-    """
+    """Metadata and luminance statistics for an image pair."""
 
     image_id: str
     split: str
     stem: str
     status: str
-    folder: str  # <folder> of the RGB XML
-    rgb_filename: str  # <filename> of the RGB XML
-    thermal_filename: str  # <filename> of the thermal XML
+    folder: str
+    rgb_filename: str
+    thermal_filename: str
     border_rgb: str
     border_thermal: str
-    thermal_channels_ok: bool  # the three channels of a 3-channel thermal JPEG are identical
+    thermal_channels_ok: bool
     lum_median: float
     lum_p05: float
     lum_p95: float
     lum_mean: float
-    rgb_hash: str  # 16 hex characters, dronevehicle crop, "" when unmeasured
+    rgb_hash: str
     thermal_hash: str
 
 
@@ -75,13 +56,12 @@ _FIELD_TYPES = {"str": str, "float": float, "bool": lambda v: v == "1"}
 
 
 def is_day(lum_median: float, min_lum_median: float) -> bool:
-    """The day decision: median linear luminance at or above the cutoff (NaN is never day)."""
+    """Return True if median luminance meets or exceeds the day threshold."""
     return lum_median >= min_lum_median
 
 
 def day_reason(row: PairStats, min_lum_median: float) -> str:
-    """`ok`, or the first reason this pair is not a day pair, in this order: the stats `status`,
-    `bad_border`, `thermal_channels`, `not_day`."""
+    """Return 'ok' or the failure reason for a pair under the day filter."""
     if row.status != "ok":
         return row.status
     if row.border_rgb or row.border_thermal:
@@ -114,8 +94,7 @@ def _failed(image_id: str, split: str, stem: str, status: str, **fields_: object
 
 
 def compute_pair_stats(layout: dv.DroneVehicleLayout, split: str, stem: str) -> PairStats:
-    """Everything the stats stage records about one stem. Never raises for bad data: a failure
-    becomes the row's `status`."""
+    """Compute metadata and luminance statistics for an image stem."""
     iid = dv.image_id(split, stem)
     paths = {
         "missing_thermal": layout.thermal_image(split, stem),
@@ -133,7 +112,7 @@ def compute_pair_stats(layout: dv.DroneVehicleLayout, split: str, stem: str) -> 
             return _failed(iid, split, stem, "missing_label")
         try:
             names[key] = dv.parse_annotation(path, layout.class_map, layout.border)
-        except Exception as exc:  # malformed XML
+        except Exception as exc:
             logger.warning(f"{iid}: {path.name}: {exc}")
             return _failed(iid, split, stem, "read_error")
     meta = dict(
@@ -146,7 +125,7 @@ def compute_pair_stats(layout: dv.DroneVehicleLayout, split: str, stem: str) -> 
         dv.crop_border(rgb, layout.border, layout.frame_size)
     except dv.FrameError:
         return _failed(iid, split, stem, "bad_frame", **meta)
-    except Exception as exc:  # truncated JPEG
+    except Exception as exc:
         logger.warning(f"{iid}: RGB: {exc}")
         return _failed(iid, split, stem, "read_error", **meta)
     border_rgb = dv.check_border(rgb, layout.border_check, layout.border) or ""
@@ -171,7 +150,7 @@ def compute_pair_stats(layout: dv.DroneVehicleLayout, split: str, stem: str) -> 
     lum = luminance(srgb8_to_linear(crop)).flatten()
     p05, median, p95 = torch.quantile(lum, torch.tensor([0.05, 0.5, 0.95])).tolist()
     weights = torch.tensor(_REC709).view(3, 1, 1)
-    codes_luma = (crop.float() / 255 * weights).sum(dim=0, keepdim=True)  # sRGB-coded luma
+    codes_luma = (crop.float() / 255 * weights).sum(dim=0, keepdim=True)
     return PairStats(
         image_id=iid,
         split=split,
@@ -190,15 +169,12 @@ def compute_pair_stats(layout: dv.DroneVehicleLayout, split: str, stem: str) -> 
     )
 
 
-# --- CSV -----------------------------------------------------------------------------------------
-
-
 def _split_rank(split: str) -> int:
     return dv.SPLITS.index(split) if split in dv.SPLITS else len(dv.SPLITS)
 
 
 def write_stats_csv(path: str | Path, rows: Iterable[PairStats]) -> None:
-    """Write the stats CSV, sorted by (split in `SPLITS` order, image ID). Full precision."""
+    """Write pair statistics to a CSV file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(rows, key=lambda r: (_split_rank(r.split), r.image_id))
@@ -215,7 +191,7 @@ def write_stats_csv(path: str | Path, rows: Iterable[PairStats]) -> None:
 
 
 def read_stats_csv(path: str | Path) -> list[PairStats]:
-    """Read the stats CSV back, in file order."""
+    """Read pair statistics from a CSV file."""
     types = {field.name: _FIELD_TYPES[field.type] for field in fields(PairStats)}
     with Path(path).open(newline="", encoding="utf-8") as f:
         return [
@@ -229,11 +205,10 @@ def _log10(value: float) -> float:
 
 
 def write_day_log(path: str | Path, rows: Iterable[PairStats], min_lum_median: float) -> None:
-    """The committed per-pair day log: ID, folder, log10 luminance percentiles (3 decimals), the
-    decision and its reason. Sorted like the stats CSV."""
+    """Write day filter results and luminance percentiles to a CSV log."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = lambda v: "" if math.isnan(v) else f"{v:.3f}"  # noqa: E731
+    fmt = lambda v: "" if math.isnan(v) else f"{v:.3f}" 
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, lineterminator="\n")
         writer.writerow(
@@ -263,18 +238,15 @@ def write_day_log(path: str | Path, rows: Iterable[PairStats], min_lum_median: f
 
 
 def read_day_log(path: str | Path) -> dict[str, tuple[bool, str]]:
-    """`{image_id: (is_day, reason)}` from `write_day_log`."""
+    """Read day filter results from a CSV log."""
     with Path(path).open(newline="", encoding="utf-8") as f:
         return {r["image_id"]: (r["day"] == "1", r["reason"]) for r in csv.DictReader(f)}
-
-
-# --- tables for choosing the cutoff --------------------------------------------------------------
 
 
 def counts_at_cutoffs(
     rows: Iterable[PairStats], cutoffs: Sequence[float]
 ) -> dict[float, dict[str, int]]:
-    """Day pairs per split at each cutoff (defects excluded, as in `day_reason`)."""
+    """Count valid day pairs per split across candidate luminance cutoffs."""
     rows = list(rows)
     splits = sorted({r.split for r in rows}, key=_split_rank)
     return {
@@ -286,9 +258,7 @@ def counts_at_cutoffs(
 def folder_table(
     rows: Iterable[PairStats], min_lum_median: float, mixed_only: bool = False
 ) -> list[dict]:
-    """Per XML `<folder>`: frames, day frames, day share, median log10 luminance and splits, the
-    largest folders first. Folders with a mixed day share are where dusk hides (`mixed_only`
-    keeps just those). Only rows with `status == "ok"` count."""
+    """Summarize day pair counts and luminance statistics grouped by folder."""
     groups: dict[str, list[PairStats]] = {}
     for row in rows:
         if row.status == "ok":
@@ -312,9 +282,6 @@ def folder_table(
     return sorted(table, key=lambda t: (-t["frames"], t["folder"]))
 
 
-# --- histogram and contact sheets ----------------------------------------------------------------
-
-
 def _style(ax) -> None:
     ax.set_facecolor(_SURFACE)
     ax.grid(color=_GRID, linewidth=0.6)
@@ -329,12 +296,7 @@ def _style(ax) -> None:
 def plot_log_luminance_histogram(
     rows: Sequence[PairStats], min_lum_median: float, out_path: str | Path, bin_log10: float = 0.05
 ) -> None:
-    """Histogram of log10(median linear luminance), one panel per split, with the cutoff marked.
-
-    Log scale on purpose: in linear units every dusk and night frame piles up against zero. Only
-    rows with `status == "ok"` are drawn; the panel titles give the counts and the day share at
-    the cutoff.
-    """
+    """Plot log-luminance histograms per split with the day threshold marked."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
@@ -382,7 +344,7 @@ def plot_log_luminance_histogram(
 def rgb_thumbnail(
     layout: dv.DroneVehicleLayout, split: str, stem: str, box: tuple[int, int] = SHEET_BOX
 ) -> torch.Tensor:
-    """`(3, h, w)` uint8 sRGB thumbnail of the cropped RGB frame (a `run_parallel` job)."""
+    """Generate a thumbnail tensor for a cropped RGB frame."""
     crop = dv.crop_border(
         dv.read_rgb8(layout.rgb_image(split, stem)), layout.border, layout.frame_size
     )
@@ -409,17 +371,7 @@ def save_day_sheets(
     seed: int = 0,
     workers: int = 1,
 ) -> list[Path]:
-    """Contact sheets for choosing and checking the cutoff; each caption is `log10 L split+stem`.
-
-    - `day_random.jpg`: `count` random accepted frames, darkest first.
-    - `band_above.jpg`: accepted frames within `band_log10` above the cutoff (the borderline
-      frames that just made it).
-    - `band_below.jpg`: rejected frames within `band_log10` below it (what was just missed).
-    - `night_folders.jpg`: every accepted frame from a folder whose name contains "night" (there
-      should be none). Always written, empty when there are none, so a rerun replaces a stale one.
-
-    Only pairs with no defect are drawn. Same seed, same sheets.
-    """
+    """Generate contact sheets of sampled day and night frames around the cutoff."""
     out_dir = Path(out_dir)
     usable = [r for r in rows if r.status == "ok" and not r.border_rgb and not r.border_thermal]
     cut = _log10(min_lum_median)

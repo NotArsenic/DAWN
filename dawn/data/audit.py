@@ -1,12 +1,4 @@
-"""The alignment audit (plan step 11): contact sheets with thermal edges drawn over the RGB, and
-histograms of the fit metrics.
-
-An aligned pair is judged by eye: the edges of the **warped** thermal, drawn in magenta over the
-RGB crop, should sit on the RGB edges of the same objects. The sheets show accepted pairs and
-rejected ones, the rejected stratified by reason so a rare reason is not drowned by `few_matches`.
-Display only: the thumbnails average sRGB codes, which is fine for looking at and is never used
-for training data.
-"""
+"""Visual audit and diagnostic tools for dataset inspection."""
 
 from __future__ import annotations
 
@@ -27,9 +19,9 @@ from dawn.data.sheets import run_parallel, tile_sheet
 
 logger = logging.getLogger(__name__)
 
-TILE_BOX = (256, 320)  # audit thumbnails (height, width): half the 640x512 crop
+TILE_BOX = (256, 320)
 EDGE_COLOR = (255, 0, 255)
-# Chart palette: the dataviz reference instance (surface, inks, categorical slots 1 and 2).
+
 _SURFACE, _GRID, _INK, _INK_2 = "#fcfcfb", "#e4e3de", "#0b0b0b", "#52514e"
 _ACCEPTED, _REJECTED = "#2a78d6", "#eb6834"
 
@@ -42,21 +34,7 @@ def edge_overlay(
     blur_sigma: float = 1.0,
     grow: bool = False,
 ) -> torch.Tensor:
-    """Draw the strongest thermal edges over an RGB image.
-
-    The edge pixels are the `keep_fraction` of valid pixels with the largest blurred Sobel
-    gradient magnitude of the thermal; one pixel wide unless `grow` (then grown by one pixel).
-    Drawn at full resolution, so after the tile is area-averaged down the lines stay thin and
-    blend into the RGB instead of hiding what is under them.
-
-    Args:
-        rgb8: `(3, H, W)` uint8 sRGB.
-        thermal: `(1, H, W)` float, the warped thermal (code / 255).
-        valid: `(1, H, W)` bool; edges are drawn only where True. Default: everywhere.
-
-    Returns:
-        `(3, H, W)` uint8 copy of `rgb8` with the edge pixels set to magenta.
-    """
+    """Overlay detected thermal edges onto an RGB image."""
     gradient = align.gradient_magnitude(thermal[0].numpy(), blur_sigma)
     keep = np.ones_like(gradient, dtype=bool) if valid is None else valid[0].numpy()
     if not keep.any():
@@ -71,7 +49,7 @@ def edge_overlay(
 
 
 def _thumb8(img8: torch.Tensor, box: tuple[int, int]) -> torch.Tensor:
-    """Area-averaged uint8 thumbnail fitting `box = (height, width)` (display only)."""
+    """Compute an area-averaged thumbnail fitting the specified box dimensions."""
     h, w = img8.shape[-2:]
     scale = min(1.0, box[0] / h, box[1] / w)
     size = (max(1, round(h * scale)), max(1, round(w * scale)))
@@ -81,8 +59,7 @@ def _thumb8(img8: torch.Tensor, box: tuple[int, int]) -> torch.Tensor:
 def audit_tile(
     layout: dv.DroneVehicleLayout, row: align.AlignRow, box: tuple[int, int] = TILE_BOX
 ) -> torch.Tensor:
-    """`(3, h, w)` uint8 audit tile of one logged pair: the thermal is warped with the logged
-    transform (the unwarped thermal when the pair had no fit) and its edges drawn over the RGB."""
+    """Create an audit thumbnail showing warped thermal edges overlaid on RGB."""
     split, stem = dv.parse_image_id(row.image_id)
     rgb8 = dv.crop_border(
         dv.read_rgb8(layout.rgb_image(split, stem)), layout.border, layout.frame_size
@@ -103,7 +80,7 @@ def _caption(row: align.AlignRow) -> str:
     gain = "" if math.isnan(row.edge_gain) else f" g{row.edge_gain:+.2f}"
     residual = "" if math.isnan(row.median_residual) else f" r{row.median_residual:.1f}"
     fallback = ""
-    if row.fb_tried:  # what the edge fallback estimated: shift, peak margin, quadrant disagreement
+    if row.fb_tried:
         shift = f"({row.fb_dx:+.0f},{row.fb_dy:+.0f})"
         fallback = f" fb{shift} p{row.fb_prominence:.2f} q{row.fb_quad_dev:.0f}"
     return f"{row.image_id} {row.reason}{residual}{gain}{fallback}"
@@ -118,12 +95,7 @@ def save_audit_sheets(
     workers: int = 1,
     prefix: str = "",
 ) -> list[Path]:
-    """Contact sheets `<prefix>accepted_NN.jpg` and `<prefix>rejected_NN.jpg`, `per_sheet` tiles
-    each, 4 per row.
-
-    Each caption is `image_id reason r<median residual px> g<edge gain>`. The rows are drawn in the
-    order given, so pass them already sampled (`report.stratified_sample`).
-    """
+    """Generate contact sheets for accepted and rejected alignment pairs."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -155,20 +127,14 @@ def _style(ax) -> None:
 
 
 def box_fitted(rows: Sequence[align.AlignRow]) -> list[align.AlignRow]:
-    """The rows that have a box-based fit (similarity or homography), i.e. not the fallback's pure
-    translations, whose scale, rotation and residual are not measurements."""
+    """Filter rows that have a box-fitted transformation model."""
     return [r for r in rows if r.model not in ("none", "edge_translation")]
 
 
 def plot_fit_histograms(
     rows: Sequence[align.AlignRow], cfg: align.AlignConfig, out_path: str | Path
 ) -> None:
-    """Histograms of the fit metrics (median inlier residual, scale, rotation, shift, edge-check
-    gain) for accepted and rejected pairs that have a fit, with the acceptance thresholds marked.
-
-    The rejected pairs are cut off at the plot range, so a few wild fits do not squash the rest;
-    the count outside the range is in each panel's title.
-    """
+    """Plot histograms of transformation fit metrics with acceptance thresholds."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
@@ -228,14 +194,10 @@ def plot_fit_histograms(
     fig.savefig(out_path, dpi=150, facecolor=_SURFACE)
 
 
-# --- dedup examples ------------------------------------------------------------------------------
-
-
 def pair_tiles(
     layout: dv.DroneVehicleLayout, image_id: str, matched_id: str, box: tuple[int, int] = TILE_BOX
 ) -> list[torch.Tensor]:
-    """Four `(3, h, w)` uint8 tiles for one cross-split match: the candidate's RGB, the matched
-    train pair's RGB, the candidate's thermal and the matched pair's thermal (raw crops)."""
+    """Create comparison thumbnails for candidate and matched cross-split image pairs."""
     tiles = []
     for kind in ("rgb", "thermal"):
         for pair_id in (image_id, matched_id):
@@ -251,14 +213,7 @@ def pair_tiles(
 
 
 def pick_dedup_examples(rows: Sequence, max_hamming: int, count: int) -> list:
-    """Cross-split matches just under and just over the threshold, half each when available.
-
-    Just under: distance in `[max_hamming - 2, max_hamming]`, the closest to the threshold first.
-    Just over: distance in `(max_hamming, max_hamming + 3]`, the closest first. When fewer than
-    `count` fall in those windows (as when no val / test pair comes anywhere near a train pair),
-    the sheet is filled up with the closest remaining matches, so it always shows the nearest
-    cross-split pairs. `rows` are `dawn.data.dedup.DedupRow`s.
-    """
+    """Sample deduplication matches around the Hamming distance threshold."""
     matched = [r for r in rows if r.matched_id]
     under = sorted(
         (r for r in matched if max_hamming - 2 <= r.distance <= max_hamming),
@@ -287,10 +242,7 @@ def save_dedup_sheet(
     count: int = 24,
     workers: int = 1,
 ) -> Path | None:
-    """One row per example: candidate RGB | matched train RGB | candidate thermal | matched
-    thermal, with the Hamming distances in the captions. Shows what sits just under and just over
-    `max_hamming`, topped up with the closest matches overall (`pick_dedup_examples`). Returns None
-    only when there is no match at all."""
+    """Generate a contact sheet comparing near-duplicate candidates."""
     picked = pick_dedup_examples(rows, max_hamming, count)
     if not picked:
         return None
@@ -316,9 +268,6 @@ def save_dedup_sheet(
     return out_path
 
 
-# --- the usable pairs ----------------------------------------------------------------------
-
-
 def plot_usable_luminance(
     stats: Sequence,
     day_log: Mapping[str, tuple[bool, str]],
@@ -327,21 +276,7 @@ def plot_usable_luminance(
     out_path: str | Path,
     bin_log10: float = 0.05,
 ) -> dict[str, tuple[int, int]]:
-    """Histogram of log10(median RGB luminance) of the day pairs, one panel per split, stacked:
-    the usable pairs (in the final manifests) and the day pairs that were rejected later.
-
-    It shows whether the filters are luminance-blind or lose the dark end disproportionately, and
-    where the cutoff sits relative to the pairs the model will see.
-
-    Args:
-        stats: `dawn.data.day_filter.PairStats` rows.
-        day_log: `{image_id: (is_day, reason)}` from the day log.
-        usable_ids: Image IDs in the final manifests.
-        min_lum_median: The day cutoff, drawn as a line.
-
-    Returns:
-        `{split: (usable, day pairs)}`.
-    """
+    """Plot stacked luminance histograms for accepted and rejected day pairs."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
 
@@ -393,8 +328,7 @@ def plot_usable_luminance(
 
 
 def pick_usable(lum_by_id: Mapping[str, float], how: str, count: int, seed: int = 0) -> list[str]:
-    """IDs of usable pairs to look at: `how="darkest"` is the `count` lowest median luminance
-    (where dusk and night hide), `"random"` a seeded sample, sorted darkest first."""
+    """Select image IDs by luminance criterion (darkest or random sample)."""
     if how == "darkest":
         return sorted(lum_by_id, key=lambda i: (lum_by_id[i], i))[:count]
     if how == "random":
@@ -407,8 +341,7 @@ def pick_usable(lum_by_id: Mapping[str, float], how: str, count: int, seed: int 
 def usable_tiles(
     layout: dv.DroneVehicleLayout, image_id: str, box: tuple[int, int] = (192, 240)
 ) -> list[torch.Tensor]:
-    """`[rgb, thermal]` `(3, h, w)` uint8 thumbnails of one written pair (the aligned PNGs, so
-    what the model will actually be given)."""
+    """Generate paired RGB and thermal thumbnails for an image ID."""
     from PIL import Image
 
     with Image.open(layout.aligned_path(image_id, "rgb")) as img:
@@ -426,8 +359,7 @@ def save_usable_sheet(
     title: str,
     workers: int = 1,
 ) -> Path | None:
-    """A sheet of usable pairs as RGB | thermal, two pairs per row, captioned with the ID and
-    log10 luminance. Returns None when `image_ids` is empty."""
+    """Generate a contact sheet of usable RGB and thermal image pairs."""
     if not image_ids:
         return None
     pairs = run_parallel(usable_tiles, [(layout, i) for i in image_ids], workers)
@@ -445,8 +377,7 @@ def save_usable_sheet(
 def vehicles_tile(
     layout: dv.DroneVehicleLayout, image_id: str, box: tuple[int, int] = TILE_BOX
 ) -> torch.Tensor:
-    """`(3, h, w)` uint8 thumbnail of a written pair's RGB with its vehicles mask tinted red
-    (display only), to check what a dense frame masks out."""
+    """Generate an RGB thumbnail with the vehicle mask overlaid in red."""
     from PIL import Image
 
     with Image.open(layout.aligned_path(image_id, "rgb")) as img:
@@ -465,8 +396,7 @@ def save_vehicle_sheet(
     title: str,
     workers: int = 1,
 ) -> Path | None:
-    """A sheet of `(image_id, vehicles_fraction)` frames with their masks tinted red, 4 per row,
-    captioned with the masked share. Returns None when `frames` is empty."""
+    """Generate a contact sheet displaying vehicle mask overlays."""
     if not frames:
         return None
     tiles = run_parallel(vehicles_tile, [(layout, i) for i, _ in frames], workers)

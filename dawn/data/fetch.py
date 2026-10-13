@@ -1,25 +1,4 @@
-"""Get DroneVehicle off the Hugging Face Hub and into the layout `configs/data.yaml` expects.
-
-`McCheng/DroneVehicle` is **not** a `datasets`-format repo: it holds three zip archives
-(`train.zip`, `val.zip`, `test.zip`, about 14 GB) with no parquet shards and no loading script,
-so `load_dataset("McCheng/DroneVehicle")` does not work. It has to be downloaded, unpacked and
-arranged. That is what this module does, and `scripts/fetch_dronevehicle.py` is the CLI.
-
-The pipeline wants::
-
-    <root>/<split>/{<split>img, <split>imgr, <split>label, <split>labelr}/<stem>.{jpg,xml}
-
-**The archives are not assumed to be in that shape.** Their internal structure is not documented
-on the Hub, and mirrors differ in whether they wrap everything in an extra directory level. So
-rather than hard-coding a path and failing on a mirror that nests things differently,
-`discover_split_dirs` *searches* the extracted tree for the four folders by name and
-`arrange_split` links them into place. A layout nobody predicted is then a one-line fix to
-`FOLDER_SUFFIXES`, not a rewrite.
-
-Safety: the archives are downloaded data, so `safe_extract` refuses any member whose resolved
-path escapes the destination (the "zip slip" traversal), and extraction always goes to its own
-directory, never on top of the arranged tree.
-"""
+"""Download, unpack, and arrange the DroneVehicle dataset."""
 
 from __future__ import annotations
 
@@ -34,38 +13,24 @@ logger = logging.getLogger(__name__)
 
 REPO_ID = "McCheng/DroneVehicle"
 SPLITS = ("train", "val", "test")
-# The four folders of a split, as `<split><suffix>`: RGB images, thermal images, RGB XML,
-# thermal XML. `dawn.data.dronevehicle.DroneVehicleLayout` builds the same names.
+
 FOLDER_SUFFIXES = ("img", "imgr", "label", "labelr")
-# What a correctly arranged split holds, roughly: 28,439 pairs over three splits.
+
 MIN_FILES_PER_FOLDER = 100
-# Corrupt members tolerated per archive before it counts as archive-level corruption rather
-# than one bad file. 56,878 images per the dataset card, so this is well under 0.1%.
 MAX_BAD_MEMBERS = 50
-# Share of a folder's stems that may fail to pair across the four before it counts as a broken
-# download rather than a few bad files. 1% of ~28,400 is ~280 pairs, which the alignment filter
-# would mostly have discarded anyway.
 MAX_UNPAIRED_FRACTION = 0.01
 ARRANGE_MODES = ("symlink", "copy", "move")
 
 
 def folder_names(split: str) -> tuple[str, ...]:
-    """`("trainimg", "trainimgr", "trainlabel", "trainlabelr")` for `train`."""
+    """Return the expected subdirectory names for a split."""
     return tuple(f"{split}{suffix}" for suffix in FOLDER_SUFFIXES)
-
-
-# --- download ------------------------------------------------------------------------------
 
 
 def download_archives(
     dest: Path, repo_id: str = REPO_ID, splits: Sequence[str] = SPLITS
 ) -> dict[str, Path]:
-    """Fetch `<split>.zip` for each split into `dest`. Returns `{split: path}`.
-
-    Uses `huggingface_hub.snapshot_download`, so a partial download resumes and an archive
-    already in the Hub cache is not fetched twice. The repo is public and ungated, unlike the
-    DINOv3 weights, so no token is needed.
-    """
+    """Download split zip archives from Hugging Face Hub."""
     from huggingface_hub import snapshot_download
 
     dest.mkdir(parents=True, exist_ok=True)
@@ -86,18 +51,8 @@ def download_archives(
     return found
 
 
-# --- extract -------------------------------------------------------------------------------
-
-
 def safe_members(archive: zipfile.ZipFile, dest: Path) -> list[zipfile.ZipInfo]:
-    """Every member whose resolved destination stays inside `dest`.
-
-    A zip may name a member `../../etc/thing` and a naive `extractall` writes it there. This is
-    downloaded data, so it is checked rather than trusted.
-
-    Raises:
-        ValueError: a member would escape `dest`.
-    """
+    """Validate archive members to prevent path traversal outside the destination directory."""
     dest = dest.resolve()
     members = []
     for member in archive.infolist():
@@ -111,23 +66,7 @@ def safe_members(archive: zipfile.ZipFile, dest: Path) -> list[zipfile.ZipInfo]:
 def safe_extract(
     zip_path: Path, dest: Path, force: bool = False, max_bad: int = MAX_BAD_MEMBERS
 ) -> Path:
-    """Unpack one archive into its own directory under `dest`, with a completion marker.
-
-    The marker (`.extracted`) is what makes re-running cheap: unpacking 14 GB again because a
-    later step failed is an hour nobody has. `force` ignores it.
-
-    **A member with a bad CRC is skipped, not fatal.** `extractall` aborts the whole archive on
-    the first corrupt file, which threw away a 14 GB extraction over one unreadable JPEG out of
-    56,878. One missing frame costs nothing here -- its stem simply stops pairing across the
-    four folders, so `verify_split` reports it and the alignment stage drops that pair, out of
-    28,411. Whole-archive corruption is a different thing, so more than `max_bad` failures
-    still raises, and every skipped name is logged and written into the marker rather than
-    being quietly forgotten.
-
-    Raises:
-        zipfile.BadZipFile: more than `max_bad` members failed, i.e. the archive itself is bad
-            rather than one file in it.
-    """
+    """Safely extract an archive into destination directory."""
     out = dest / zip_path.stem
     marker = out / ".extracted"
     if marker.exists() and not force:
@@ -141,10 +80,6 @@ def safe_extract(
             try:
                 archive.extract(member, out)
             except (zipfile.BadZipFile, OSError) as error:
-                # The CRC is only checked once the member has been read to the end, so a
-                # truncated file is already on disk. Leaving it would be worse than leaving
-                # nothing: the stem would still pair across the four folders and the pipeline
-                # would decode a corrupt JPEG instead of dropping the pair.
                 partial = out / member.filename
                 partial.unlink(missing_ok=True)
                 bad.append(member.filename)
@@ -166,17 +101,8 @@ def safe_extract(
     return out
 
 
-# --- discover and arrange ---------------------------------------------------------------------
-
-
 def discover_split_dirs(tree: Path, split: str) -> dict[str, Path]:
-    """Find this split's four folders anywhere under `tree`. `{folder name: path}`.
-
-    Matched by directory name, case-insensitively, so it does not matter whether the archive
-    unpacks to `trainimg/`, `train/trainimg/` or `DroneVehicle/train/trainimg/`. A folder that
-    appears more than once resolves to the shallowest match, which is the real one when an
-    archive carries a `__MACOSX` shadow tree or a nested copy.
-    """
+    """Locate split subdirectories within an extracted directory tree."""
     wanted = {name.lower(): name for name in folder_names(split)}
     best: dict[str, tuple[int, Path]] = {}
     for current, directories, _ in os.walk(tree):
@@ -195,15 +121,7 @@ def discover_split_dirs(tree: Path, split: str) -> dict[str, Path]:
 def arrange_split(
     found: Mapping[str, Path], root: Path, split: str, mode: str = "symlink"
 ) -> list[str]:
-    """Put this split's folders where `data.yaml` expects them. Returns what was done.
-
-    `symlink` is the default because the dataset is 14 GB and a second copy buys nothing; `copy`
-    is for filesystems without symlinks, `move` for when the extracted tree is disposable.
-    An existing, correct destination is left alone, so re-running is cheap and idempotent.
-
-    Raises:
-        ValueError: an unknown `mode`, or a folder this split needs was not discovered.
-    """
+    """Organize split folders into the target directory structure."""
     if mode not in ARRANGE_MODES:
         raise ValueError(f"mode must be one of {ARRANGE_MODES}, got {mode!r}")
     missing = [name for name in folder_names(split) if name not in found]
@@ -233,16 +151,8 @@ def arrange_split(
     return actions
 
 
-# --- verify ----------------------------------------------------------------------------------
-
-
 def verify_split(root: Path, split: str, sample: int = 5) -> list[str]:
-    """Problems with one arranged split; empty means it is ready. Never raises.
-
-    Checks the four folders exist and are populated, that the stems really pair across all four
-    (the thing that actually breaks a prepare run), and that a sampled image is the 840x712 the
-    whole pipeline assumes -- the crop to 640x512 and the border check both depend on it.
-    """
+    """Verify that split files and folders are present and structurally valid."""
     problems: list[str] = []
     counts: dict[str, set[str]] = {}
     for name in folder_names(split):
@@ -259,11 +169,6 @@ def verify_split(root: Path, split: str, sample: int = 5) -> list[str]:
         return problems
 
     shared = set.intersection(*counts.values())
-    # A few unpaired stems are not a reason to stop. `prepare_dronevehicle.py stats` already
-    # gives a pair missing a modality (or carrying an unreadable JPEG) a status and drops it at
-    # the day stage (docs/conventions.md section 10.1), and a handful of corrupt files in a
-    # 28,411-pair download costs almost nothing once the alignment filter has taken its ~80%.
-    # A LOT of them is a bad download, which is a different thing and still fails.
     for name, stems in counts.items():
         extra = len(stems - shared)
         if not extra:
@@ -283,7 +188,7 @@ def verify_split(root: Path, split: str, sample: int = 5) -> list[str]:
 
 
 def _check_frames(root: Path, split: str, stems: Iterable[str]) -> list[str]:
-    """Sampled RGB/thermal frames really are 840x712 with the white border."""
+    """Verify image dimensions for a sample of image stems."""
     from PIL import Image
 
     problems = []
@@ -292,8 +197,8 @@ def _check_frames(root: Path, split: str, stems: Iterable[str]) -> list[str]:
             path = root / split / name / f"{stem}.jpg"
             try:
                 with Image.open(path) as image:
-                    size = image.size  # (width, height)
-            except Exception as error:  # a truncated or non-image file
+                    size = image.size
+            except Exception as error:
                 problems.append(f"{split}/{name}/{stem}.jpg cannot be read: {error}")
                 continue
             if size != (840, 712):
@@ -305,7 +210,7 @@ def _check_frames(root: Path, split: str, stems: Iterable[str]) -> list[str]:
 
 
 def verify(root: Path, splits: Sequence[str] = SPLITS, sample: int = 5) -> list[str]:
-    """Every problem across every split; empty means `prepare_dronevehicle.py` can run."""
+    """Verify all dataset splits and return a list of any detected issues."""
     return [problem for split in splits for problem in verify_split(root, split, sample)]
 
 

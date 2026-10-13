@@ -1,9 +1,4 @@
-"""Counts, verdicts and samples for reporting on the data pipeline (pure functions over the logs).
-
-Every pair ends the pipeline with one verdict, `final_reasons`: the reason of the first stage that
-rejected it (`day` -> `align` -> `dedup`), or `ok`. `build_summary` renders those, and the count at
-each stage, as the committed `summary.md`.
-"""
+"""Reporting and summary generation for the dataset pipeline."""
 
 from __future__ import annotations
 
@@ -41,11 +36,7 @@ def final_reasons(
     align_rows: Mapping[str, AlignRow],
     dedup_rows: Mapping[str, DedupRow],
 ) -> dict[str, str]:
-    """`{image_id: reason}`: the first stage that rejected the pair, or `ok`.
-
-    A day pair with no align row is `not_aligned` (the `align` stage has not run for it), never
-    silently `ok`.
-    """
+    """Map each image ID to its terminal pipeline status reason."""
     final = {}
     for row in stats:
         iid = row.image_id
@@ -64,8 +55,7 @@ def final_reasons(
 
 
 def fallback_ids(final: Mapping[str, str], align_rows: Mapping[str, AlignRow]) -> list[str]:
-    """Sorted IDs of the final pairs that the edge-correlation fallback aligned (no boxes behind
-    them, no moving mask): the contents of `fallback_pairs.txt`."""
+    """Return sorted image IDs aligned via edge correlation fallback."""
     return sorted(
         i
         for i, reason in final.items()
@@ -79,9 +69,7 @@ def stage_counts(
     align_rows: Mapping[str, AlignRow],
     dedup_rows: Mapping[str, DedupRow],
 ) -> dict[str, dict[str, int]]:
-    """Pairs surviving each stage, per split: `stems` (every stem in either image folder),
-    `paired` (both images present), `readable` (labels, frame, border and thermal channels fine),
-    `day`, `aligned` (geometry and edge check) and `final` (after dedup: the manifests)."""
+    """Compute surviving pair counts across pipeline stages per split."""
     final = final_reasons(stats, day_log, align_rows, dedup_rows)
     stages = {
         name: Counter() for name in ("stems", "paired", "readable", "day", "aligned", "final")
@@ -143,14 +131,7 @@ def write_vehicle_log(
     max_fraction: float,
     branches: Mapping[str, VehicleBranches] | None = None,
 ) -> list[str]:
-    """Write the committed vehicles-mask log: per final pair, the share of the frame its vehicles
-    mask covers (3 decimals), `dense` = 1 when that is over `max_fraction` (dense parking lots:
-    to be looked at, not silently dropped) and how many of its vehicles took each branch of
-    `align.vehicle_mask` (blank when `branches` is not given). Sorted by ID.
-
-    Returns:
-        The IDs flagged dense.
-    """
+    """Write vehicle mask coverage statistics to a CSV log."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     flagged = []
@@ -182,9 +163,7 @@ def build_summary(
     max_vehicle_fraction: float = 0.30,
     vehicle_branches: Mapping[str, VehicleBranches] | None = None,
 ) -> str:
-    """The text of `summary.md`: counts per stage and split, each reason code's count, the
-    alignment diagnostics, the vehicles mask (when `vehicle_fractions` is given) and the
-    thresholds in force (day, align, dedup, masks sections of `cfg`)."""
+    """Generate Markdown summary report from pipeline logs."""
     splits = _splits_in(stats)
     counts = stage_counts(stats, day_log, align_rows, dedup_rows)
     final = final_reasons(stats, day_log, align_rows, dedup_rows)
@@ -286,21 +265,10 @@ def _vehicles_section(
     return [*lines, ""]
 
 
-# --- stratified sample ---------------------------------------------------------------------------
-
-
 def stratified_sample(
     groups: Mapping[str, Sequence], n: int, seed: int
 ) -> list[tuple[str, object]]:
-    """`n` items spread over the groups, proportionally to group size but with every group
-    represented (largest groups first when there are fewer slots than groups). Seeded.
-
-    A group never gives more than it has; the surplus goes to the others. Asking for at least as
-    many as exist returns everything.
-
-    Returns:
-        `[(group, item), ...]`, grouped by group name.
-    """
+    """Draw a stratified sample of n items proportionally across groups."""
     sizes = {g: len(items) for g, items in groups.items() if len(items)}
     total = sum(sizes.values())
     names = sorted(sizes)
@@ -314,10 +282,10 @@ def stratified_sample(
     else:
         ideal = {g: n * sizes[g] / total for g in names}
         quota = {g: min(sizes[g], max(1, math.floor(ideal[g]))) for g in names}
-        while sum(quota.values()) > n:  # over by the floor of one: take from the most over-served
+        while sum(quota.values()) > n:
             g = max((g for g in names if quota[g] > 1), key=lambda g: (quota[g] - ideal[g], g))
             quota[g] -= 1
-        while sum(quota.values()) < n:  # under by rounding: give to the most under-served
+        while sum(quota.values()) < n:
             g = max(
                 (g for g in names if quota[g] < sizes[g]), key=lambda g: (ideal[g] - quota[g], g)
             )

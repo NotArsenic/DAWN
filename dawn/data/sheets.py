@@ -1,13 +1,4 @@
-"""Contact sheets and the process pool behind the data scripts.
-
-Both were first written for the VisDrone preparation and are kept because every prepare / audit
-script wants them: `run_parallel` maps a function over jobs on a spawn pool with one torch thread
-per worker, and `tile_sheet` lays labelled thumbnails on a dark background.
-
-Thumbnails shrink by area averaging (docs/conventions.md section 4a): RGB in linear light, then
-back to sRGB codes for display; thermal as the plain code average, because thermal values are not
-sRGB (section 1).
-"""
+"""Contact sheets and parallel execution utilities."""
 
 from __future__ import annotations
 
@@ -27,20 +18,13 @@ from dawn.data.resample import area_downsample
 
 logger = logging.getLogger(__name__)
 
-THUMB_BOX = (144, 192)  # thumbnails fit inside (height, width)
+THUMB_BOX = (144, 192)
 BACKGROUND = (26, 26, 25)
 _TITLE_INK, _LABEL_INK = (235, 235, 230), (195, 194, 183)
 
 
 def run_parallel(fn: Callable, jobs: Sequence, workers: int, desc: str = "") -> list:
-    """`[fn(*job) for job in jobs]` on `workers` processes (in-process when `workers <= 1`).
-
-    Results come back in job order. Each worker runs torch single-threaded, so `workers` equal
-    to the number of cores uses every core without oversubscribing them. `fn` and the jobs must
-    be picklable (a module-level function). Logs progress with a rate and an ETA every 5% when
-    `desc` is given; always as lines, never a bar, because these passes are run once and their
-    output is the record of what was done (`dawn/progress.py`).
-    """
+    """Execute jobs in parallel using a process pool, or sequentially if workers <= 1."""
     from dawn.progress import eta_line, format_duration
 
     jobs = list(jobs)
@@ -62,7 +46,7 @@ def run_parallel(fn: Callable, jobs: Sequence, workers: int, desc: str = "") -> 
             results.append(fn(*job))
             progress(done)
         return results
-    # spawn, not fork: forking a process that has already started torch's thread pools can hang.
+
     context = multiprocessing.get_context("spawn")
     chunksize = max(1, min(32, total // (workers * 8)))
     with ProcessPoolExecutor(workers, mp_context=context, initializer=_one_thread) as pool:
@@ -77,7 +61,7 @@ def _one_thread() -> None:
 
 
 def load_font(size: int) -> ImageFont.ImageFont:
-    """A scalable default font (Pillow >= 10.1), the bitmap default on older Pillow."""
+    """Load default ImageFont at the requested size."""
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -85,34 +69,24 @@ def load_font(size: int) -> ImageFont.ImageFont:
 
 
 def save_srgb8(img: torch.Tensor, path: str | Path, **save_kwargs) -> None:
-    """Save a `(3, H, W)` or `(1, H, W)` uint8 tensor as an image (mode RGB or L)."""
+    """Save an image tensor to disk."""
     array = img.permute(1, 2, 0).numpy()
     Image.fromarray(array[..., 0] if array.shape[-1] == 1 else array).save(path, **save_kwargs)
 
 
 def _fit_size(height: int, width: int, box: tuple[int, int]) -> tuple[int, int]:
-    scale = min(1.0, box[0] / height, box[1] / width)  # never upsample
+    scale = min(1.0, box[0] / height, box[1] / width)
     return max(1, round(height * scale)), max(1, round(width * scale))
 
 
 def thumbnail(img_linear: torch.Tensor, box: tuple[int, int] = THUMB_BOX) -> torch.Tensor:
-    """`(3, h, w)` uint8 sRGB thumbnail of a linear RGB image, area-averaged in linear light to
-    fit `box = (height, width)`. Never upsamples.
-
-    Args:
-        img_linear: `(3, H, W)` float32 linear RGB in [0, 1].
-    """
+    """Generate an sRGB uint8 thumbnail from a linear RGB image."""
     size = _fit_size(*img_linear.shape[-2:], box)
     return linear_to_srgb8(area_downsample(img_linear, size))
 
 
 def thumbnail_thermal(thermal: torch.Tensor, box: tuple[int, int] = THUMB_BOX) -> torch.Tensor:
-    """`(3, h, w)` uint8 grey thumbnail of a thermal image: codes averaged as they are (thermal is
-    not sRGB, docs/conventions.md section 1), then copied to three channels for display.
-
-    Args:
-        thermal: `(1, H, W)` float32 in [0, 1] (code / 255).
-    """
+    """Generate a 3-channel uint8 grayscale thumbnail from a thermal image."""
     size = _fit_size(*thermal.shape[-2:], box)
     small = (area_downsample(thermal, size).clamp(0, 1) * 255).round().to(torch.uint8)
     return small.expand(3, -1, -1).contiguous()
@@ -125,17 +99,7 @@ def tile_sheet(
     columns: int = 10,
     box: tuple[int, int] = THUMB_BOX,
 ) -> Image.Image:
-    """Thumbnails in a grid on a dark background, each with a caption under it.
-
-    Args:
-        thumbs: `(3, h, w)` uint8 tensors, each at most `box` = (height, width).
-        labels: One caption per thumbnail.
-        title: Printed across the top.
-        columns: Tiles per row.
-
-    Raises:
-        ValueError: `labels` and `thumbs` differ in length.
-    """
+    """Arrange thumbnails with captions into a titled contact sheet grid."""
     if len(labels) != len(thumbs):
         raise ValueError(f"{len(thumbs)} thumbnails but {len(labels)} labels")
     (cell_h, cell_w), label_h, title_h, pad = box, 20, 34, 6

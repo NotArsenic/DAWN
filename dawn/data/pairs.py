@@ -1,29 +1,4 @@
-"""Aligned thermal / RGB pairs on disk, and the dataset that serves them.
-
-`write_aligned_pair` (the `write` stage of scripts/prepare_dronevehicle.py) stores each accepted
-pair once, under `dronevehicle.aligned_dir/<split>/`, so training never warps on the fly:
-
-    <id>_rgb.png      8-bit sRGB, the lossless crop of the decoded RGB JPEG (never resampled)
-    <id>_thermal.png  8-bit L, the thermal warped onto the RGB frame (dawn.data.align.warp_thermal)
-    <id>_valid.png    L, 0 / 255: 255 where the warped thermal is real data
-    <id>_moving.png   L, 0 / 255: 255 on vehicles that moved between the two exposures (box
-                      pairs only; empty and unknown for pairs aligned by edge correlation)
-    <id>_vehicles.png L, 0 / 255: 255 on every vehicle, at every position it may be at, dilated
-                      (`masks.vehicles` in data.yaml). The loss code uses `moving` for box pairs
-                      and `vehicles` for edge-correlation (fallback) pairs; eval uses it for
-                      vehicle-crop metrics.
-
-All five are 640x512 (`DroneVehicleLayout.crop_size`). The 8-bit thermal is deliberate: the
-requantization noise (about 59 dB) is far below the JPEG noise already in the source.
-
-`AlignedPairs` serves them as tensors. Conventions (docs/conventions.md sections 1 and 10):
-
-- `thermal` is `code / 255`, float32 in [0, 1], `(1, H, W)`. Thermal values are codes, not sRGB:
-  they never go through `srgb_to_linear`.
-- `rgb` is decoded with `srgb8_to_linear`: linear float32 in [0, 1], `(3, H, W)`.
-- `valid` is excluded from **every** loss, `moving` from the **pixel** losses (box pairs); for
-  `fallback` pairs, which have no moving mask, `vehicles` takes its place.
-"""
+"""Dataset and export utilities for aligned thermal and RGB image pairs."""
 
 from __future__ import annotations
 
@@ -46,11 +21,8 @@ from dawn.data.color import srgb8_to_linear
 logger = logging.getLogger(__name__)
 
 
-# --- manifests -----------------------------------------------------------------------------------
-
-
 def write_manifest(path: str | Path, image_ids: Iterable[str]) -> None:
-    """One image ID per line, sorted and unique, LF line endings, UTF-8."""
+    """Write sorted unique image identifiers to a manifest file."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     ids = sorted(set(image_ids))
@@ -58,17 +30,14 @@ def write_manifest(path: str | Path, image_ids: Iterable[str]) -> None:
 
 
 def read_manifest(path: str | Path) -> list[str]:
-    """The IDs in a manifest, in file order (blank lines ignored)."""
+    """Read image identifiers from a manifest file."""
     return [
         line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
-# --- writing the aligned PNGs --------------------------------------------------------------------
-
-
 def _save_png(array: np.ndarray, path: Path) -> None:
-    """Write through a temporary name so an interrupted run leaves no half-written PNG."""
+    """Save an array as a PNG file via an atomic temporary write."""
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(f"{path.stem}.partial.png")
     Image.fromarray(array).save(partial, format="PNG")
@@ -77,7 +46,7 @@ def _save_png(array: np.ndarray, path: Path) -> None:
 
 @dataclass(frozen=True)
 class VehicleMaskConfig:
-    """The `masks.vehicles` section of data.yaml (`params` is what `align.vehicle_mask` takes)."""
+    """Configuration parameters for vehicle mask generation."""
 
     dilate_px: float = 3.0
     extend_px: float = 17.4
@@ -86,10 +55,11 @@ class VehicleMaskConfig:
     max_residual_px: int = 2
     min_prominence: float = 0.02
     min_window_px: int = 32
-    max_frame_fraction: float = 0.30  # a frame masked over this much is flagged (dense lots)
+    max_frame_fraction: float = 0.30
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> VehicleMaskConfig:
+        """Create a VehicleMaskConfig instance from configuration."""
         static = cfg.get("static_test") or {}
         flat = {
             "dilate_px": cfg.get("dilate_px"),
@@ -115,13 +85,13 @@ class VehicleMaskConfig:
 
 @dataclass(frozen=True)
 class VehicleResult:
-    """What `write_vehicles` found: the share of the frame masked and the branch counts."""
+    """Summary of generated vehicle mask metrics."""
 
     fraction: float
     branches: align.VehicleBranches
 
 
-_BASE_KINDS = ("rgb", "thermal", "valid", "moving")  # `write_aligned_pair`; vehicles is separate
+_BASE_KINDS = ("rgb", "thermal", "valid", "moving")
 
 
 def write_aligned_pair(
@@ -130,20 +100,7 @@ def write_aligned_pair(
     row: align.AlignRow,
     force: bool = False,
 ) -> bool:
-    """Write the four PNGs of one accepted pair, using the logged transform (no refit).
-
-    The thermal is warped onto the RGB frame with `align.warp_thermal` (bilinear inverse mapping;
-    not a downsample, so the area-averaging rule does not apply) and requantized to 8 bits. The
-    moving-vehicle mask is rebuilt from the boxes (matching is deterministic) and the logged
-    transform. An existing set is kept unless `force`. The vehicles mask is separate
-    (`write_vehicles`): it is recomputed on every run so that its branch counts are always known.
-
-    Returns:
-        True when files were written, False when the pair was already complete.
-
-    Raises:
-        ValueError: `row` is not an accepted pair.
-    """
+    """Generate and write aligned image and mask files for an accepted pair."""
     if not row.accepted:
         raise ValueError(f"only accepted pairs can be written: {row.image_id} is {row.reason}")
     paths = {kind: layout.aligned_path(row.image_id, kind) for kind in _BASE_KINDS}
@@ -165,8 +122,6 @@ def write_aligned_pair(
     )
     rgb_ann = dv.parse_annotation(layout.rgb_label(split, stem), layout.class_map, layout.border)
     if row.model == "edge_translation":
-        # Aligned by edge correlation, not boxes: a translation cannot tell which matched
-        # vehicles moved, so there is no moving mask (the pair is listed in fallback_pairs).
         moving = torch.zeros(1, *layout.crop_size, dtype=torch.bool)
     else:
         matches = align.match_boxes(thermal_ann.boxes, rgb_ann.boxes, cfg)
@@ -186,13 +141,7 @@ def write_vehicles(
     masks: VehicleMaskConfig,
     row: align.AlignRow,
 ) -> VehicleResult:
-    """Build and write `<id>_vehicles.png` for one pair (`align.vehicle_mask`, per vehicle).
-
-    Needs the pair's images for the local static test: the RGB luma and the thermal after the
-    warp, as blurred gradient magnitudes (the same ones `edge_check` uses), and the warp's
-    validity mask. Every run recomputes it (it is deterministic), so the branch counts it returns
-    are known even for pairs whose other PNGs were already written. A `run_parallel` job.
-    """
+    """Generate and save vehicle mask for an aligned pair."""
     split, stem = dv.parse_image_id(row.image_id)
     thermal8 = dv.crop_border(
         dv.read_thermal8(layout.thermal_image(split, stem)), layout.border, layout.frame_size
@@ -219,26 +168,17 @@ def write_vehicles(
     return VehicleResult(fraction=align.vehicle_fraction(mask), branches=branches)
 
 
-# --- augmentation --------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class AugmentConfig:
-    """Training augmentation (the `augment` section of data.yaml).
+    """Data augmentation configuration for training pairs."""
 
-    Flips are applied to all four tensors alike; the contrast curve to thermal only (the thermal
-    camera rescales its gain frame by frame, the RGB does not). 90 degree rotations are not offered:
-    they would turn 640x512 into 512x640, which breaks batching and the velocity net's learned
-    40x32 position embedding.
-    """
-
-    hflip: float = 0.5  # probability
-    vflip: float = 0.5  # probability; hflip and vflip together are a 180 degree rotation
+    hflip: float = 0.5
+    vflip: float = 0.5
     rot90: bool = False
-    contrast_prob: float = 0.8  # probability that a thermal curve is applied at all
-    black_point: tuple[float, float] = (0.0, 0.10)  # uniform range of the input mapped to 0
-    white_point: tuple[float, float] = (0.90, 1.0)  # uniform range of the input mapped to 1
-    gamma: tuple[float, float] = (0.7, 1.4)  # log-uniform range of the exponent
+    contrast_prob: float = 0.8
+    black_point: tuple[float, float] = (0.0, 0.10)
+    white_point: tuple[float, float] = (0.90, 1.0)
+    gamma: tuple[float, float] = (0.7, 1.4)
 
     def __post_init__(self) -> None:
         if self.rot90:
@@ -248,7 +188,7 @@ class AugmentConfig:
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> AugmentConfig:
-        """Build from the `augment` section of data.yaml."""
+        """Create an AugmentConfig instance from configuration."""
         contrast = cfg.get("thermal_contrast") or {}
         kwargs = {
             "hflip": cfg.get("hflip"),
@@ -269,7 +209,7 @@ def _uniform(lo: float, hi: float, generator: torch.Generator | None) -> float:
 def sample_contrast_curve(
     aug: AugmentConfig, generator: torch.Generator | None
 ) -> tuple[float, float, float] | None:
-    """Draw `(black, white, gamma)` for one image, or None when no curve is applied this time."""
+    """Sample random thermal contrast adjustment parameters."""
     if aug.contrast_prob <= 0 or torch.rand(1, generator=generator).item() >= aug.contrast_prob:
         return None
     black = _uniform(*aug.black_point, generator)
@@ -279,11 +219,8 @@ def sample_contrast_curve(
 
 
 def apply_contrast_curve(x: torch.Tensor, black: float, white: float, gamma: float) -> torch.Tensor:
-    """`((x - black) / (white - black)) ** gamma`, clipped to [0, 1]: monotone non-decreasing."""
+    """Apply contrast curve adjustments to a tensor."""
     return ((x - black) / (white - black)).clamp(0.0, 1.0) ** gamma
-
-
-# --- the dataset ---------------------------------------------------------------------------------
 
 
 def _load_png(path: Path, image_id: str) -> np.ndarray:
@@ -295,36 +232,7 @@ def _load_png(path: Path, image_id: str) -> np.ndarray:
 
 
 class AlignedPairs(Dataset):
-    """Aligned day pairs of one manifest (`train_pairs`, `val_pairs` or `test_pairs`).
-
-    Each item is a dict:
-
-        thermal   (1, 512, 640) float32  code / 255 of the thermal warped onto the RGB frame
-        rgb       (3, 512, 640) float32  linear RGB (`srgb8_to_linear` of the stored 8-bit sRGB)
-        valid     (1, 512, 640) bool     True where the warped thermal is real data
-        moving    (1, 512, 640) bool     True on vehicles that moved between the two exposures
-        vehicles  (1, 512, 640) bool     True on every vehicle, at every position it may be at,
-                                         dilated: use it instead of `moving` for `fallback` pairs
-        image_id  str                    `<split>_<stem>`
-        fallback  bool                   aligned by edge correlation, not boxes: the `moving` mask
-                                         is empty and unknown, so keep the pair out of the pixel
-                                         losses (listed in `fallback_pairs.txt`)
-
-    With `train=True`, a random horizontal and vertical flip is applied to all four tensors alike,
-    then a random monotone contrast curve to thermal only. Validation and test (`train=False`) are
-    deterministic and never augmented.
-
-    Augmentation draws come from `generator` when one is passed, else from torch's default RNG,
-    which a DataLoader seeds per worker. The global RNG is never reseeded here.
-
-    Args:
-        layout: Where the aligned PNGs and manifests live.
-        manifest: Manifest name, read from `<manifest_dir>/<manifest>.txt`.
-        train: Augment.
-        augment: Augmentation settings (defaults to `AugmentConfig()` when `train`).
-        max_pairs: Keep only the first N manifest entries; defaults to `dronevehicle.max_pairs`.
-        generator: Explicit `torch.Generator` for the augmentation draws.
-    """
+    """PyTorch Dataset serving aligned thermal and RGB image pairs."""
 
     def __init__(
         self,
@@ -355,7 +263,7 @@ class AlignedPairs(Dataset):
         train: bool = False,
         generator: torch.Generator | None = None,
     ) -> AlignedPairs:
-        """Build from the parsed data.yaml (`dronevehicle` and `augment` sections)."""
+        """Create an AlignedPairs dataset from configuration."""
         return cls(
             dv.DroneVehicleLayout.from_config(cfg["dronevehicle"]),
             manifest,
@@ -369,7 +277,7 @@ class AlignedPairs(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         image_id = self.image_ids[index]
-        path = lambda kind: self.layout.aligned_path(image_id, kind)  # noqa: E731
+        path = lambda kind: self.layout.aligned_path(image_id, kind)
         rgb = torch.from_numpy(_load_png(path("rgb"), image_id)).permute(2, 0, 1)
         thermal = torch.from_numpy(_load_png(path("thermal"), image_id)).unsqueeze(0)
         valid = torch.from_numpy(_load_png(path("valid"), image_id) > 127).unsqueeze(0)

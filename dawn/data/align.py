@@ -1,34 +1,4 @@
-"""Aligning day thermal to day RGB with the vehicle boxes (plan steps 3-10).
-
-The thermal and RGB cameras are mounted a few centimetres apart and expose at slightly
-different times, so a pair is a similarity warp (plus moving vehicles) apart, not identical. The
-labels give correspondences without any cross-modal feature matching: each vehicle is boxed
-separately in both modalities, and the box centres are the points.
-
-Pipeline for one pair (`align_pair` does the I/O, `align_boxes` the geometry):
-
-1. `match_boxes`: copied boxes out, then same-class **mutual** nearest-neighbour centres within a
-   gate.
-2. `ransac_similarity`: scale + rotation + translation, thermal -> RGB. With at most
-   `ransac_enumerate_max` matches every 2-match minimal set is tried, so no RNG is needed; above
-   that the sets are drawn from `generator_for(image_id, "ransac")` (docs/conventions.md 10.3).
-3. A homography (`ransac_homography`) only if the similarity fails on the residual alone.
-4. `failed_checks`: the acceptance thresholds, in plan order, each with its own reason code.
-5. `edge_check`: an independent test on the pixels, not the boxes.
-6. `warp_thermal`, `moving_mask`: the products `write` stores.
-
-Conventions (docs/conventions.md section 10)
---------------------------------------------
-- **Pixel-index coordinates**: x is the column and y the row, and the centre of the pixel in row
-  r and column c is (c, r). XML boxes (after the border crop) and every transform here use them,
-  so an integer shift of `(dx, dy)` moves pixel (c, r) to (c + dx, r + dy) exactly.
-- **Transforms map thermal onto RGB**, as 3x3 matrices acting on `(x, y, 1)`. The RGB image is
-  never resampled; the thermal image is, by inverse mapping (`warp_thermal`).
-- **Shift** is the displacement of the frame centre `(W / 2, H / 2)` = (320, 256) under the
-  transform, not the raw translation, which depends on the origin of the coordinates.
-- `warp_thermal` is a bilinear resample, not a downsample: the area-averaging rule of
-  docs/conventions.md section 4a does not apply to it.
-"""
+"""Thermal-to-RGB registration, bounding box matching, and alignment validation."""
 
 from __future__ import annotations
 
@@ -52,15 +22,15 @@ from dawn.data.seeding import generator_for
 
 logger = logging.getLogger(__name__)
 
-AFFINE_MODELS = ("similarity", "edge_translation")  # logged as the first two rows (6 numbers)
-_EPS = 1e-9  # slack on inclusive thresholds, so 1.05 passes a "within 5%" check in floating point
+AFFINE_MODELS = ("similarity", "edge_translation")
+_EPS = 1e-9
 _NAN = float("nan")
-_MIN_EDGE_PIXELS = 1000  # fewer valid pixels than this and the edge check is not meaningful
+_MIN_EDGE_PIXELS = 1000
 
 
 @dataclass(frozen=True)
 class AlignConfig:
-    """Every alignment threshold (the `align` section of data.yaml; defaults are the same)."""
+    """Configuration parameters and thresholds for pair alignment."""
 
     max_match_dist_px: float = 40.0
     copy_tol_px: float = 0.5
@@ -91,7 +61,7 @@ class AlignConfig:
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> AlignConfig:
-        """Build from the `align` section of data.yaml; missing keys keep their defaults."""
+        """Create alignment configuration from a dictionary."""
         homography = cfg.get("homography") or {}
         grad = cfg.get("grad_check") or {}
         moving = cfg.get("moving") or {}
@@ -133,9 +103,6 @@ class AlignConfig:
         return cls(**flat, **{k: v for k, v in nested.items() if v is not None})
 
 
-# --- copied boxes and matching -------------------------------------------------------------------
-
-
 def _stack(boxes: Sequence[dv.Box]) -> np.ndarray:
     return np.stack([b.vertices for b in boxes]) if boxes else np.zeros((0, 4, 2))
 
@@ -143,16 +110,7 @@ def _stack(boxes: Sequence[dv.Box]) -> np.ndarray:
 def copied_flags(
     thermal_boxes: Sequence[dv.Box], rgb_boxes: Sequence[dv.Box], tol: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Which boxes are copies of a box in the other modality.
-
-    About 17% of pairs have identical RGB and thermal label sets, and in the rest a median of 25%
-    of RGB boxes are exact copies of a thermal box. A copy has zero residual by construction, so
-    it is not alignment evidence. A thermal box is a copy of an RGB box when the (normalized)
-    class matches and every coordinate of all four vertices, in order, is within `tol` px.
-
-    Returns:
-        `(thermal_copied (nT,), rgb_copied (nR,))` bool arrays.
-    """
+    """Identify duplicate bounding boxes shared across modalities within tolerance."""
     t_flags = np.zeros(len(thermal_boxes), dtype=bool)
     r_flags = np.zeros(len(rgb_boxes), dtype=bool)
     if not len(thermal_boxes) or not len(rgb_boxes):
@@ -166,7 +124,7 @@ def copied_flags(
 def labels_identical(
     thermal_boxes: Sequence[dv.Box], rgb_boxes: Sequence[dv.Box], tol: float
 ) -> bool:
-    """True when the two label sets are the same: equal, non-zero counts, every box copied."""
+    """Return True if thermal and RGB bounding box sets are identical within tolerance."""
     if len(thermal_boxes) != len(rgb_boxes) or not thermal_boxes:
         return False
     t_flags, r_flags = copied_flags(thermal_boxes, rgb_boxes, tol)
@@ -175,17 +133,17 @@ def labels_identical(
 
 @dataclass(frozen=True)
 class Matches:
-    """Matched box centres, thermal to RGB, in the cropped frame's pixel-index coordinates."""
+    """Matched bounding box centers between thermal and RGB modalities."""
 
-    thermal_idx: np.ndarray  # (n,) indices into the thermal box list
-    rgb_idx: np.ndarray  # (n,) indices into the RGB box list
-    thermal_xy: np.ndarray  # (n, 2)
-    rgb_xy: np.ndarray  # (n, 2)
-    n_thermal: int  # boxes on each side before any exclusion
+    thermal_idx: np.ndarray
+    rgb_idx: np.ndarray
+    thermal_xy: np.ndarray
+    rgb_xy: np.ndarray
+    n_thermal: int
     n_rgb: int
-    n_copied: int  # thermal boxes that are copies (excluded when `exclude_copied_boxes`)
+    n_copied: int
     labels_identical: bool
-    n_unmatched_thermal: int  # candidate boxes without a match (copies are not candidates)
+    n_unmatched_thermal: int
     n_unmatched_rgb: int
 
     @property
@@ -196,13 +154,7 @@ class Matches:
 def match_boxes(
     thermal_boxes: Sequence[dv.Box], rgb_boxes: Sequence[dv.Box], cfg: AlignConfig
 ) -> Matches:
-    """Mutual nearest neighbours between thermal and RGB box centres.
-
-    Boxes are compared per class by the distance between their centres (the mean of the four
-    vertices). A pair matches when each is the other's nearest neighbour and they are at most
-    `cfg.max_match_dist_px` apart (a gate the plan does not state). Copied boxes are not candidates
-    on either side when `cfg.exclude_copied_boxes`.
-    """
+    """Find mutual nearest-neighbor box center matches between modalities."""
     t_copied, r_copied = copied_flags(thermal_boxes, rgb_boxes, cfg.copy_tol_px)
     identical = labels_identical(thermal_boxes, rgb_boxes, cfg.copy_tol_px)
     t_cand = (
@@ -240,11 +192,8 @@ def match_boxes(
     )
 
 
-# --- geometry ------------------------------------------------------------------------------------
-
-
 def apply_transform(T: np.ndarray, xy: np.ndarray) -> np.ndarray:
-    """Apply a 3x3 transform (similarity or homography) to `(n, 2)` points `(x, y)`."""
+    """Apply a 3x3 projective transformation matrix to 2D coordinates."""
     xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
     with np.errstate(divide="ignore", invalid="ignore"):
         w = xy @ T[2, :2] + T[2, 2]
@@ -252,14 +201,7 @@ def apply_transform(T: np.ndarray, xy: np.ndarray) -> np.ndarray:
 
 
 def fit_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    """Least-squares similarity `dst ~ s R src + t` (no reflection), as a 3x3 matrix.
-
-    In complex form `z' = a z + b`, with `a = s e^{i theta}`; exact for two points (the minimal
-    set of the RANSAC) and the Umeyama solution for more.
-
-    Raises:
-        ValueError: Fewer than two points, or the source points are not distinct.
-    """
+    """Fit a 2D similarity transform mapping src to dst."""
     src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
     if len(src) < 2:
         raise ValueError("a similarity needs at least two points")
@@ -274,7 +216,7 @@ def fit_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
 
 
 def _normalizer(points: np.ndarray) -> np.ndarray:
-    """Hartley normalization: centroid to the origin, mean distance sqrt(2)."""
+    """Compute Hartley normalization matrix translating centroid to origin."""
     centre = points.mean(axis=0)
     spread = np.linalg.norm(points - centre, axis=1).mean()
     if spread < 1e-12:
@@ -284,11 +226,7 @@ def _normalizer(points: np.ndarray) -> np.ndarray:
 
 
 def fit_homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    """Homography `dst ~ H src` by the normalized direct linear transform, `H[2, 2] = 1`.
-
-    Raises:
-        ValueError: Fewer than four points, or a degenerate (collinear / coincident) configuration.
-    """
+    """Fit a 3x3 homography matrix mapping src to dst using normalized DLT."""
     src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
     if len(src) < 4:
         raise ValueError("a homography needs at least four points")
@@ -300,7 +238,7 @@ def fit_homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
         rows.append([-x, -y, -1, 0, 0, 0, u * x, u * y, u])
         rows.append([0, 0, 0, -x, -y, -1, v * x, v * y, v])
     _, singular, vt = np.linalg.svd(np.array(rows))
-    if singular[-2] < 1e-9 * singular[0]:  # null space is more than one-dimensional
+    if singular[-2] < 1e-9 * singular[0]:
         raise ValueError("degenerate point configuration")
     h = np.linalg.inv(td) @ vt[-1].reshape(3, 3) @ ts
     if abs(h[2, 2]) < 1e-12:
@@ -309,12 +247,7 @@ def fit_homography(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
 
 
 def transform_summary(T: np.ndarray, size: tuple[int, int]) -> tuple[float, float, float]:
-    """`(scale, rotation_deg, shift_px)` of a 3x3 transform on a frame of `size = (H, W)`.
-
-    The shift is the displacement of the frame centre `(W / 2, H / 2)`. For a similarity, scale and
-    rotation are exact; for a homography they are those of the local Jacobian at the frame
-    centre (the nearest similarity there): `scale = sqrt(|det J|)`.
-    """
+    """Compute scale, rotation in degrees, and center shift in pixels from transform matrix."""
     centre = np.array([size[1] / 2.0, size[0] / 2.0])
     mapped = apply_transform(T, centre[None])[0]
     w = float(centre @ T[2, :2] + T[2, 2])
@@ -330,8 +263,7 @@ def _residuals(T: np.ndarray, src: np.ndarray, dst: np.ndarray) -> np.ndarray:
 
 
 def _best_hypothesis(residual: np.ndarray, valid: np.ndarray, inlier_px: float) -> int:
-    """Index of the hypothesis with the most inliers, then the smallest truncated error sum, then
-    the lowest index. `residual` is `(P, n)`."""
+    """Select the RANSAC hypothesis with the highest inlier count and lowest residual error."""
     inliers = (residual <= inlier_px) & valid[:, None]
     count = np.where(valid, inliers.sum(axis=1), -1)
     error = np.minimum(residual, inlier_px).sum(axis=1)
@@ -339,7 +271,7 @@ def _best_hypothesis(residual: np.ndarray, valid: np.ndarray, inlier_px: float) 
 
 
 def _refine(fit, T: np.ndarray, src: np.ndarray, dst: np.ndarray, inlier_px: float, min_pts: int):
-    """Refit on the inliers of `T` until the inlier set stops changing (at most 5 rounds)."""
+    """Iteratively refit transformation on inlier correspondences."""
     mask = _residuals(T, src, dst) <= inlier_px
     for _ in range(5):
         if mask.sum() < min_pts:
@@ -367,19 +299,7 @@ def ransac_similarity(
     iterations: int,
     generator: torch.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """RANSAC similarity fit, thermal `src` -> RGB `dst`, refit on the inliers.
-
-    Minimal sets are two matches. With `len(src) <= enumerate_max` every pair is tried, which is
-    deterministic and needs no generator; above that, `iterations` pairs are drawn from
-    `generator` (pass `generator_for(image_id, "ransac")`). The best hypothesis has the most
-    inliers (residual <= `inlier_px`), ties broken by the smaller truncated error, then by order.
-
-    Returns:
-        `(T (3, 3), inliers (n,) bool)`, the inliers measured under the refit `T`.
-
-    Raises:
-        ValueError: Fewer than two matches, or more than `enumerate_max` and no generator.
-    """
+    """Fit a similarity transform using RANSAC with inlier refinement."""
     src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
     n = len(src)
     if n < 2:
@@ -416,14 +336,7 @@ def ransac_homography(
     iterations: int,
     generator: torch.Generator,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """RANSAC homography fit with 4-match minimal sets drawn from `generator`, refit on inliers.
-
-    Returns:
-        `(H (3, 3), inliers (n,) bool)`.
-
-    Raises:
-        ValueError: Fewer than four matches, or no non-degenerate minimal set was found.
-    """
+    """Fit a homography matrix using RANSAC with inlier refinement."""
     src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
     n = len(src)
     if n < 4:
@@ -444,31 +357,23 @@ def ransac_homography(
     return _refine(fit_homography, best, src, dst, inlier_px, 4)
 
 
-# --- acceptance ----------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class GeometryMetrics:
-    """What the acceptance thresholds look at, for one fitted model."""
+    """Alignment quality and geometric error metrics for a fitted transform."""
 
     n_matches: int
     labels_identical: bool
     n_inliers: int
     inlier_ratio: float
-    median_residual: float  # px, over the inliers: the number the threshold applies to
-    median_residual_all: float  # px, over all matches (logged only)
+    median_residual: float
+    median_residual_all: float
     scale: float
     rotation_deg: float
     shift_px: float
 
 
 def failed_checks(m: GeometryMetrics, cfg: AlignConfig) -> list[str]:
-    """Every acceptance check the fit fails, in plan order (empty = accepted).
-
-    `few_matches` (`labels_copied` when the two label sets are identical), `inlier_ratio`,
-    `residual`, `scale`, `rotation`, `shift`. Thresholds: matches >= min, ratio >= min, median
-    inlier residual <= max, |scale - 1| <= max, |rotation| < max, shift < max. NaN fails.
-    """
+    """Evaluate alignment metrics and return reasons for any failed criteria."""
     failed = []
     if not m.n_matches >= cfg.min_matches:
         failed.append("labels_copied" if m.labels_identical else "few_matches")
@@ -486,7 +391,7 @@ def failed_checks(m: GeometryMetrics, cfg: AlignConfig) -> list[str]:
 
 
 def first_reason(m: GeometryMetrics, cfg: AlignConfig) -> str:
-    """`ok`, or the first failed check in plan order."""
+    """Return 'ok' if all checks pass, otherwise the first failed check name."""
     failed = failed_checks(m, cfg)
     return failed[0] if failed else "ok"
 
@@ -511,22 +416,22 @@ def _metrics(
 
 @dataclass(frozen=True)
 class AlignResult:
-    """The geometry of one pair: matches, the model used, its transform and the verdict."""
+    """Alignment solution, fitted transform, and diagnostic metrics for an image pair."""
 
     matches: Matches
-    model: str  # "similarity", "homography" or "none" (fewer than two matches)
-    T: np.ndarray | None  # 3x3, thermal -> RGB; None when `model == "none"`
-    metrics: GeometryMetrics  # of the model used (what the acceptance applied to)
-    sim: GeometryMetrics | None  # the similarity attempt
-    hom: GeometryMetrics | None  # the homography attempt, when it was tried
-    reason: str  # "ok" or the first failed check
+    model: str
+    T: np.ndarray | None
+    metrics: GeometryMetrics
+    sim: GeometryMetrics | None
+    hom: GeometryMetrics | None
+    reason: str
     n_moving: int
     n_unmatched_thermal: int
     n_unmatched_rgb: int
 
 
 def moving_flags(matches: Matches, T: np.ndarray | None, min_residual_px: float) -> np.ndarray:
-    """`(n,)` bool: matched boxes whose own residual under `T` exceeds `min_residual_px`."""
+    """Identify matched bounding boxes exceeding the moving displacement threshold."""
     if T is None or not matches.n:
         return np.zeros(matches.n, dtype=bool)
     return _residuals(T, matches.thermal_xy, matches.rgb_xy) > min_residual_px
@@ -539,17 +444,7 @@ def align_boxes(
     image_id: str,
     size: tuple[int, int] = (512, 640),
 ) -> AlignResult:
-    """Match, fit and judge the geometry of one pair (steps 3-5 of the plan, no pixels).
-
-    The similarity is fitted whenever there are two matches, even when there are too few to accept
-    (so the audit can see what a looser `min_matches` would have done). The homography is tried
-    only when the similarity fails on the residual alone and there are at least
-    `cfg.homography_min_matches` matches; it is used when it passes every check with the same
-    thresholds, and logged either way.
-
-    Args:
-        size: Frame `(H, W)` after the crop, for the shift definition.
-    """
+    """Estimate and validate geometric alignment from bounding box annotations."""
     matches = match_boxes(thermal_boxes, rgb_boxes, cfg)
     nan = GeometryMetrics(
         matches.n, matches.labels_identical, 0, _NAN, _NAN, _NAN, _NAN, _NAN, _NAN
@@ -613,33 +508,10 @@ def align_boxes(
     )
 
 
-# --- warp ----------------------------------------------------------------------------------------
-
-
 def warp_thermal(
     thermal: torch.Tensor, T: np.ndarray, size: tuple[int, int]
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resample thermal onto the RGB frame by bilinear inverse mapping.
-
-    RGB pixel `(x, y)` takes the thermal value at `T^-1 (x, y)` (pixel-index coordinates, x =
-    column, y = row; module docstring). The RGB image itself is never resampled. This is an
-    interpolation at arbitrary positions, not a downsample, so docs/conventions.md section 4a
-    (area averaging) does not apply. Computed in float64, so the identity and integer shifts
-    reproduce the input exactly.
-
-    The validity mask is False wherever the source position falls outside the thermal frame
-    (beyond the extent of its pixels, `[-0.5, W_t - 0.5]` and likewise in y), then eroded by one
-    pixel (8-neighbourhood; the outside of the RGB frame counts as valid) for the bilinear edge.
-
-    Args:
-        thermal: `(1, H_t, W_t)` or `(H_t, W_t)` float, codes / 255.
-        T: 3x3, thermal -> RGB.
-        size: Output `(H, W)`, the RGB frame.
-
-    Returns:
-        `(warped (1, H, W) float32, valid (1, H, W) bool)`. Where `valid` is False the value is
-        a clamped edge sample and must not be used.
-    """
+    """Warp a thermal image onto RGB coordinates using inverse bilinear sampling."""
     plane = thermal.detach().cpu().numpy().astype(np.float64)
     plane = plane[0] if plane.ndim == 3 else plane
     h_t, w_t = plane.shape
@@ -665,12 +537,8 @@ def warp_thermal(
     return torch.from_numpy(out.astype(np.float32))[None], torch.from_numpy(valid)[None]
 
 
-# --- moving-vehicle mask -------------------------------------------------------------------------
-
-
 def rasterize(polygons: Sequence[np.ndarray], size: tuple[int, int]) -> np.ndarray:
-    """`(H, W)` bool mask of the union of `(k, 2)` polygons in pixel-index coordinates. Edges are
-    included: a box with vertices at x = 45 and x = 55 covers columns 45 to 55."""
+    """Rasterize a collection of 2D polygons into a binary mask."""
     canvas = Image.new("L", (size[1], size[0]), 0)
     draw = ImageDraw.Draw(canvas)
     for poly in polygons:
@@ -686,16 +554,7 @@ def moving_mask(
     size: tuple[int, int],
     cfg: AlignConfig,
 ) -> tuple[torch.Tensor, int]:
-    """Mask of the vehicles that moved between the two exposures (plan step 10).
-
-    A matched box whose own residual under `T` exceeds `cfg.moving_min_residual_px` is moving.
-    Its mask is the union of its RGB polygon and its thermal polygon pushed through `T` (where
-    the thermal pixels of that vehicle end up), dilated by `cfg.moving_dilate_px` as a Euclidean
-    disk. Unmatched and copied boxes are not masked.
-
-    Returns:
-        `(mask (1, H, W) bool, number of moving vehicles)`.
-    """
+    """Generate a binary mask covering vehicles detected as moving between exposures."""
     flags = moving_flags(matches, T, cfg.moving_min_residual_px)
     polygons = []
     for k in np.flatnonzero(flags):
@@ -710,9 +569,7 @@ def moving_mask(
 def moving_displacements(
     matches: Matches, T: np.ndarray | None, min_residual_px: float
 ) -> np.ndarray:
-    """`(k,)` residuals in px (the distance between where `T` puts the thermal box centre and
-    where the RGB box centre is) of the matched boxes that moved, i.e. `moving_flags`. Their
-    spread, measured on the box-aligned pairs, sizes the dilation of the vehicles mask."""
+    """Compute displacement magnitudes for matched boxes exceeding the moving threshold."""
     if T is None or not matches.n:
         return np.zeros(0)
     residual = _residuals(T, matches.thermal_xy, matches.rgb_xy)
@@ -721,23 +578,20 @@ def moving_displacements(
 
 @dataclass(frozen=True)
 class VehicleMaskParams:
-    """The `masks.vehicles` section of data.yaml, as `vehicle_mask` uses it."""
+    """Parameters for vehicle mask rasterization and motion classification."""
 
-    dilate_px: float = 3.0  # margin round every polygon (the fallback's alignment error)
-    extend_px: float = 17.4  # moved / unsure vehicles: stretch along the long axis, both ways
-    window_margin_px: int = 12  # static test: window = the box plus this on every side
-    search_px: int = 6  # static test: residual shifts within +- this are searched
-    max_residual_px: int = 2  # static test: the best shift must be within this of "none"
-    min_prominence: float = 0.02  # static test: the correlation peak must be this clear
-    min_window_px: int = 32  # static test: a shorter window than this is too small to trust
+    dilate_px: float = 3.0
+    extend_px: float = 17.4
+    window_margin_px: int = 12
+    search_px: int = 6
+    max_residual_px: int = 2
+    min_prominence: float = 0.02
+    min_window_px: int = 32
 
 
 @dataclass(frozen=True)
 class VehicleBranches:
-    """How many vehicles of a frame took each branch of `vehicle_mask`: `matched` (a thermal box
-    of its own: both positions masked), `static`, `moved` and `unsure` (the local test passed,
-    found a clear shift, or could not decide), and `thermal_only` (thermal boxes with no RGB
-    counterpart)."""
+    """Counts of vehicles categorized across mask handling branches."""
 
     matched: int = 0
     thermal_only: int = 0
@@ -747,9 +601,7 @@ class VehicleBranches:
 
 
 def extend_polygon(vertices: np.ndarray, length: float) -> list[np.ndarray]:
-    """The region swept by an oriented box moved up to `length` px each way along its **long**
-    axis (vehicles move along their heading): the convex hull of the box shifted by `+length` and
-    `-length`. Returns polygons to rasterize (one, or three if the hull is degenerate)."""
+    """Extend an oriented bounding box along its principal axis."""
     v = np.asarray(vertices, dtype=np.float64)
     first, second = v[1] - v[0], v[2] - v[1]
     axis = first if np.linalg.norm(first) >= np.linalg.norm(second) else second
@@ -769,15 +621,7 @@ def extend_polygon(vertices: np.ndarray, length: float) -> list[np.ndarray]:
 def _classify_static(
     box: dv.Box, g_rgb: np.ndarray, g_thermal: np.ndarray, valid: np.ndarray, p: VehicleMaskParams
 ) -> str:
-    """`static`, `moved` or `unsure` for a vehicle with no thermal box of its own.
-
-    After the pair's warp, the gradient maps of RGB and thermal are correlated inside a window
-    around the box over every residual shift within `+-search_px` (the same FFT search as
-    `edge_translation`, here local). A clear peak (`min_prominence`) within `max_residual_px` of
-    no shift means the thermal shows the vehicle where RGB does: `static`. A clear peak further
-    away means it `moved`. No clear peak, a window shorter than `min_window_px` (a tiny box), or a
-    window that touches pixels the warp could not fill is `unsure`.
-    """
+    """Classify vehicle movement status based on local gradient cross-correlation."""
     height, width = g_rgb.shape
     s, margin = p.search_px, p.window_margin_px
     v = box.vertices
@@ -809,34 +653,7 @@ def vehicle_mask(
     cfg: AlignConfig,
     images: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[torch.Tensor, VehicleBranches]:
-    """Every vehicle, wherever it may be, dilated: `(1, H, W)` bool, and how each took its branch.
-
-    For pairs aligned by edge correlation there is no `moving` mask, so the pixel losses stay away
-    from the vehicles instead. The margin is chosen per vehicle:
-
-    1. **Matched** (the vehicle has a thermal box of its own, see `match_boxes`): both positions
-       are known, the oriented RGB polygon and the thermal polygon pushed through `T`, so only
-       `dilate_px` is added.
-    2. **Static**: no thermal box of its own (copied labels, or unmatched), but a local shift
-       search around the RGB box (`_classify_static`) agrees with the pair's warp and has a clear
-       peak: the vehicle did not move, `dilate_px` only.
-    3. **Moved or unsure** (a clear shift, no clear peak, a tiny box, or no `images`): the
-       polygon is stretched `extend_px` each way along its **long** axis (`extend_polygon`; a
-       vehicle moves along its heading, so an isotropic margin would waste most of its area),
-       plus `dilate_px` all round.
-
-    Thermal boxes with no RGB counterpart add their warped polygon (`thermal_only`); a thermal
-    box that is a copy of an RGB box adds nothing, since warping it would put it in the wrong
-    place. No boxes means an empty mask.
-
-    Args:
-        rgb_boxes, thermal_boxes: boxes in the cropped frame.
-        T: 3x3 thermal -> RGB, or None to ignore the thermal boxes.
-        cfg: Matching settings (gate, copy tolerance, copy exclusion).
-        images: `(g_rgb, g_thermal_warped, valid)`, the blurred gradient magnitudes of the RGB
-            luma and of the thermal after the warp, and the warp's validity mask, all `(H, W)`.
-            Without them the static test cannot run.
-    """
+    """Generate a combined binary vehicle mask and record classification branches."""
     have_both = bool(rgb_boxes) and bool(thermal_boxes)
     matches = match_boxes(thermal_boxes, rgb_boxes, cfg) if have_both else None
     partner = dict(zip(matches.rgb_idx.tolist(), matches.thermal_idx.tolist())) if matches else {}
@@ -867,30 +684,22 @@ def vehicle_mask(
 
 
 def vehicle_fraction(mask: torch.Tensor) -> float:
-    """Share of the frame a vehicles mask covers, in `[0, 1]`."""
+    """Return the fraction of pixels covered by a vehicle mask."""
     return float(mask.float().mean())
 
 
 def is_dense(fraction: float, max_fraction: float) -> bool:
-    """True when a vehicles mask covers more than `max_fraction` of the frame (dense parking
-    lots): those frames are flagged to be looked at, not silently dropped."""
+    """Return True if vehicle mask coverage exceeds the density threshold."""
     return fraction > max_fraction
 
 
-# --- independent edge check ----------------------------------------------------------------------
-
-
 def rgb_edge_luma(rgb_linear: torch.Tensor) -> np.ndarray:
-    """`(H, W)` float32 sRGB-coded luma of a linear `(3, H, W)` RGB image, for `edge_check`.
-
-    Edges are compared in a display-like space, like the thermal codes (docs/conventions.md
-    section 1), so a shadowed edge counts as much as a sunlit one.
-    """
+    """Compute sRGB luma array from linear RGB for edge correlation analysis."""
     return linear_to_srgb(luminance(rgb_linear))[0].numpy().astype(np.float32)
 
 
 def gradient_magnitude(img: np.ndarray, sigma: float) -> np.ndarray:
-    """Sobel gradient magnitude after a Gaussian blur of `sigma` px (edge-replicated)."""
+    """Compute Gaussian-smoothed Sobel gradient magnitude."""
     smooth = ndimage.gaussian_filter(img.astype(np.float32), sigma, mode="nearest")
     gy = ndimage.sobel(smooth, axis=0, mode="nearest")
     gx = ndimage.sobel(smooth, axis=1, mode="nearest")
@@ -905,12 +714,11 @@ def _pearson(a: np.ndarray, b_centered: np.ndarray, b_norm: float) -> float:
 
 @dataclass(frozen=True)
 class EdgeResult:
-    """Outcome of `edge_check`. `best_dx` / `best_dy` is the integer shift (columns, rows) to
-    apply to the warped thermal, within `+-search_px`, that best lines its edges up with RGB."""
+    """Gradient correlation metrics and shift estimates from edge verification."""
 
-    before: float  # gradient-magnitude correlation with the unwarped thermal
-    after: float  # ... with the warped thermal, same pixels
-    gain: float  # after - before
+    before: float
+    after: float
+    gain: float
     best_dx: int
     best_dy: int
     passed: bool
@@ -919,26 +727,13 @@ class EdgeResult:
 def edge_check(
     thermal: torch.Tensor, rgb_luma: np.ndarray, T: np.ndarray, cfg: AlignConfig
 ) -> EdgeResult:
-    """Independent check on the pixels: do the thermal edges line up with the RGB edges?
-
-    Normalized (Pearson) correlation of gradient magnitudes (light blur, then Sobel) between the
-    thermal and the RGB luma, over the pixels where the warp is valid (and a margin the blur and
-    Sobel reach into), before the warp (identity) and after. With near-identity warps "must
-    improve" is noisy, so the gain is logged, and the warped pair is also shifted by every
-    integer offset within `+-grad_search_px` to find where its edges fit best. Accepted when
-    `gain >= grad_min_gain` and the best shift is at most `grad_max_best_shift_px` on each axis.
-
-    Args:
-        thermal: `(1, H, W)` float, codes / 255, the unwarped thermal crop.
-        rgb_luma: `(H, W)` float32, from `rgb_edge_luma`.
-        T: 3x3 thermal -> RGB.
-    """
+    """Validate alignment quality by measuring gradient correlation between edges."""
     plane = thermal.detach().cpu().numpy()[0]
     if plane.shape != rgb_luma.shape:
         raise ValueError(f"thermal {plane.shape} and RGB {rgb_luma.shape} differ in size")
     warped, valid = warp_thermal(thermal, T, rgb_luma.shape)
     sigma = cfg.grad_blur_sigma
-    margin = int(math.ceil(3 * sigma)) + 1  # what the blur and the Sobel kernel reach
+    margin = int(math.ceil(3 * sigma)) + 1
     keep = ndimage.binary_erosion(
         valid[0].numpy(), structure=np.ones((2 * margin + 1,) * 2, bool), border_value=1
     )
@@ -968,7 +763,7 @@ def edge_check(
             key=lambda o: (max(abs(o[0]), abs(o[1])), o[0] ** 2 + o[1] ** 2, o),
         )
         best = -math.inf
-        for dy, dx in offsets:  # moves the warped content by (+dx, +dy)
+        for dy, dx in offsets:
             cand = g_after[s - dy : h - s - dy, s - dx : w - s - dx]
             score = _pearson(cand[where], ref_c, ref_norm)
             if score > best + 1e-12:
@@ -981,23 +776,13 @@ def edge_check(
     return EdgeResult(before, after, gain, best_dx, best_dy, passed)
 
 
-# --- edge-correlation fallback: translation from the pixels alone -------------------------------
-
-
 def translation_matrix(dx: float, dy: float) -> np.ndarray:
-    """3x3 pure translation, thermal onto RGB: pixel `(c, r)` lands on `(c + dx, r + dy)`."""
+    """Construct a 3x3 2D translation matrix."""
     return np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)], [0.0, 0.0, 1.0]])
 
 
 def _ncc_grid(ref: torch.Tensor, padded: torch.Tensor, s: int) -> torch.Tensor:
-    """Pearson correlation between `ref` `(h, w)` and every shifted window of `padded`.
-
-    `padded` is `(h + 2s, w + 2s)`: the same region of the other image with `s` pixels of context
-    on every side. The result is `(2s + 1, 2s + 1)`, indexed `[dy + s, dx + s]`: the correlation
-    after moving the `padded` content by `(+dx, +dy)` (the convention of `edge_check`). All
-    shifts at once: the numerator is a circular cross-correlation by FFT (exact here, no window
-    wraps), the per-window mean and variance come from integral images. float64 throughout.
-    """
+    """Compute normalized cross-correlation surface over displacement window."""
     h, w = ref.shape
     ph, pw = padded.shape
     ref_c = ref - ref.mean()
@@ -1016,19 +801,12 @@ def _ncc_grid(ref: torch.Tensor, padded: torch.Tensor, s: int) -> torch.Tensor:
     total, total_sq = window_sums(padded), window_sums(padded.pow(2))
     variance = (total_sq - total.pow(2) / (h * w)).clamp_min(1e-12)
     grid = numerator / (ref_norm.clamp_min(1e-12) * variance.sqrt())
-    return grid.flip(0).flip(1)  # window start i = s - dy, j = s - dx
+    return grid.flip(0).flip(1)
 
 
 @dataclass(frozen=True)
 class TranslationEstimate:
-    """A global integer translation of the thermal onto the RGB, from edge correlation alone.
-
-    `dx`, `dy` is the shift (columns, rows) to apply to the thermal content, so the transform is
-    `translation_matrix(dx, dy)`. `corr` is the correlation at that shift, `corr_at_zero` with no
-    shift, `prominence` the margin of the peak over the best shift at least 2 px from it,
-    `quad_dev` the largest disagreement (Chebyshev, px) between a quadrant's own best shift and
-    the global one, and `saturated` says the best shift sits on the edge of the search window.
-    """
+    """Estimated global translation derived from edge correlation."""
 
     dx: int
     dy: int
@@ -1040,7 +818,7 @@ class TranslationEstimate:
 
 
 def _grid_peak(grid: torch.Tensor, s: int) -> tuple[int, int, float, float]:
-    """`(dx, dy, best, prominence)` of a correlation grid."""
+    """Locate peak coordinates, correlation value, and prominence in correlation grid."""
     flat = int(torch.argmax(grid))
     iy, ix = divmod(flat, grid.shape[1])
     best = float(grid[iy, ix])
@@ -1052,18 +830,7 @@ def _grid_peak(grid: torch.Tensor, s: int) -> tuple[int, int, float, float]:
 def edge_translation(
     thermal: torch.Tensor, rgb_luma: np.ndarray, cfg: AlignConfig
 ) -> TranslationEstimate:
-    """Estimate the thermal -> RGB translation by maximizing the gradient-magnitude correlation.
-
-    For pairs the boxes cannot align (`labels_copied`, `few_matches`): the same blurred Sobel
-    gradient magnitude as `edge_check`, correlated over every integer shift within
-    `+-fallback_search_px` (normalized correlation over the whole frame less that margin), then
-    again inside each image quadrant. Quadrants that disagree with the global shift mean the
-    pair is not a plain translation (or the correlation is not trustworthy).
-
-    Args:
-        thermal: `(1, H, W)` float, codes / 255, the unwarped thermal crop.
-        rgb_luma: `(H, W)` float32 from `rgb_edge_luma`.
-    """
+    """Estimate global translation by maximizing gradient cross-correlation."""
     plane = thermal.detach().cpu().numpy()[0]
     if plane.shape != rgb_luma.shape:
         raise ValueError(f"thermal {plane.shape} and RGB {rgb_luma.shape} differ in size")
@@ -1095,9 +862,7 @@ def edge_translation(
 
 
 def fallback_accepts(est: TranslationEstimate, cfg: AlignConfig) -> bool:
-    """The fallback's acceptance rule: not on the window edge, a clear single peak
-    (`prominence >= fallback_min_prominence`) and quadrants within `fallback_max_quadrant_dev_px`
-    of the global shift. NaN fails."""
+    """Validate whether fallback translation estimate meets quality thresholds."""
     return bool(
         cfg.fallback_enabled
         and not est.saturated
@@ -1106,28 +871,9 @@ def fallback_accepts(est: TranslationEstimate, cfg: AlignConfig) -> bool:
     )
 
 
-# --- per-pair verdict, log and I/O ---------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class AlignRow:
-    """One row of the align log: every metric, the fitted transform and the verdict.
-
-    The top-level metrics (`n_inliers` ... `shift_px`) belong to the model used (`model`), which is
-    the similarity unless the homography fallback passed. `hom_*` are the homography attempt when
-    one was made (`hom_tried`), else NaN. `edge_*` belong to `transform`, NaN when the edge check
-    did not run. `transform` is 6 numbers (the first two rows of a similarity, or of the pure
-    translation of the edge fallback) or 9 (a homography), so `write` never refits. `reason` is
-    `ok` or the first failed check; `accepted` is `reason == ok`.
-
-    `fb_*` are the edge-correlation fallback, tried only on pairs the boxes rejected for lack of
-    evidence (`labels_copied`, `few_matches`): `fb_dx`, `fb_dy` the estimated translation,
-    `fb_corr`, `fb_prominence`, `fb_quad_dev`, `fb_saturated` what `fallback_accepts` looks at
-    (NaN when not tried). A pair the fallback accepts has `model == "edge_translation"`, `scale` 1,
-    `rotation_deg` 0, `shift_px` the length of the translation, no residuals, `n_moving` 0 (no
-    boxes were matched, so no moving mask can be made) and `reason == "ok"`; its `edge_*` are
-    the correlation at zero shift, at the estimate, and their difference.
-    """
+    """Record containing alignment parameters, transformation, metrics, and verdict."""
 
     image_id: str
     n_thermal: int
@@ -1170,8 +916,7 @@ class AlignRow:
 
 
 def format_transform(model: str, T: np.ndarray | None) -> str:
-    """Space-separated numbers, 10 significant digits: 6 for a similarity or the fallback's pure
-    translation (the first two rows), 9 for a homography."""
+    """Format transformation matrix entries into a serialized space-separated string."""
     if model == "none" or T is None:
         return ""
     values = T[:2].ravel() if model in AFFINE_MODELS else T.ravel()
@@ -1179,7 +924,7 @@ def format_transform(model: str, T: np.ndarray | None) -> str:
 
 
 def parse_transform(model: str, text: str) -> np.ndarray | None:
-    """Inverse of `format_transform`."""
+    """Parse a serialized transformation string back into a 3x3 matrix."""
     if model == "none" or not text.strip():
         return None
     values = np.array([float(v) for v in text.split()])
@@ -1189,13 +934,12 @@ def parse_transform(model: str, text: str) -> np.ndarray | None:
 
 
 def transform_of(row: AlignRow) -> np.ndarray | None:
-    """The 3x3 thermal -> RGB transform of a log row, or None when there was no fit."""
+    """Extract the 3x3 transformation matrix from an alignment row."""
     return parse_transform(row.model, row.transform)
 
 
 def final_reason(result: AlignResult, edge: EdgeResult | None, cfg: AlignConfig) -> str:
-    """The pair's verdict: the geometry's reason, else `edge_check` if the independent check is on
-    and failed (or could not run), else `ok`."""
+    """Determine the final verdict string combining geometry and edge checks."""
     if result.reason != "ok":
         return result.reason
     if cfg.grad_enabled and (edge is None or not edge.passed):
@@ -1206,7 +950,7 @@ def final_reason(result: AlignResult, edge: EdgeResult | None, cfg: AlignConfig)
 def row_from_result(
     image_id: str, result: AlignResult, edge: EdgeResult | None, cfg: AlignConfig
 ) -> AlignRow:
-    """Flatten an `AlignResult` and its `EdgeResult` into a log row."""
+    """Construct an AlignRow from alignment and edge verification results."""
     m, hom = result.metrics, result.hom
     reason = final_reason(result, edge, cfg)
     return AlignRow(
@@ -1294,17 +1038,11 @@ def _failed_row(image_id: str, reason: str) -> AlignRow:
     )
 
 
-NO_EVIDENCE = ("labels_copied", "few_matches")  # box rejections the edge fallback may overturn
+NO_EVIDENCE = ("labels_copied", "few_matches")
 
 
 def apply_fallback(row: AlignRow, est: TranslationEstimate, cfg: AlignConfig) -> AlignRow:
-    """The row after the edge fallback has looked at a pair the boxes could not judge.
-
-    The estimate is always logged (`fb_*`). When `fallback_accepts` it, the pair becomes an
-    `edge_translation` pair: the transform is the pure translation, the box-path metrics that
-    described a fit that was never accepted are cleared, and the verdict is `ok`. Otherwise the
-    box reason stands.
-    """
+    """Update alignment row with edge correlation fallback translation results."""
     logged = dataclasses.replace(
         row,
         fb_tried=True,
@@ -1346,14 +1084,7 @@ def apply_fallback(row: AlignRow, est: TranslationEstimate, cfg: AlignConfig) ->
 
 
 def align_pair(layout: dv.DroneVehicleLayout, cfg: AlignConfig, split: str, stem: str) -> AlignRow:
-    """Align one pair from the raw files: parse both label files, fit, and run the edge check.
-
-    The edge check runs for every pair that has a fitted transform, accepted or not, so the audit
-    and the sensitivity table can see how the rejected pairs would have done. A pair the boxes
-    rejected for lack of evidence (`NO_EVIDENCE`) then gets the edge-correlation fallback
-    (`edge_translation`, `apply_fallback`). A pair that cannot be read gets the reason
-    `read_error` instead of raising (a `run_parallel` job).
-    """
+    """Run full alignment pipeline on an image pair from disk."""
     image_id = dv.image_id(split, stem)
     try:
         thermal_ann = dv.parse_annotation(
@@ -1399,13 +1130,7 @@ def align_pair(layout: dv.DroneVehicleLayout, cfg: AlignConfig, split: str, stem
 def pair_moving_displacements(
     layout: dv.DroneVehicleLayout, cfg: AlignConfig, row: AlignRow
 ) -> list[float]:
-    """The displacement (px) of each vehicle that moved between the exposures in one accepted,
-    box-aligned pair (`moving_displacements` on its re-matched boxes and logged transform).
-
-    Pairs rejected or aligned by edge correlation have no box-based transform and give `[]`.
-    A `run_parallel` job; the displacements of all box pairs size how far the vehicles mask
-    extends a vehicle that may have moved.
-    """
+    """Compute displacements for moving vehicles in an accepted aligned pair."""
     if not row.accepted or row.model not in ("similarity", "homography"):
         return []
     split, stem = dv.parse_image_id(row.image_id)
@@ -1421,9 +1146,7 @@ def pair_moving_displacements(
 
 
 def summarize_displacements(values: Sequence[float]) -> dict:
-    """`n`, `p50`, `p90`, `p95`, `p99`, `max` of moving-vehicle displacements and the suggested
-    `masks.vehicles.extend_px`: the p95, rounded to 0.1 px (how far a vehicle that moved may be
-    from where RGB has it; `suggested_extend_px` is None without data)."""
+    """Compute distribution percentiles and recommended padding for moving vehicle displacements."""
     if not len(values):
         return {"n": 0, "suggested_extend_px": None}
     v = np.asarray(values, dtype=float)
@@ -1448,8 +1171,7 @@ _TYPES = {
 
 
 def write_align_log(path: str | Path, rows: Sequence[AlignRow]) -> None:
-    """Write the committed align log, one row per pair in the order given: floats to 3 decimals
-    (NaN empty), the transform to 10 significant digits."""
+    """Write alignment records to a CSV log."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1468,7 +1190,7 @@ def write_align_log(path: str | Path, rows: Sequence[AlignRow]) -> None:
 
 
 def read_align_log(path: str | Path) -> dict[str, AlignRow]:
-    """Read the align log into `{image_id: AlignRow}`, in file order."""
+    """Read alignment records from a CSV log."""
     types = {field.name: _TYPES[field.type] for field in fields(AlignRow)}
     with Path(path).open(newline="", encoding="utf-8") as f:
         rows = [
@@ -1519,17 +1241,7 @@ def _estimate_of(row: AlignRow) -> TranslationEstimate:
 
 
 def reevaluate(row: AlignRow, cfg: AlignConfig) -> str:
-    """The verdict a logged pair would get under other thresholds, without refitting.
-
-    Applies `cfg` to the logged metrics: the box path first (and, for a pair the boxes could not
-    judge, the logged edge-fallback estimate against `cfg`'s fallback thresholds), then (when a
-    homography was tried) the homography's, then the logged edge check against `cfg`'s edge
-    thresholds. It is exact for
-    thresholds that only move the acceptance of the logged fits. It cannot know about a homography
-    that a tighter residual threshold would have triggered but the run never tried, nor re-match
-    boxes (`exclude_copied_boxes`, `max_match_dist_px`) or re-fit (RANSAC thresholds); those need
-    a new `align` run.
-    """
+    """Re-evaluate acceptance status of an existing alignment row under updated config."""
     failed = failed_checks(_metrics_of(row), cfg)
     if (
         failed
@@ -1550,6 +1262,5 @@ def reevaluate(row: AlignRow, cfg: AlignConfig) -> str:
 
 
 def config_fingerprint(cfg: AlignConfig) -> str:
-    """A short stable hash of every alignment threshold, to notice a changed config that would
-    make an existing align log stale."""
+    """Generate a compact hash of alignment configuration thresholds."""
     return hashlib.sha1(repr(cfg).encode("utf-8")).hexdigest()[:12]

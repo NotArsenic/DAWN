@@ -1,14 +1,4 @@
-"""Near-duplicate detection across splits: 64-bit perceptual hashes and Hamming matching.
-
-Consecutive frames of one flight are near-duplicates, and the official DroneVehicle splits are
-not flight-disjoint (77 of the 84 train folders also appear in test). A val or test pair is a
-near-duplicate of a train pair when its RGB hash **and** its thermal hash are both within
-`dedup.max_hamming` bits of the same train pair. The matching is deliberately two-sided: a scene
-that only looks alike in one modality (a thermal gain change, a lighting change) is not a leak.
-
-The hash is the classic DCT perceptual hash: area-downsample to 32x32 (docs/conventions.md
-section 4a), 2-D DCT, keep the 8x8 low frequencies, one bit per coefficient above their median.
-"""
+"""Near-duplicate detection across dataset splits using perceptual hashes."""
 
 from __future__ import annotations
 
@@ -24,24 +14,13 @@ from scipy.fft import dctn
 
 from dawn.data.resample import area_downsample
 
-HASH_SIDE = 8  # 8 x 8 = 64 bits
+HASH_SIDE = 8
 _DCT_SIDE = 32
 _POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
 
 def phash(img: torch.Tensor) -> int:
-    """64-bit perceptual hash of a single-channel image.
-
-    The median is taken over the 63 AC coefficients (the DC term, the mean brightness, is far
-    larger than the rest and would skew it); the DC bit is kept and is almost always 1.
-
-    Args:
-        img: `(H, W)` or `(1, H, W)` float image, any range. Callers pass luminance in display
-            codes (sRGB-coded luma for RGB, the thermal codes for thermal).
-
-    Returns:
-        An integer in `[0, 2**64)`; bit `i` belongs to coefficient `i` in row-major order.
-    """
+    """Compute a 64-bit perceptual hash (pHash) of an image."""
     if img.ndim == 3:
         img = img[0]
     small = area_downsample(img.float(), (_DCT_SIDE, _DCT_SIDE)).double().numpy()
@@ -51,21 +30,22 @@ def phash(img: torch.Tensor) -> int:
 
 
 def to_hex(value: int) -> str:
-    """16 lowercase hex characters."""
+    """Format a 64-bit integer as a 16-character hexadecimal string."""
     return f"{value:016x}"
 
 
 def from_hex(text: str) -> int:
+    """Parse a hexadecimal string into an integer."""
     return int(text, 16)
 
 
 def hamming(a: int, b: int) -> int:
-    """Number of differing bits."""
+    """Compute the Hamming distance between two integers."""
     return bin(a ^ b).count("1")
 
 
 def _popcount(values: np.ndarray) -> np.ndarray:
-    """Per-element bit count of a uint64 array."""
+    """Compute bit counts per element for a uint64 array."""
     as_bytes = np.ascontiguousarray(values).view(np.uint8).reshape(*values.shape, 8)
     return _POPCOUNT[as_bytes].sum(axis=-1, dtype=np.int32)
 
@@ -77,20 +57,7 @@ def nearest_pairs(
     train_thermal: np.ndarray,
     chunk: int = 256,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """For each query pair, the train pair whose worse modality is closest.
-
-    The distance between a query and a train pair is `max(hamming(rgb), hamming(thermal))`, so a
-    pair is within `k` bits exactly when both modalities are. Ties go to the lower train index.
-
-    Args:
-        query_rgb, query_thermal: `(Q,)` uint64 hashes, one per query pair.
-        train_rgb, train_thermal: `(T,)` uint64 hashes of the candidate train pairs.
-        chunk: Queries per step (bounds the `chunk x T` distance matrices).
-
-    Returns:
-        `(index, distance)`, both `(Q,)` int: the best train index and its distance. With no
-        train pairs the index is -1 and the distance 65 (above any real distance).
-    """
+    """Find the nearest train pair for each query pair by maximum modal Hamming distance."""
     n_query = len(query_rgb)
     index = np.full(n_query, -1, dtype=np.int64)
     distance = np.full(n_query, 65, dtype=np.int32)
@@ -108,16 +75,11 @@ def nearest_pairs(
 
 
 def counts_at(distance: np.ndarray, thresholds: list[int]) -> dict[int, int]:
-    """How many query pairs have a train pair within each Hamming threshold (inclusive)."""
+    """Count pairs within each Hamming distance threshold."""
     return {int(k): int((np.asarray(distance) <= k).sum()) for k in thresholds}
 
 
-# --- cross-split matching of whole pairs ---------------------------------------------------------
-
-
 class HashedPair(Protocol):
-    """What `cross_split_duplicates` needs of a pair: an ID and the two hex hashes (the rows of
-    `dawn.data.day_filter.PairStats` qualify)."""
 
     image_id: str
     rgb_hash: str
@@ -126,12 +88,7 @@ class HashedPair(Protocol):
 
 @dataclass(frozen=True)
 class DedupRow:
-    """One row of the dedup log: a val / test pair and the train pair closest to it.
-
-    `distance` is the worse of the two modalities (`d_rgb`, `d_thermal`) for that train pair, and
-    `near_duplicate` is `distance <= max_hamming`. `matched_id` is "" when there were no train
-    pairs to compare against.
-    """
+    """Near-duplicate comparison result between a query pair and the closest train pair."""
 
     image_id: str
     matched_id: str
@@ -151,14 +108,7 @@ def _hashes(pairs: Sequence[HashedPair]) -> tuple[np.ndarray, np.ndarray]:
 def cross_split_duplicates(
     candidates: Sequence[HashedPair], references: Sequence[HashedPair], max_hamming: int
 ) -> list[DedupRow]:
-    """For each candidate pair (an accepted val / test pair), its closest reference pair (a train
-    pair that passed the day filter) and whether it is a near-duplicate of it.
-
-    Near-duplicate: RGB **and** thermal hashes both within `max_hamming` bits of the same
-    reference pair. The reference set is the train pairs that passed the day filter, which does
-    not depend on any alignment threshold, so loosening alignment later cannot sneak leakage back
-    in. One row per candidate, in the order given.
-    """
+    """Identify near-duplicate pairs across splits within a maximum Hamming distance."""
     if not candidates:
         return []
     q_rgb, q_thermal = _hashes(candidates)
@@ -194,7 +144,7 @@ def _row_key(image_id: str) -> tuple[int, str]:
 
 
 def write_dedup_log(path: str | Path, rows: Iterable[DedupRow]) -> None:
-    """Write the committed dedup log, sorted by (split, image ID)."""
+    """Write deduplication results to a CSV log."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -205,7 +155,7 @@ def write_dedup_log(path: str | Path, rows: Iterable[DedupRow]) -> None:
 
 
 def read_dedup_log(path: str | Path) -> dict[str, DedupRow]:
-    """Read the dedup log into `{image_id: DedupRow}`, in file order."""
+    """Read deduplication results from a CSV log."""
     with Path(path).open(newline="", encoding="utf-8") as f:
         rows = [
             DedupRow(

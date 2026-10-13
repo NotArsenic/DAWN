@@ -1,28 +1,4 @@
-"""DroneVehicle: raw on-disk layout, image IDs, raw readers, border check and XML parsing.
-
-Raw layout (paths from the `dronevehicle` section of configs/data.yaml, see `DroneVehicleLayout`):
-
-    <root>/<split>/<split>img/<stem>.jpg      RGB
-    <root>/<split>/<split>imgr/<stem>.jpg     thermal
-    <root>/<split>/<split>label/<stem>.xml    RGB boxes
-    <root>/<split>/<split>labelr/<stem>.xml   thermal boxes
-
-The file stem pairs the two modalities. Stems repeat across splits (`train 00001` is not
-`val 00001`), so the global image ID is `f"{split}_{stem}"` (`image_id`), used everywhere:
-manifests, logs, file names and seeds.
-
-Every frame is 840x712 with a clean 100-px white border on both modalities; the content is the
-640x512 window `[100:612, 100:740]` (`crop_border`). Coordinates:
-
-- Images are `(C, H, W)` tensors, `(3, ...)` for RGB and `(1, ...)` for thermal.
-- Box coordinates are pixel-index coordinates, x = column and y = row, so the centre of the
-  pixel in row r and column c is (c, r). The XML is in the 840x712 frame; `parse_annotation`
-  subtracts the border, so boxes are in the cropped 640x512 frame like the cropped images.
-
-Thermal is not sRGB: its 8-bit codes mean `code / 255` and never go through `srgb_to_linear`
-(docs/conventions.md section 1). This module only reads raw 8-bit data; no color conversion
-happens here.
-"""
+"""DroneVehicle layout, file readers, border validation, and annotation parsing."""
 
 from __future__ import annotations
 
@@ -36,34 +12,27 @@ import torch
 from PIL import Image
 
 SPLITS = ("train", "val", "test")
-BORDER = 100  # px of white border on every side of a raw frame
-FRAME_SIZE = (712, 840)  # raw (height, width)
-ASSET_KINDS = ("rgb", "thermal", "valid", "moving", "vehicles")  # PNGs written per pair
-_WHITE = 250  # an 8-bit value this high counts as white in the ring check
+BORDER = 100
+FRAME_SIZE = (712, 840)
+ASSET_KINDS = ("rgb", "thermal", "valid", "moving", "vehicles")
+_WHITE = 250
 
 
 class FrameError(ValueError):
-    """An image or label does not have the 840x712 frame this dataset is documented to have."""
+    """Raised when an image or annotation frame does not match expected dimensions."""
 
 
 class ThermalChannelError(ValueError):
-    """A thermal JPEG stored as 3 channels whose channels are not identical."""
-
-
-# --- ids -----------------------------------------------------------------------------------------
+    """Raised when a multi-channel thermal image contains non-identical channels."""
 
 
 def image_id(split: str, stem: str) -> str:
-    """The global ID of a pair: `f"{split}_{stem}"` (stems repeat across splits)."""
+    """Generate a global image identifier from split and stem."""
     return f"{split}_{stem}"
 
 
 def parse_image_id(image_id_: str) -> tuple[str, str]:
-    """`(split, stem)` of a global image ID.
-
-    Raises:
-        ValueError: The ID does not start with one of `SPLITS` and an underscore.
-    """
+    """Parse a global image identifier into split and stem."""
     split, sep, stem = image_id_.partition("_")
     if not sep or split not in SPLITS or not stem:
         raise ValueError(
@@ -72,35 +41,32 @@ def parse_image_id(image_id_: str) -> tuple[str, str]:
     return split, stem
 
 
-# --- layout --------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class BorderCheck:
-    """Bounds of `check_border`. Both come from `dronevehicle.border_check` in data.yaml."""
+    """Thresholds for border validation."""
 
-    min_value: int = 200  # every border pixel (8-bit) must be at least this
-    max_ring_white: float = 0.5  # share of white pixels allowed in the content's outer 1-px ring
+    min_value: int = 200
+    max_ring_white: float = 0.5
 
 
 @dataclass(frozen=True)
 class DroneVehicleLayout:
-    """Where every DroneVehicle file lives (module docstring), plus the reader settings."""
+    """Directory layout and configuration for the DroneVehicle dataset."""
 
-    root: Path  # raw download
+    root: Path
     aligned_dir: Path
     stats_csv: Path
     manifest_dir: Path
     outputs_dir: Path
-    frame_size: tuple[int, int] = FRAME_SIZE  # raw (height, width), border included
+    frame_size: tuple[int, int] = FRAME_SIZE
     border: int = BORDER
     border_check: BorderCheck = field(default_factory=BorderCheck)
-    class_map: Mapping[str, str | None] = field(default_factory=dict)  # raw name -> name / None
+    class_map: Mapping[str, str | None] = field(default_factory=dict)
     max_pairs: int | None = None
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> DroneVehicleLayout:
-        """Build from the `dronevehicle` section of data.yaml."""
+        """Create a layout instance from configuration."""
         check = cfg.get("border_check") or {}
         return cls(
             root=Path(cfg["root"]),
@@ -120,7 +86,7 @@ class DroneVehicleLayout:
 
     @property
     def crop_size(self) -> tuple[int, int]:
-        """Cropped `(height, width)`: 512 x 640 for the default frame and border."""
+        """Return cropped image dimensions (height, width)."""
         return (self.frame_size[0] - 2 * self.border, self.frame_size[1] - 2 * self.border)
 
     def rgb_image(self, split: str, stem: str) -> Path:
@@ -136,33 +102,33 @@ class DroneVehicleLayout:
         return self.root / split / f"{split}labelr" / f"{stem}.xml"
 
     def aligned_path(self, image_id_: str, kind: str) -> Path:
-        """`<aligned_dir>/<split>/<id>_<kind>.png` for `kind` in `ASSET_KINDS`."""
+        """Return the output path for an aligned asset."""
         if kind not in ASSET_KINDS:
             raise ValueError(f"kind must be one of {ASSET_KINDS}, got {kind!r}")
         split, _ = parse_image_id(image_id_)
         return self.aligned_dir / split / f"{image_id_}_{kind}.png"
 
     def manifest(self, name: str) -> Path:
-        """`<manifest_dir>/<name>.txt`, e.g. `train_pairs`."""
+        """Return the path to a split manifest file."""
         return self.manifest_dir / f"{name}.txt"
 
     def log(self, name: str) -> Path:
-        """`<manifest_dir>/logs/<name>.csv`."""
+        """Return the path to a CSV log file."""
         return self.manifest_dir / "logs" / f"{name}.csv"
 
 
 @dataclass(frozen=True)
 class PairListing:
-    """The image stems of one split, by which modalities exist."""
+    """Listing of image stems partitioned by modality presence."""
 
     split: str
-    paired: list[str]  # in both image folders
-    rgb_only: list[str]  # RGB image but no thermal image
-    thermal_only: list[str]  # thermal image but no RGB image
+    paired: list[str]
+    rgb_only: list[str]
+    thermal_only: list[str]
 
 
 def list_pairs(layout: DroneVehicleLayout, split: str) -> PairListing:
-    """Sorted stems of `split`, from the two image folders. Reports stems missing a modality."""
+    """List and categorize image stems present in a split."""
     rgb = {p.stem for p in layout.rgb_image(split, "x").parent.glob("*.jpg")}
     thermal = {p.stem for p in layout.thermal_image(split, "x").parent.glob("*.jpg")}
     return PairListing(
@@ -173,25 +139,15 @@ def list_pairs(layout: DroneVehicleLayout, split: str) -> PairListing:
     )
 
 
-# --- raw readers ---------------------------------------------------------------------------------
-
-
 def read_rgb8(path: str | Path) -> torch.Tensor:
-    """Decode an RGB JPEG to a `(3, H, W)` uint8 tensor of sRGB codes (the whole raw frame)."""
+    """Load an RGB image as a (3, H, W) uint8 tensor."""
     with Image.open(path) as img:
         array = np.asarray(img.convert("RGB"))
     return torch.from_numpy(array.copy()).permute(2, 0, 1).contiguous()
 
 
 def read_thermal8(path: str | Path) -> torch.Tensor:
-    """Decode a thermal JPEG to a `(1, H, W)` uint8 tensor of raw codes (the whole raw frame).
-
-    The files are stored either as one channel or as three identical channels. One channel is
-    taken, never a luma mix, after checking that the three really are identical.
-
-    Raises:
-        ThermalChannelError: A 3-channel file whose channels differ.
-    """
+    """Load a thermal image as a (1, H, W) uint8 tensor."""
     with Image.open(path) as img:
         array = np.asarray(img)
     if array.ndim == 3:
@@ -206,11 +162,7 @@ def read_thermal8(path: str | Path) -> torch.Tensor:
 def crop_border(
     img: torch.Tensor, border: int = BORDER, frame_size: tuple[int, int] = FRAME_SIZE
 ) -> torch.Tensor:
-    """The content window of a raw frame: `(..., H, W)` -> `(..., H - 2b, W - 2b)`.
-
-    Raises:
-        FrameError: `img` is not `frame_size` = (height, width).
-    """
+    """Crop white borders from an image tensor."""
     if tuple(img.shape[-2:]) != tuple(frame_size):
         raise FrameError(
             f"expected a {frame_size[1]}x{frame_size[0]} frame, got {img.shape[-1]}x{img.shape[-2]}"
@@ -221,13 +173,7 @@ def crop_border(
 def check_border(
     img: torch.Tensor, check: BorderCheck | None = None, border: int = BORDER
 ) -> str | None:
-    """Check the white border of a raw `(C, H, W)` uint8 frame.
-
-    Returns:
-        None when the border is clean, `"dark"` when a border pixel is below `check.min_value`
-        (content or a defect inside the border), `"wide"` when the content's outer 1-px ring is
-        mostly white (a border wider than `border`, which the crop would leave in the image).
-    """
+    """Validate white border boundaries, returning an error label if invalid."""
     check = check or BorderCheck()
     _, height, width = img.shape
     strips = (
@@ -253,58 +199,41 @@ def check_border(
     return None
 
 
-# --- XML -----------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class Box:
-    """One vehicle box: normalized class, 4 polygon vertices and where the geometry came from.
-
-    `polygon` is `((x1, y1), ..., (x4, y4))` in pixel-index coordinates of the **cropped** frame.
-    A `bndbox` becomes the rectangle (xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax).
-    """
+    """Bounding polygon and category for an annotated vehicle."""
 
     category: str
     polygon: tuple[tuple[float, float], ...]
-    kind: str  # "polygon" or "bndbox": the form the XML used
+    kind: str
 
     @property
     def vertices(self) -> np.ndarray:
-        """`(4, 2)` float64 array of `(x, y)`."""
+        """Return polygon vertices as an (N, 2) float64 array."""
         return np.asarray(self.polygon, dtype=np.float64)
 
     @property
     def center(self) -> np.ndarray:
-        """`(2,)` mean of the four vertices, `(x, y)`."""
+        """Return the centroid coordinates (x, y) of the polygon."""
         return self.vertices.mean(axis=0)
 
 
 @dataclass(frozen=True)
 class Annotation:
-    """One XML file: the `<folder>` and `<filename>` fields and the usable boxes."""
+    """Parsed XML annotation metadata and bounding boxes."""
 
     folder: str
     filename: str
     boxes: tuple[Box, ...]
-    num_point_only: int  # objects that carry only a <point>: skipped
-    num_dropped: int  # objects whose class maps to null (the "*" class): dropped
-    unknown_classes: tuple[str, ...]  # class names missing from the map: dropped, listed once each
+    num_point_only: int
+    num_dropped: int
+    unknown_classes: tuple[str, ...]
 
 
 def parse_annotation(
     path: str | Path, class_map: Mapping[str, str | None], border: int = BORDER
 ) -> Annotation:
-    """Parse one VOC-like XML into boxes in the cropped frame.
-
-    Objects carry a `<polygon>` (x1..y4, an oriented quad) or a `<bndbox>`, or only a `<point>`
-    (skipped and counted). Class names are matched case-insensitively through `class_map`
-    (`dronevehicle.class_map`): a null target drops the box (counted), a name that is not in the
-    map is dropped and listed in `unknown_classes` so a new typo shows up in the stats rather than
-    silently shrinking the data. `<size><depth>` is wrong in this dataset and ignored.
-
-    Raises:
-        ValueError: An object with no polygon, bndbox or point.
-    """
+    """Parse a VOC-style XML annotation file into bounding boxes."""
     root = ET.parse(path).getroot()
     boxes, num_point_only, num_dropped, unknown = [], 0, 0, []
     for obj in root.findall("object"):
