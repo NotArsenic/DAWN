@@ -94,12 +94,23 @@ def test_find_inputs_takes_a_file_a_directory_and_a_limit(tmp_path):
     _write_thermal(tmp_path / "nested" / "c.png", TINY_INPUT)
     (tmp_path / "notes.txt").write_text("ignored")
 
-    assert find_inputs(one, None) == [one]
-    assert len(find_inputs(tmp_path, None)) == 3, "recursive, images only"
-    assert len(find_inputs(tmp_path, 2)) == 2
-    assert find_inputs(tmp_path, None) == sorted(find_inputs(tmp_path, None)), "sorted"
+    assert find_inputs([one], None) == [one]
+    assert len(find_inputs([tmp_path], None)) == 3, "recursive, images only"
+    assert len(find_inputs([tmp_path], 2)) == 2
+    assert find_inputs([tmp_path], None) == sorted(find_inputs([tmp_path], None)), "sorted"
     with pytest.raises(FileNotFoundError, match="no such file"):
-        find_inputs(tmp_path / "missing", None)
+        find_inputs([tmp_path / "missing"], None)
+
+
+def test_find_inputs_takes_several_paths_and_deduplicates(tmp_path):
+    """`--input` is `nargs="+"`, so a shell glob arrives as many paths, repeats and all."""
+    one = _write_thermal(tmp_path / "a.png", TINY_INPUT)
+    two = _write_thermal(tmp_path / "b.png", TINY_INPUT)
+
+    assert find_inputs([one, two], None) == [one, two]
+    assert find_inputs([two, one], None) == [one, two], "sorted, not argument order"
+    assert find_inputs([one, one], None) == [one], "the same file twice is one frame"
+    assert find_inputs([one, tmp_path], None) == sorted([one, two]), "a file and its directory"
 
 
 def test_a_raw_dronevehicle_frame_loses_its_border(tmp_path):
@@ -137,7 +148,7 @@ def test_the_uncertainty_ramp_is_fixed_not_per_image():
 
 def test_end_to_end_writes_an_image_and_two_maps(tmp_path, bundle):
     path = _write_thermal(tmp_path / "frame.png", bundle.input_size)
-    out, _ = run_one(bundle, path, torch.device("cpu"), _args())
+    out, _, _ = run_one(bundle, path, torch.device("cpu"), _args())
     write_outputs(out, path.stem, tmp_path / "out", _args(save_mean=True, save_raw=True))
 
     written = {p.name for p in (tmp_path / "out").iterdir()}
@@ -158,15 +169,15 @@ def test_end_to_end_writes_an_image_and_two_maps(tmp_path, bundle):
 def test_one_sample_writes_the_image_but_no_uncertainty(tmp_path, bundle):
     path = _write_thermal(tmp_path / "single.png", bundle.input_size)
     args = _args(samples=1)
-    out, _ = run_one(bundle, path, torch.device("cpu"), args)
+    out, _, _ = run_one(bundle, path, torch.device("cpu"), args)
     write_outputs(out, path.stem, tmp_path / "one", args)
     assert {p.name for p in (tmp_path / "one").iterdir()} == {"single_rgb.png"}
 
 
 def test_seeding_from_the_name_makes_a_frame_reproducible(tmp_path, bundle):
     path = _write_thermal(tmp_path / "stable.png", bundle.input_size)
-    first, _ = run_one(bundle, path, torch.device("cpu"), _args(seed_from_name=True))
-    second, _ = run_one(bundle, path, torch.device("cpu"), _args(seed_from_name=True))
+    first, _, _ = run_one(bundle, path, torch.device("cpu"), _args(seed_from_name=True))
+    second, _, _ = run_one(bundle, path, torch.device("cpu"), _args(seed_from_name=True))
     assert torch.equal(first.sample_rgb, second.sample_rgb)
     assert torch.equal(first.l_std, second.l_std)
 
@@ -207,12 +218,14 @@ def test_without_a_refiner_the_output_is_bit_identical_to_stage_1(tmp_path, bund
     """`apply_refiner(..., None)` is an exact identity, so the default path must not move."""
     path = _write_thermal(tmp_path / "plain.png", bundle.input_size)
     args = _args(save_mean=True, save_raw=True)
-    out, residual = run_one(bundle, path, torch.device("cpu"), args)
+    out, refined, residual = run_one(bundle, path, torch.device("cpu"), args)
     before = _stage_1(bundle, path, args)
 
     assert torch.equal(residual, torch.zeros_like(residual))
     for name in ("sample_rgb", "sample_lab", "rgb", "lab", "l_std", "ab_std"):
         assert torch.equal(getattr(out, name), getattr(before, name)), name
+        # with no refiner the two returns are the same render, so neither branch can drift
+        assert torch.equal(getattr(refined, name), getattr(before, name)), name
 
     write_outputs(before, "f", tmp_path / "stage1", args)
     write_outputs(out, "f", tmp_path / "now", args)
@@ -230,8 +243,11 @@ def test_with_a_refiner_the_images_change_and_the_maps_do_not(tmp_path, bundle):
     refiner = wake_up(LocalRefiner(hidden_channels=4, num_blocks=1, kernel_size=3), std=0.5, seed=7)
     refiner.eval().requires_grad_(False)
 
-    plain, _ = run_one(bundle, path, torch.device("cpu"), args)
-    refined, residual = run_one(bundle, path, torch.device("cpu"), args, refiner)
+    plain, _, _ = run_one(bundle, path, torch.device("cpu"), args)
+    unrefined, refined, residual = run_one(bundle, path, torch.device("cpu"), args, refiner)
+
+    for name in ("sample_rgb", "lab", "l_std", "ab_std"):
+        assert torch.equal(getattr(unrefined, name), getattr(plain, name)), name
 
     assert 100 * float(residual.abs().mean()) > 0.5, "the refiner has to actually move L*"
     assert not torch.equal(refined.sample_rgb, plain.sample_rgb)
@@ -279,7 +295,12 @@ def _save_refiner(path: Path, refiner: LocalRefiner, cfg: dict) -> Path:
 def test_main_writes_the_same_maps_with_and_without_the_refiner(
     tmp_path, flow_checkpoint, monkeypatch
 ):
-    """The whole script, as a user runs it: only the images move when step 6 is switched on."""
+    """The whole script, as a user runs it.
+
+    `main` writes the unrefined render to `--output` either way and puts the refined images in
+    an `refined/` subfolder, so switching step 6 on must leave the top level byte-identical and
+    add a folder whose image differs while its two uncertainty maps do not.
+    """
     frame = _write_thermal(tmp_path / "in" / "frame.png", TINY_INPUT)
     cfg = {"hidden_channels": 4, "num_blocks": 1, "kernel_size": 3}
     refiner = wake_up(LocalRefiner(**cfg), std=0.5, seed=7)
@@ -308,11 +329,17 @@ def test_main_writes_the_same_maps_with_and_without_the_refiner(
     )
     main()
 
-    plain, refined = _png_bytes(tmp_path / "plain"), _png_bytes(tmp_path / "refined")
-    assert set(plain) == {"frame_rgb.png", "frame_l_std.png", "frame_ab_std.png"} == set(refined)
-    assert plain["frame_rgb.png"] != refined["frame_rgb.png"]
-    assert plain["frame_l_std.png"] == refined["frame_l_std.png"]
-    assert plain["frame_ab_std.png"] == refined["frame_ab_std.png"]
+    written = {"frame_rgb.png", "frame_l_std.png", "frame_ab_std.png"}
+    plain = _png_bytes(tmp_path / "plain")
+    top = _png_bytes(tmp_path / "refined")
+    step_6 = _png_bytes(tmp_path / "refined" / "refined")
+
+    assert set(plain) == set(top) == set(step_6) == written
+    assert not (tmp_path / "plain" / "refined").exists(), "no subfolder without --refiner"
+    assert top == plain, "the unrefined output is untouched by step 6"
+    assert step_6["frame_rgb.png"] != plain["frame_rgb.png"]
+    assert step_6["frame_l_std.png"] == plain["frame_l_std.png"]
+    assert step_6["frame_ab_std.png"] == plain["frame_ab_std.png"]
 
 
 def test_help_works_and_offers_the_refiner_flag(monkeypatch, capsys):
