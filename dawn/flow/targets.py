@@ -1,20 +1,4 @@
-"""Training targets: the pixel mask, the oracle fit and the token statistics.
-
-Everything here runs on the device in float32 with no gradient (docs/conventions.md section 5.3).
-From a batch of aligned pairs at the working resolution it builds, with the same code that the
-oracle script and validation use, the RAW parts the model is trained to produce:
-
-    grid  brightness (gain, offset) per cell and bin, fit from thermal to L = L*/100 with the
-          pixel mask as fit weights, at `grid.refine_steps`
-    ab    the masked area average of the true a*b* at the colour-map size
-    corr  (only when the correction is on) the masked area average of `L - L_grid`, with `L_grid`
-          the FITTED target grid rendered
-
-plus the weights the losses need (node pixel counts, colour-pixel mask fractions). The pixel mask
-is `valid & ~moving` for box-aligned pairs and `valid & ~vehicles` for fallback pairs
-(`configs/flow.yaml: pairs`). Lab channels are area-averaged as values and masks as fractions
-(docs/conventions.md section 4a).
-"""
+"""Target generation, pixel masking, and normalization statistics computation."""
 
 from __future__ import annotations
 
@@ -38,13 +22,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class FitSettings:
-    """How the target grid is fit (`grid:` in flow.yaml)."""
+    """Settings for fitting bilateral affine grids."""
 
     ridge_alpha: float = 1e-3
     refine_steps: int = 1
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> FitSettings:
+        """Instantiate FitSettings from configuration mapping."""
         return cls(
             ridge_alpha=float(cfg["grid"]["ridge_alpha"]),
             refine_steps=int(cfg["grid"]["refine_steps"]),
@@ -53,21 +38,17 @@ class FitSettings:
 
 @dataclass
 class Targets:
-    """What `build_targets` returns. `parts` are RAW; `lab` and `L_grid` are at the working size."""
+    """Container holding target parts and intermediate tensors."""
 
     parts: dict[str, torch.Tensor]
     node_weights: torch.Tensor  # (B, K, gy, gx)
-    fraction: torch.Tensor  # (B, 1, hc, wc) kept share of every colour-map pixel
-    L_grid: torch.Tensor  # (B, 1, H, W) the fitted grid rendered (the brightness oracle)
-    lab: torch.Tensor  # (B, 3, H, W) the true L*, a*, b* of the RGB
+    fraction: torch.Tensor  # (B, 1, hc, wc)
+    L_grid: torch.Tensor  # (B, 1, H, W)
+    lab: torch.Tensor  # (B, 3, H, W)
 
 
 def pixel_mask(batch: Mapping, policy: Mapping) -> torch.Tensor:
-    """`valid & ~excluded` as bool `(B, 1, H, W)`, `excluded` by the pair policy.
-
-    Box-aligned pairs exclude `policy["box_pixel_mask"]` (`moving`), fallback pairs
-    `policy["fallback_pixel_mask"]` (`vehicles`), per sample.
-    """
+    """Compute binary pixel validity mask based on alignment policy."""
     fallback = batch["fallback"].to(batch["valid"].device).view(-1, 1, 1, 1).bool()
     excluded = torch.where(
         fallback, batch[policy["fallback_pixel_mask"]], batch[policy["box_pixel_mask"]]
@@ -81,18 +62,19 @@ def prepare_batch(
     policy: Mapping,
     device: torch.device | str | None = None,
 ) -> dict:
-    """An `AlignedPairs` batch at the working resolution `size`, ready for the trainer.
+    """Preprocess data loader batch to working resolution.
 
-    Thermal and the linear RGB are area-downsampled when `size` is below the stored size; the
-    pixel mask becomes the area-averaged **fraction** of kept pixels (used as a weight, never
-    thresholded).
+    Args:
+        batch: Raw batch dictionary from dataset loader.
+        size: Target spatial dimensions (H, W).
+        policy: Pair masking policy configuration.
+        device: Optional target device for tensors.
 
     Returns:
-        dict: `thermal (B, 1, H, W)`, `rgb (B, 3, H, W)`, `mask (B, 1, H, W)` in [0, 1],
-        `fallback (B,)` bool and `image_id` (list of str).
+        Prepared batch dictionary with float tensors.
 
     Raises:
-        ValueError: `size` is larger than the stored size.
+        ValueError: If size exceeds stored image dimensions.
     """
     keep = pixel_mask(batch, policy).to(torch.float32)
     thermal, rgb = batch["thermal"].to(torch.float32), batch["rgb"].to(torch.float32)
@@ -115,7 +97,7 @@ def prepare_batch(
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor, size: tuple[int, int]):
-    """`area(value * mask) / area(mask)` at `size`, 0 where `area(mask) == 0`; also `area(mask)`."""
+    """Compute area-averaged masked mean and mask coverage fraction."""
     fraction = area_downsample(mask, size)
     mean = area_downsample(value * mask, size) / fraction.clamp(min=torch.finfo(value.dtype).tiny)
     return torch.where(fraction > 0, mean, torch.zeros_like(mean)), fraction
@@ -129,14 +111,17 @@ def build_targets(
     layout: TokenLayout,
     fit: FitSettings,
 ) -> Targets:
-    """Raw target parts, node weights and the oracle brightness for a batch.
+    """Fit bilateral grid and extract target token components for training batch.
 
     Args:
-        thermal: (B, 1, H, W) at the working resolution.
-        rgb: (B, 3, H, W) linear RGB at the same resolution.
-        mask: (B, 1, H, W) pixel mask fractions (`prepare_batch`).
-        layout: the token layout (grid and colour-map sizes, correction flag).
-        fit: ridge and refine settings of the brightness fit.
+        thermal: Thermal image tensor of shape (B, 1, H, W).
+        rgb: Linear RGB image tensor of shape (B, 3, H, W).
+        mask: Loss mask tensor of shape (B, 1, H, W).
+        layout: TokenLayout defining grid and token structure.
+        fit: FitSettings specifying grid fitting parameters.
+
+    Returns:
+        Targets container with raw part tensors and reference images.
     """
     thermal, rgb, mask = (t.to(torch.float32) for t in (thermal, rgb, mask))
     lab = linear_to_lab(rgb.clamp(0.0, 1.0))
@@ -166,16 +151,7 @@ def compute_token_stats(
     fit: FitSettings,
     device: torch.device | str = "cpu",
 ) -> dict[str, dict[str, torch.Tensor]]:
-    """Per-segment mean and std of the RAW targets over prepared batches (`prepare_batch`).
-
-    Brightness stats are `(2, K)` indexed `[coefficient, bin]`, pooled over samples and cells but
-    never over bins; colour `(2,)` and correction `(1,)` are pooled over colour pixels, weighted by
-    the mask fraction, so neutral-filled masked pixels do not bias them. Only running sums are
-    kept, so the memory cost does not grow with the number of samples.
-
-    Raises:
-        ValueError: `batches` yielded nothing.
-    """
+    """Compute per-segment mean and standard deviation of target parts across batches."""
     bright = WeightedMoments(2 * layout.num_bins)
     color = WeightedMoments(NUM_AB)
     correction = WeightedMoments(1) if layout.correction else None
@@ -187,7 +163,6 @@ def compute_token_stats(
             layout,
             fit,
         )
-        # (B, 2, K, gy, gx) -> one row per (sample, cell), one column per (coefficient, bin).
         bright.add(t.parts["grid"].permute(0, 3, 4, 1, 2).reshape(-1, 2 * layout.num_bins), None)
         weight = t.fraction.reshape(-1)
         color.add(t.parts["ab"].permute(0, 2, 3, 1).reshape(-1, NUM_AB), weight)
@@ -213,16 +188,7 @@ def load_or_compute_stats(
     key_extra: Mapping | None = None,
     device: torch.device | str = "cpu",
 ) -> dict[str, dict[str, torch.Tensor]]:
-    """Load the cached stats, or compute and save them if the cache is missing or stale.
-
-    The cache is keyed by the token layout, the fit settings, the working resolution and
-    `key_extra` (the number of samples, the manifest): any mismatch recomputes and overwrites it.
-    Training caches here; checkpoints embed the stats they were trained with, and inference reads
-    them from the checkpoint, never from this file (docs/conventions.md section 5.1).
-
-    Args:
-        make_batches: Called only on a cache miss; returns prepared batches (`prepare_batch`).
-    """
+    """Load cached normalization statistics or compute and cache them if missing."""
     cache_path = Path(cache_path)
     key = {
         "layout": layout.descriptor(),
@@ -241,3 +207,4 @@ def load_or_compute_stats(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"key": key, "stats": stats}, cache_path)
     return stats
+

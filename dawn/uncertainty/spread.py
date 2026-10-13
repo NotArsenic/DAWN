@@ -1,26 +1,4 @@
-"""Sample-spread uncertainty: brightness and colour maps from K flow samples.
-
-The flow is stochastic in `z_0`, so K draws for the same frame give K renders that agree where
-the conditioning pins the answer down and disagree where it does not. Their spread is the model's
-own statement of where it is unsure, and it needs no extra head, no calibration target and no
-second network: `sample_parts` draws the K members in one batch off a single DINO pass, so the
-whole map costs `nfe * K` velocity passes (docs/conventions.md section 11).
-
-Units are CIELAB, so the maps read against the metrics directly:
-
-    l_std   L* units (the image's L* spans 0-100), comparable to the L* error
-    ab_std  a*b* units, the RMS distance from the mean colour in the a*b* plane, so it is on the
-            same scale as a chroma CIEDE2000 and can be ranked against it
-
-**The spread is a disagreement, not an error bar.** It says the model had several answers here,
-which is not the same as being wrong here: a region the model is confidently wrong about has a
-small spread. `dawn/eval/calibration.py` measures how well the two actually rank together; until
-that number exists, read these maps as "generated, not measured", which is what the README
-promises.
-
-With `num_samples == 1` there is nothing to disagree with: both maps come back as zeros rather
-than NaN, so a K=1 run still produces a well-formed result.
-"""
+"""Sample spread uncertainty estimation across stochastic flow predictions."""
 
 from __future__ import annotations
 
@@ -37,24 +15,16 @@ from dawn.flow.tokens import TokenLayout
 
 @dataclass(frozen=True)
 class SpreadResult:
-    """One frame's point estimate, ensemble mean and the two uncertainty maps.
-
-    `sample_rgb` and `rgb` answer different questions. A single member is what the model actually
-    generates: sharp, saturated, one plausible colouring. The ensemble mean is the average of K
-    colourings, so it is smoother and less colourful (the regression-to-brown the flow exists to
-    avoid) but closer in CIEDE2000. Show `sample_rgb`; score whichever the evaluation says.
+    """Ensemble point estimates and uncertainty maps for an image batch.
 
     Args:
-        sample_rgb: `(B, 3, h, w)` linear RGB of member 0, the point estimate to display.
-        sample_lab: `(B, 3, h, w)` member 0 in L*, a*, b*. Carried rather than re-derived from
-            `sample_rgb`, because `render` clamps RGB to the gamut and converting back would
-            quietly score the clipped colour instead of the generated one.
-        rgb: `(B, 3, h, w)` linear RGB of the ensemble mean, clamped to the gamut.
-        lab: `(B, 3, h, w)` the ensemble mean in L*, a*, b*.
-        l_std: `(B, 1, h, w)` standard deviation of L* across members, in L* units.
-        ab_std: `(B, 1, h, w)` RMS distance from the mean colour in the a*b* plane,
-            `sqrt(var(a*) + var(b*))`, in a*b* units.
-        num_samples: K, the number of members the spread was taken over.
+        sample_rgb: (B, 3, H, W) linear RGB tensor for primary sample.
+        sample_lab: (B, 3, H, W) Lab tensor for primary sample.
+        rgb: (B, 3, H, W) ensemble mean linear RGB tensor.
+        lab: (B, 3, H, W) ensemble mean Lab tensor.
+        l_std: (B, 1, H, W) lightness standard deviation map.
+        ab_std: (B, 1, H, W) chroma RMS standard deviation map.
+        num_samples: Number of ensemble draws.
     """
 
     sample_rgb: torch.Tensor
@@ -72,26 +42,19 @@ def spread_from_parts(
     size: tuple[int, int],
     settings: RenderSettings,
 ) -> SpreadResult:
-    """Render K sampled members and reduce them to a mean and two spread maps.
-
-    The members are rendered one at a time and reduced by Welford's algorithm, so peak memory is
-    that of two renders whatever K is. Rendering is the expensive half of a K-sample inference
-    (the BGU especially), and it is unavoidable: the spread is defined on rendered L*a*b*, not on
-    tokens, because a token's variance says nothing about how much of it survives the grid slice.
+    """Render ensemble component parts and compute mean and spread uncertainty maps.
 
     Args:
-        parts: raw parts with a leading `(S, B)`, exactly as `sample_parts` returns them:
-            `grid (S, B, 2, K, gy, gx)`, `ab (S, B, 2, hc, wc)` and, with the correction,
-            `corr (S, B, 1, hc, wc)`.
-        thermal: `(B, 1, H, W)` thermal, `code / 255`, at least `size`.
-        size: `(h, w)` to render at (docs/conventions.md section 6.4).
-        settings: layout and upsampling settings, as `render` takes them.
+        parts: Dictionary of sampled model components with leading sample dimension (S, B, ...).
+        thermal: (B, 1, H, W) input thermal tensor in [0, 1].
+        size: Output (height, width) spatial dimensions.
+        settings: Render settings configuration.
 
     Returns:
-        A `SpreadResult` at `size`.
+        SpreadResult containing sample outputs, ensemble mean, and spread maps.
 
     Raises:
-        ValueError: `parts` is empty, the members disagree on `S`, or `S` is 0.
+        ValueError: If parts mapping is empty or sample counts disagree.
     """
     if not parts:
         raise ValueError("parts is empty: expected the dict sample_parts returns")
@@ -147,29 +110,25 @@ def sample_with_spread(
     generator: torch.Generator | None = None,
     image_ids: Sequence[str] | None = None,
 ) -> SpreadResult:
-    """One DINO pass in, a rendered estimate and its uncertainty maps out.
-
-    The whole inference path of docs/conventions.md section 6.4 after the encoder: draw K members,
-    unstandardize once, render each, reduce. `encoded` is what `DINOEncoder.encode` returned for
-    this same thermal frame, so the encoder is never run twice.
+    """Sample multiple predictions from the velocity model and compute spread statistics.
 
     Args:
-        velocity_model: `VelocityTransformer`, in eval mode.
-        encoded: `DINOEncoder.encode` output: needs `patch_tokens` and `thumb`, uses `attn_bias`
-            when the encoder was asked for it.
-        layout: the checkpoint's token layout.
-        mean, std: `(D,)` stats from the checkpoint, never from the cache file (section 5.1).
-        thermal: `(B, 1, H, W)` thermal, `code / 255`.
-        size: `(h, w)` to render at.
-        settings: layout and upsampling settings.
-        num_samples: K members. 4-8 is the plan's range; 1 skips the spread.
-        method: `"euler"` or `"midpoint"`.
-        nfe: velocity evaluations per member.
-        generator: RNG for `z_0`. Ignored when `image_ids` is given.
-        image_ids: one per image, so the draw is reproducible from the ID (section 10.3).
+        velocity_model: Velocity transformer model.
+        encoded: Encoded feature mapping containing patch tokens and thumbnail representations.
+        layout: Token layout specification.
+        mean: (D,) feature standardization mean vector.
+        std: (D,) feature standardization standard deviation vector.
+        thermal: (B, 1, H, W) input thermal tensor in [0, 1].
+        size: Target (height, width) render resolution.
+        settings: Render settings configuration.
+        num_samples: Number of stochastic ensemble samples to draw.
+        method: ODE integration method ('euler' or 'midpoint').
+        nfe: Number of function evaluations per sample.
+        generator: Optional random number generator.
+        image_ids: Optional sequence of image identifiers for deterministic seeding.
 
     Returns:
-        A `SpreadResult` at `size`.
+        SpreadResult containing primary sample, ensemble mean, and uncertainty maps.
     """
     parts = sample_parts(
         velocity_model,
@@ -186,3 +145,4 @@ def sample_with_spread(
         image_ids=image_ids,
     )
     return spread_from_parts(parts, thermal, size, settings)
+

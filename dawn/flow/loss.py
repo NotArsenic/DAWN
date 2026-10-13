@@ -1,21 +1,4 @@
-"""Flow matching losses.
-
-Conditional flow matching / rectified flow, in STANDARDIZED token space
-(docs/conventions.md section 5):
-    z_0 ~ N(0, I)
-    z_1 = standardize(pack(target parts))
-    z_t = (1 - t) * z_0 + t * z_1        (t = 0 noise, t = 1 data)
-    v_target = z_1 - z_0
-
-Loss = velocity_weight * L_flow     weighted MSE of the velocity, per segment of the token
-     + render_weight   * L_render   L1 of Lab/100 after one-step estimate and render
-     + align_weight    * L_align    1 - cosine of adapted (thermal) vs frozen (RGB) DINO tokens
-     + color_weight    * L_color    cross-entropy of the colour head over the 261 a*b* bins
-
-Every term is a MASKED mean: the pixel mask and its fractions arrive as weights, never thresholded,
-and a term with no weight at all is 0, not NaN. L_render arrives as an already rendered image: the
-caller unstandardizes and renders before this module, so it never sees stats.
-"""
+"""Flow matching losses and multi-term training objectives."""
 
 from __future__ import annotations
 
@@ -32,16 +15,17 @@ _TINY = torch.finfo(torch.float32).tiny
 
 
 class FlowLoss(nn.Module):
-    """The four losses of stage 1, with the token layout deciding the L_flow segments.
+    """Loss module combining flow matching, rendering, feature alignment, and color classification.
 
     Args:
-        layout: The token layout; its segments are brightness, color and (optionally) correction.
-        velocity_weight, render_weight, align_weight, color_weight: Loss weights.
-        segment_balance: How the segments of L_flow are summed. `per_value`: each segment counts
-            in proportion to its number of values, i.e. the plain mean over the token (colour's 32
-            values weigh twice brightness's 16). `equal`: each segment's own mean counts the same.
-        min_patch_fraction: L_color ignores patches whose kept share is below this.
-        fallback_render_weight: Weight of a fallback-aligned pair in L_render (`sample_weight`).
+        layout: TokenLayout defining token segmentation.
+        velocity_weight: Weight for flow matching velocity loss.
+        render_weight: Weight for rendered Lab L1 loss.
+        align_weight: Weight for DINO feature alignment cosine loss.
+        color_weight: Weight for color head cross-entropy loss.
+        segment_balance: Strategy for balancing flow loss across segments ('per_value' or 'equal').
+        min_patch_fraction: Minimum valid patch fraction threshold for color loss.
+        fallback_render_weight: Relative weight for fallback-aligned pairs in render loss.
     """
 
     def __init__(
@@ -71,7 +55,7 @@ class FlowLoss(nn.Module):
 
     @classmethod
     def from_config(cls, cfg: Mapping, layout: TokenLayout) -> FlowLoss:
-        """Build from the parsed flow.yaml (`flow`, `color.min_patch_fraction`, `pairs`)."""
+        """Instantiate FlowLoss from configuration mapping and TokenLayout."""
         flow = cfg["flow"]
         return cls(
             layout,
@@ -85,11 +69,9 @@ class FlowLoss(nn.Module):
         )
 
     def sample_weight(self, fallback: torch.Tensor) -> torch.Tensor:
-        """`(B,)` L_render weight per pair: `fallback_render_weight` for fallback pairs, else 1."""
+        """Compute sample-level loss weights based on pair alignment type."""
         ones = torch.ones(fallback.shape, dtype=torch.float32, device=fallback.device)
         return torch.where(fallback.bool(), ones * self.fallback_render_weight, ones)
-
-    # --- the four terms -------------------------------------------------------------------------
 
     def flow(
         self,
@@ -98,16 +80,16 @@ class FlowLoss(nn.Module):
         z_1: torch.Tensor,
         weights: torch.Tensor | None,
     ) -> dict[str, torch.Tensor]:
-        """L_flow: weighted MSE of `v_pred` against `z_1 - z_0`, summed over the segments.
+        """Compute weighted MSE flow velocity loss across token segments.
 
         Args:
-            v_pred, z_0, z_1: (B, N, D) standardized tokens.
-            weights: (B, N, D) from `TokenLayout.weights` (each segment mean 1 per sample), or
-                None for unweighted.
+            v_pred: Predicted velocity tokens of shape (B, N, D).
+            z_0: Source noise tokens of shape (B, N, D).
+            z_1: Target data tokens of shape (B, N, D).
+            weights: Optional token weights of shape (B, N, D).
 
         Returns:
-            `flow` (the balanced sum) and `flow_<segment>` (each segment's own weighted mean),
-            for the segments the layout has.
+            Dictionary containing overall 'flow' loss and per-segment losses.
         """
         if v_pred.shape != z_0.shape or v_pred.shape != z_1.shape:
             raise ValueError(
@@ -142,12 +124,16 @@ class FlowLoss(nn.Module):
         pixel_weight: torch.Tensor,
         sample_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """L_render: L1 of `Lab / 100`, a masked mean per pair, times the pair's weight.
+        """Compute masked L1 loss between predicted and target Lab images.
 
         Args:
-            lab_pred, lab_target: (B, 3, H, W) L*, a*, b* at the render size.
-            pixel_weight: (B, 1, H, W) mask fractions at the render size.
-            sample_weight: (B,) per-pair weight (`sample_weight(fallback)`).
+            lab_pred: Predicted Lab image of shape (B, 3, H, W).
+            lab_target: Target Lab image of shape (B, 3, H, W).
+            pixel_weight: Pixel mask weights of shape (B, 1, H, W).
+            sample_weight: Sample weights of shape (B,).
+
+        Returns:
+            Scalar render loss tensor.
         """
         l1 = (lab_pred.float() - lab_target.float()).abs().mean(dim=1, keepdim=True) / 100.0
         weight = pixel_weight.to(torch.float32)
@@ -157,12 +143,15 @@ class FlowLoss(nn.Module):
     def align(
         self, adapted: torch.Tensor, frozen: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
-        """L_align: `1 - cosine` per patch, a masked mean; no gradient into `frozen`.
+        """Compute cosine distance alignment loss between adapted and frozen features.
 
         Args:
-            adapted: (B, N, C) patch tokens of the LoRA-adapted encoder on thermal.
-            frozen: (B, N, C) patch tokens of the frozen encoder on the paired RGB.
-            weight: (B, N) kept share of every patch.
+            adapted: Adapted patch tokens of shape (B, N, C).
+            frozen: Frozen target patch tokens of shape (B, N, C).
+            weight: Patch validity weights of shape (B, N).
+
+        Returns:
+            Scalar alignment loss tensor.
         """
         cosine = F.cosine_similarity(adapted.float(), frozen.float().detach(), dim=-1)
         weight = weight.to(cosine.dtype)
@@ -171,22 +160,20 @@ class FlowLoss(nn.Module):
     def color(
         self, logits: torch.Tensor, target: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
-        """L_color: cross-entropy of the colour head against the soft histogram, per patch.
-
-        Patches whose kept share is below `min_patch_fraction` count 0; the rest are weighted by
-        their share.
+        """Compute cross-entropy loss between predicted bin logits and target histograms.
 
         Args:
-            logits: (B, N, Q) from `ColorHead`.
-            target: (B, N, Q) soft histograms (`patch_histograms`), each summing to 1.
-            weight: (B, N) kept share of every patch.
+            logits: Predicted bin logits of shape (B, N, Q).
+            target: Target soft histograms of shape (B, N, Q).
+            weight: Patch validity weights of shape (B, N).
+
+        Returns:
+            Scalar color loss tensor.
         """
         weight = weight.to(torch.float32)
         weight = torch.where(weight >= self.min_patch_fraction, weight, torch.zeros_like(weight))
         cross_entropy = -(target.float() * F.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
         return (weight * cross_entropy).sum() / weight.sum().clamp(min=_TINY)
-
-    # --- all together ---------------------------------------------------------------------------
 
     def forward(
         self,
@@ -205,10 +192,10 @@ class FlowLoss(nn.Module):
         color_target: torch.Tensor | None = None,
         color_patch_weight: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """All four terms and their weighted `total`. A term whose inputs are missing is 0.
+        """Compute all active loss terms and their weighted total.
 
         Returns:
-            dict: `total`, `flow`, `flow_<segment>` per segment, `render`, `align`, `color`.
+            Dictionary mapping loss names to scalar tensors.
         """
         out = self.flow(v_pred, z_0, z_1, token_weights)
         zero = v_pred.new_zeros((), dtype=torch.float32)
@@ -234,3 +221,4 @@ class FlowLoss(nn.Module):
             + self.color_weight * out["color"]
         )
         return out
+

@@ -1,22 +1,4 @@
-"""The brightness and colour oracle: the best any model could do with this parametrization.
-
-`scripts/check_oracle.py` is a thin CLI over this module. Per pair, with the pixel mask of
-`configs/flow.yaml: pairs`, at the configured resolution, it measures (all against the RGB's
-CIELAB):
-
-    grid-only    the fitted brightness grid, rendered, at refine 0 and 1: L* PSNR (peak 100)
-    + correction the same grid plus the generated-L correction at the colour-map size, upsampled
-                 bilinearly and by the BGU (both through `render`)
-    colour       the true a*b* area-averaged to the colour-map size and brought back up by the BGU
-                 guided by the true L, against bilinear: mean |delta a*b*|, over the whole frame
-                 and again restricted to the top decile of gradient magnitude (`*_edge`), where
-                 an upsampling that bleeds across boundaries would show
-    assembled    the whole oracle image through `render` (grid-only and with the correction, each
-                 upsample mode): CIEDE2000 next to the L* PSNR
-
-Everything goes through the project's own `build_targets` and `render`, so the oracle is exactly
-the ceiling the trainer's validation compares against (docs/conventions.md rules 9 and 10).
-"""
+"""Brightness and color oracle evaluation and error analysis."""
 
 from __future__ import annotations
 
@@ -78,17 +60,13 @@ LABELS = {
 
 
 def layouts(cfg: Mapping) -> tuple[TokenLayout, TokenLayout]:
-    """`(correction off, correction on)` layouts at the configured resolution."""
+    """Return token layouts with correction disabled and enabled."""
     off = dataclasses.replace(TokenLayout.from_config(cfg), correction=False)
     return off, dataclasses.replace(off, correction=True)
 
 
 def measure_batch(batch: Mapping, cfg: Mapping) -> dict[str, torch.Tensor]:
-    """Every oracle metric for one prepared batch (`prepare_batch`), each `(B,)`.
-
-    Both upsample modes are always measured (whatever `color.upsample` is), so the report keeps
-    the BGU's cost against bilinear in view.
-    """
+    """Compute oracle reconstruction metrics for a single batch."""
     off, on = layouts(cfg)
     ridge = float(cfg["grid"]["ridge_alpha"])
     size = tuple(int(v) for v in cfg["encoder"]["input_size"])
@@ -125,10 +103,7 @@ def measure_batch(batch: Mapping, cfg: Mapping) -> dict[str, torch.Tensor]:
             err_bil = torch.linalg.vector_norm(ab_bil - true_ab, dim=1)
             out["ab_err_bgu"] = masked_mean(err_bgu, mask)
             out["ab_err_bilinear"] = masked_mean(err_bil, mask)
-            # The same two numbers restricted to structural edges. The whole-frame means are
-            # dominated by flat asphalt and roofs, so they cannot answer whether bilinear bleeds
-            # across sharp boundaries -- which is the one objection the Checkpoint A measurement
-            # left open (docs/proposals_review.md section 3.B).
+            # Compute metrics restricted to structural edges.
             edge = mask * edge_quantile_mask(
                 plain.lab[:, :1] / 100.0, mask, float(cfg["color"].get("edge_quantile", 0.9))
             )
@@ -140,8 +115,7 @@ def measure_batch(batch: Mapping, cfg: Mapping) -> dict[str, torch.Tensor]:
 def colour_ceiling(
     targets, render_settings: RenderSettings, size: tuple[int, int], layout: TokenLayout
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """True a*b* at the colour-map size, brought back to `size` by the BGU (guided by the true L,
-    at the configured BGU settings) and by plain bilinear upsampling: `(bgu, bilinear)`."""
+    """Compute high-resolution color maps via BGU and bilinear upsampling."""
     low = targets.parts["ab"]
     guide_hi = targets.lab[:, :1] / 100.0
     guide_lo = area_downsample(guide_hi, layout.color_size)
@@ -159,8 +133,7 @@ def bgu_sweep_batch(
     cfg: Mapping,
     settings: Sequence[tuple[int, int, int, float, int]],
 ) -> dict[tuple, torch.Tensor]:
-    """Colour-ceiling error `(B,)` of each BGU setting `(bins, rows, cols, ridge, refine)` on a
-    batch, plus the bilinear baseline under the key `("bilinear",)`."""
+    """Compute color reconstruction errors across a sweep of BGU parameter settings."""
     off, _ = layouts(cfg)
     targets = build_targets(
         batch["thermal"], batch["rgb"], batch["mask"], off, FitSettings(1e-3, 0)
@@ -206,9 +179,20 @@ def run_oracle(
     sweep: Sequence[tuple[int, int, int, float, int]] = (),
     sweep_pairs: int = 40,
 ) -> tuple[list[dict], dict[tuple, list[float]]]:
-    """Per-pair oracle rows (`id`, `fallback`, every metric) and the BGU sweep sums.
+    """Evaluate oracle metrics and optional BGU sweep over dataset indices.
 
-    `sweep` settings are measured on the first `sweep_pairs` pairs only (box and fallback alike).
+    Args:
+        dataset: Dataset of aligned image pairs.
+        indices: Subset indices to evaluate.
+        cfg: Configuration mapping.
+        device: Evaluation device.
+        batch_size: Evaluation batch size.
+        workers: Number of DataLoader worker processes.
+        sweep: Optional sequence of BGU parameter tuples to sweep.
+        sweep_pairs: Number of initial pairs to evaluate for BGU parameter sweep.
+
+    Returns:
+        Tuple of (per_pair_metrics, sweep_results_dict).
     """
     size = tuple(int(v) for v in cfg["encoder"]["input_size"])
     rows: list[dict] = []
@@ -236,11 +220,9 @@ def run_oracle(
     return rows, sweeps
 
 
-# --- summaries --------------------------------------------------------------------------------
-
-
+# summaries
 def summarize(rows: Sequence[Mapping], key: str) -> dict[str, float]:
-    """mean / p10 / p50 / p90 / n of `key` over `rows` (NaN when there are none)."""
+    """Compute summary statistics (mean, p10, p50, p90, count) for a metric."""
     values = np.array([r[key] for r in rows if key in r], dtype=np.float64)
     if values.size == 0:
         return {
@@ -261,7 +243,7 @@ def summarize(rows: Sequence[Mapping], key: str) -> dict[str, float]:
 
 
 def metrics_table(rows: Sequence[Mapping], keys: Sequence[str] = METRICS) -> str:
-    """A markdown table: one row per metric, mean / p10 / p50 / p90 for all, box and fallback."""
+    """Format oracle evaluation metrics as a Markdown summary table."""
     groups = {
         "all": list(rows),
         "box-aligned": [r for r in rows if not r["fallback"]],
@@ -285,11 +267,7 @@ def metrics_table(rows: Sequence[Mapping], keys: Sequence[str] = METRICS) -> str
 
 
 def sweep_table(sweeps: Mapping[tuple, Sequence[float]]) -> tuple[str, tuple | None, float | None]:
-    """A markdown table of the BGU sweep (mean |delta a*b*|, lower is better).
-
-    Returns `(table, best BGU setting, bilinear baseline on the same pairs)`; the bilinear row
-    (key `("bilinear",)`) is the baseline, not a candidate.
-    """
+    """Format BGU parameter sweep results as a Markdown table."""
     baseline = sweeps.get(("bilinear",))
     base_mean = float(np.mean(baseline)) if baseline else None
     ranked = sorted(
@@ -307,13 +285,10 @@ def sweep_table(sweeps: Mapping[tuple, Sequence[float]]) -> tuple[str, tuple | N
     return "\n".join(lines), (ranked[0][1] if ranked else None), base_mean
 
 
-# --- the worst-10% sheet ----------------------------------------------------------------------
-
-
 def worst_ids(
     rows: Sequence[Mapping], key: str = "psnr_grid_r1", fraction: float = 0.10
 ) -> list[str]:
-    """IDs of the worst `fraction` of `rows` by `key` (at least one), worst first."""
+    """Identify sample IDs with lowest metric performance."""
     count = max(1, int(round(len(rows) * fraction)))
     return [r["id"] for r in sorted(rows, key=lambda r: r[key])[:count]]
 
@@ -329,11 +304,7 @@ def write_worst_sheets(
     scenes_per_sheet: int = 10,
     prefix: str = "worst10_grid_only",
 ) -> list[Path]:
-    """Contact sheets of the scenes the grid cannot express: one row per scene,
-    thermal | RGB | true L* | oracle L* | |delta L*|, labelled with the ID and the PSNR.
-
-    The oracle is the grid-only fit at the configured refine steps, rendered at the input size.
-    """
+    """Generate image contact sheets for pairs with highest reconstruction error."""
     off, _ = layouts(cfg)
     size = tuple(int(v) for v in cfg["encoder"]["input_size"])
     base = RenderSettings.from_config(cfg)
@@ -389,8 +360,9 @@ def write_worst_sheets(
 
 
 def save_rows(rows: Sequence[Mapping], path: str | Path) -> None:
-    """Per-pair numbers as JSON lines, for later comparison and plots."""
+    """Save per-sample evaluation metrics to JSON lines file."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
+

@@ -1,24 +1,4 @@
-"""The one token layout of the flow stage (docs/conventions.md section 2.3).
-
-A token is one DINO patch / brightness cell. Its values, in this order:
-
-    brightness   2K     v = k*2 + c            (bin-major; c = gain, offset)
-    color        2*b*b  v = 2K + ch*b*b + py*b + px   (its b x b block of the colour map; a*, b*)
-    correction   b*b    v = 2K + 2*b*b + py*b + px    (only when enabled; the same block, in L)
-
-with block `b = 4` (the plan's 16 brightness values, then 32 colour values). Token `n = y*gx + x`,
-row-major, matches DINO patch `n`, the thermal thumbnail pixel `n` and brightness cell `n`.
-
-`TokenLayout` is the only place that packs, unpacks, slices or counts those values: the velocity
-net's width, the stats vector, the loss weights and the render path all derive from it, and no
-other module hard-codes 16 / 32 / 48 / 64 (docs/conventions.md section 8, rule 3).
-
-Raw "parts" are what the pixel side sees:
-
-    grid  (B, 2, K, gy, gx)       gain and offset, mapping thermal to L = L*/100
-    ab    (B, 2, b*gy, b*gx)      a*, b* in CIELAB units
-    corr  (B, 1, b*gy, b*gx)      the L correction (only when enabled)
-"""
+"""Token layout specification, packing, unpacking, and normalization weighting."""
 
 from __future__ import annotations
 
@@ -35,13 +15,13 @@ NUM_AB = 2  # a*, b*
 
 @dataclass(frozen=True)
 class TokenLayout:
-    """Sizes and packing of the flow tokens.
+    """Structure and dimension specifications for flow tokens.
 
     Args:
-        num_bins: K, thermal-intensity bins of the brightness grid.
-        grid: (gy, gx) token / cell / DINO patch grid.
-        block: Colour pixels per token side; the colour map is `block` x the token grid.
-        correction: Whether the generated L correction is part of every token.
+        num_bins: Number of intensity bins in the brightness grid.
+        grid: Spatial grid dimensions (gy, gx) for tokens and patches.
+        block: Spatial scale factor from token grid to color map.
+        correction: Whether lightness residual correction is included in tokens.
     """
 
     num_bins: int = 8
@@ -51,7 +31,7 @@ class TokenLayout:
 
     @classmethod
     def from_config(cls, cfg: Mapping) -> TokenLayout:
-        """Build from the parsed flow.yaml: `encoder.input_size`, `grid`, `color`, correction."""
+        """Instantiate TokenLayout from configuration mapping."""
         height, width = cfg["encoder"]["input_size"]
         patch = cfg["encoder"]["patch_size"]
         if height % patch or width % patch:
@@ -65,20 +45,20 @@ class TokenLayout:
             correction=bool(cfg["brightness_correction"]["enabled"]),
         )
 
-    # --- sizes --------------------------------------------------------------------------------
-
+    # sizes
     @property
     def num_tokens(self) -> int:
+        """Total number of spatial tokens."""
         return self.grid[0] * self.grid[1]
 
     @property
     def color_size(self) -> tuple[int, int]:
-        """(H, W) of the colour map (and the correction map): `block` x the token grid."""
+        """Spatial dimensions (height, width) of the color map."""
         return self.grid[0] * self.block, self.grid[1] * self.block
 
     @property
     def segments(self) -> dict[str, slice]:
-        """Value slice of each segment, in token order: brightness, color, (correction)."""
+        """Slice ranges for token segments: brightness, color, and optional correction."""
         bright = NUM_COEFFS * self.num_bins
         color = NUM_AB * self.block**2
         out = {"brightness": slice(0, bright), "color": slice(bright, bright + color)}
@@ -88,11 +68,10 @@ class TokenLayout:
 
     @property
     def dim(self) -> int:
-        """D, values per token."""
+        """Total number of channels per token."""
         return max(seg.stop for seg in self.segments.values())
 
-    # --- packing ------------------------------------------------------------------------------
-
+    # packing
     def _part_shapes(self, batch: int) -> dict[str, tuple[int, ...]]:
         height, width = self.color_size
         shapes = {
@@ -104,10 +83,16 @@ class TokenLayout:
         return shapes
 
     def pack(self, parts: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Raw parts -> tokens `(B, N, D)`. Works in whatever space the parts are in.
+        """Pack raw part tensors into flattened tokens of shape (B, N, D).
+
+        Args:
+            parts: Mapping of part names ('grid', 'ab', optional 'corr') to tensors.
+
+        Returns:
+            Packed token tensor of shape (B, N, D).
 
         Raises:
-            ValueError: the parts are not exactly the ones this layout has, or are misshapen.
+            ValueError: If part shapes do not match expected layout.
         """
         expected = self._part_shapes(parts["grid"].shape[0] if "grid" in parts else 0)
         if set(parts) != set(expected):
@@ -130,10 +115,16 @@ class TokenLayout:
         return torch.cat(pieces, dim=-1)
 
     def unpack(self, tokens: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Tokens `(B, N, D)` -> raw parts. The inverse of `pack`.
+        """Unpack token tensor of shape (B, N, D) into structured part tensors.
+
+        Args:
+            tokens: Packed token tensor of shape (B, N, D).
+
+        Returns:
+            Dictionary of unpacked part tensors.
 
         Raises:
-            ValueError: `tokens` is not (B, num_tokens, dim).
+            ValueError: If token shape does not match layout dimensions.
         """
         if tokens.ndim != 3 or tokens.shape[1:] != (self.num_tokens, self.dim):
             raise ValueError(
@@ -170,8 +161,7 @@ class TokenLayout:
             )
         return parts
 
-    # --- stats and weights --------------------------------------------------------------------
-
+    # stats and weights
     def _segment_stat_shapes(self) -> dict[str, tuple[int, ...]]:
         shapes = {"brightness": (NUM_COEFFS, self.num_bins), "color": (NUM_AB,)}
         if self.correction:
@@ -181,14 +171,16 @@ class TokenLayout:
     def stats_vector(
         self, stats: Mapping[str, Mapping[str, torch.Tensor]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-segment stats -> the `(D,)` mean and std that `standardize` takes.
+        """Flatten per-segment normalization moments into 1D mean and std vectors of shape (D,).
 
         Args:
-            stats: `{segment: {"mean": ..., "std": ...}}` with brightness `(2, K)` indexed
-                `[coefficient, bin]`, colour `(2,)` (a*, b*), correction `(1,)`.
+            stats: Nested dictionary mapping segment names to 'mean' and 'std' tensors.
+
+        Returns:
+            Tuple of (mean, std) vectors of shape (D,).
 
         Raises:
-            ValueError: a segment is missing or misshapen.
+            ValueError: If required segment statistics are missing or misshapen.
         """
         out = {"mean": [], "std": []}
         for name, shape in self._segment_stat_shapes().items():
@@ -205,16 +197,14 @@ class TokenLayout:
         return torch.cat(out["mean"]), torch.cat(out["std"])
 
     def weights(self, node_weights: torch.Tensor, fraction: torch.Tensor) -> torch.Tensor:
-        """Loss weights `(B, N, D)`, each segment normalized to mean 1 per sample.
-
-        Brightness values take the node weights (pixel count per cell and bin) broadcast over
-        gain and offset; colour and correction values take the mask fraction of their pixel.
-        A segment with no weight at all (a fully masked sample) stays all zero.
+        """Construct loss weighting tensor of shape (B, N, D) normalized per sample.
 
         Args:
-            node_weights: (B, K, gy, gx) from `fit_affine_grid`.
-            fraction: (B, 1, b*gy, b*gx) kept share of every colour-map pixel, from the area
-                average of the pixel mask.
+            node_weights: Grid fitting sample counts of shape (B, K, gy, gx).
+            fraction: Mask coverage fraction tensor of shape (B, 1, hc, wc).
+
+        Returns:
+            Loss weights tensor of shape (B, N, D).
         """
         b = self.block
         bright = repeat(
@@ -226,10 +216,9 @@ class TokenLayout:
             pieces.append(pixel)
         return torch.cat([_mean_one(p.to(torch.float32)) for p in pieces], dim=-1)
 
-    # --- checkpoints --------------------------------------------------------------------------
-
+    # checkpoints
     def descriptor(self) -> dict:
-        """What a checkpoint stores to prove which layout it was trained with."""
+        """Serialize layout metadata for checkpoint compatibility checks."""
         return {
             "num_bins": self.num_bins,
             "grid": list(self.grid),
@@ -240,6 +229,7 @@ class TokenLayout:
 
     @classmethod
     def from_descriptor(cls, descriptor: Mapping) -> TokenLayout:
+        """Instantiate TokenLayout from descriptor dictionary."""
         return cls(
             num_bins=int(descriptor["num_bins"]),
             grid=(int(descriptor["grid"][0]), int(descriptor["grid"][1])),
@@ -248,7 +238,7 @@ class TokenLayout:
         )
 
     def check(self, descriptor: Mapping) -> None:
-        """Raise a clear error if `descriptor` is not this layout (e.g. another resolution)."""
+        """Verify compatibility with a stored layout descriptor."""
         if self.descriptor() != dict(descriptor):
             raise ValueError(
                 f"token layout mismatch: this run has {self.descriptor()}, the checkpoint was "
@@ -258,6 +248,6 @@ class TokenLayout:
 
 
 def _mean_one(weights: torch.Tensor) -> torch.Tensor:
-    """Scale `(B, N, V)` weights to mean 1 per sample; all-zero samples stay zero."""
+    """Normalize weights to mean 1 along token and feature dimensions per sample."""
     mean = weights.mean(dim=(1, 2), keepdim=True)
     return torch.where(mean > 0, weights / mean.clamp(min=torch.finfo(weights.dtype).tiny), 0.0)

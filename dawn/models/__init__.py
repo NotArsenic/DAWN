@@ -1,1 +1,1 @@
-"""Neural network modules: DINO encoder, velocity transformer, colour head."""
+"""Neural network architectures and model components."""

@@ -1,14 +1,4 @@
-"""Per-patch colour classifier for L_color (training only).
-
-A LayerNorm and one Linear map every ADAPTED DINO patch token to logits over the 261 a*b* bins
-(`dawn.flow.color_bins`). Trained with cross-entropy against the soft histogram of the RGB patch's
-colours (Zhang, Isola & Efros, ECCV 2016), it forces the LoRA-tuned encoder to know which colours
-belong where, which is what the generated colour map then relies on. Nothing bigger is needed:
-the head is a probe of what the tokens already hold, and a deeper head would learn the colour
-itself and leave the encoder lazy.
-
-It is part of the EMA and of the checkpoints and unused at inference.
-"""
+"""Per-patch color classification head."""
 
 from __future__ import annotations
 
@@ -19,7 +9,7 @@ from dawn.flow.color_bins import NUM_BINS
 
 
 class ColorHead(nn.Module):
-    """LayerNorm + Linear from patch tokens `(B, N, dino_dim)` to logits `(B, N, num_bins)`."""
+    """Linear classifier predicting color bin distributions from patch tokens."""
 
     def __init__(self, dino_dim: int = 384, num_bins: int = NUM_BINS):
         super().__init__()
@@ -27,5 +17,6 @@ class ColorHead(nn.Module):
         self.proj = nn.Linear(dino_dim, num_bins)
 
     def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
-        """Logits over the a*b* bins for every patch token (softmax is left to the loss)."""
+        """Compute unnormalized bin logits for patch tokens."""
         return self.proj(self.norm(patch_tokens))
+

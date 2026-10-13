@@ -1,24 +1,4 @@
-"""Velocity transformer for flow matching on the token layout.
-
-6-block DiT that predicts the velocity field v(z_t, t, c) where:
-    z_t: noisy STANDARDIZED tokens at time t, (B, N, D): one token per DINO patch, D values each
-         (docs/conventions.md section 2.3: brightness grid, colour block, optional correction).
-    t:   flow time in [0, 1] (0 = noise, 1 = data).
-    c:   conditioning from the DINOv3 encoder.
-
-Uses adaLN-Zero for time conditioning and an optional additive bias from DINO attention.
-
-The net works on token tensors only; the token width D, the token count N and the (gy, gx) grid of
-the thumbnail all come from the `TokenLayout` it is built with, so a different resolution or
-`brightness_correction` setting changes nothing here. Token n of this transformer, DINO patch n,
-brightness cell n and thumbnail pixel n all cover the same image region, so the conditioning
-streams are added per token with no resampling anywhere:
-
-    x = Linear(D -> 256)(z_t tokens)
-      + Linear(384 -> 256)(DINO patch tokens)
-      + Linear(1 -> 256)(thermal thumbnail)
-      + learned positional embedding
-"""
+"""Velocity transformer for conditional flow matching."""
 
 from __future__ import annotations
 
@@ -34,11 +14,7 @@ from dawn.models.encoder import attention_to_bias
 
 
 class AdaLNZero(nn.Module):
-    """Adaptive Layer Normalization (Zero init) for time conditioning.
-
-    Projects time embedding to (shift, scale, gate) per channel.
-    Initialized so gate ≈ 0, making each block a no-op at init.
-    """
+    """Adaptive Layer Normalization with zero initialization for time conditioning."""
 
     def __init__(self, hidden_dim: int, cond_dim: int):
         super().__init__()
@@ -48,18 +24,14 @@ class AdaLNZero(nn.Module):
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (normalized_x * (1 + scale) + shift, gate)."""
+        """Compute modulated features and residual gate."""
         shift, scale, gate = self.proj(cond).chunk(3, dim=-1)
         x_normed = self.norm(x)
         return x_normed * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate
 
 
 class AdaLNFinal(nn.Module):
-    """adaLN without a residual gate, for the layer that feeds the zero-init output head.
-
-    The final layer has nothing to gate (its output is the prediction, not a residual), so it
-    projects (shift, scale) only. Zero init makes it the plain LayerNorm at step 0.
-    """
+    """Adaptive Layer Normalization for final layer modulation without residual gating."""
 
     def __init__(self, hidden_dim: int, cond_dim: int):
         super().__init__()
@@ -74,16 +46,7 @@ class AdaLNFinal(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """Single Diffusion Transformer block.
-
-    Multi-head self-attention + MLP, both gated via adaLN-Zero.
-    Optional additive bias from DINO attention maps:
-        logits = QK^T / sqrt(d) + dino_gate * log(dino_attn + 1e-6)
-    with one learned scalar `dino_gate` per block, initialized at 0. The log is taken once, by
-    `dawn.models.encoder.attention_to_bias`; this block receives the bias already in log space
-    and passes `dino_gate * bias` to SDPA as a float `attn_mask`, which is exactly an additive
-    term on the logits.
-    """
+    """Diffusion Transformer block with adaLN-Zero conditioning and optional attention bias."""
 
     def __init__(
         self,
@@ -132,16 +95,15 @@ class DiTBlock(nn.Module):
         t_emb: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass.
+        """Apply self-attention and MLP blocks with adaptive modulation.
 
         Args:
-            x: (B, N, D) hidden states (N = tokens, D = hidden_dim).
-            t_emb: (B, D) time embedding.
-            attn_bias: (B, 1, N, N) additive attention-logit bias from DINO, already in log
-                space; broadcast over heads and scaled by this block's `dino_gate` (optional).
+            x: Input token features of shape (B, N, D).
+            t_emb: Time embedding tensor of shape (B, D).
+            attn_bias: Optional attention bias tensor of shape (B, 1, N, N).
 
         Returns:
-            x: (B, N, D) updated hidden states.
+            Updated token features of shape (B, N, D).
         """
         hidden, gate = self.adaln_attn(x, t_emb)
         x = x + gate.unsqueeze(1) * self._attention(hidden, attn_bias)
@@ -150,18 +112,8 @@ class DiTBlock(nn.Module):
 
 
 class VelocityTransformer(nn.Module):
-    """Predicts velocity v(z_t, t, c) for conditional flow matching.
+    """Diffusion Transformer predicting velocity field for conditional flow matching."""
 
-    Architecture:
-        1. Linear(D -> hidden) of the tokens (D = layout.dim: 48, or 64 with the correction).
-        2. Add Linear(384 -> hidden) of the DINO patch tokens, Linear(1 -> hidden) of the thermal
-           thumbnail and a learned position embedding.
-        3. A sinusoidal time embedding enters every block through adaLN-Zero; DINO attention is a
-           per-block additive attention bias scaled by a learned gate initialized at 0.
-        4. 6x DiTBlock, then a final adaLN and a zero-initialized Linear(hidden -> D).
-
-    About 7M parameters, about 10 GMACs per step at 1,280 tokens (estimate).
-    """
 
     def __init__(
         self,
@@ -203,7 +155,7 @@ class VelocityTransformer(nn.Module):
 
     @classmethod
     def from_config(cls, cfg, layout: TokenLayout) -> "VelocityTransformer":
-        """Build from the `velocity:` section of configs/flow.yaml and the token layout."""
+        """Instantiate VelocityTransformer from configuration mapping and TokenLayout."""
         return cls(
             layout,
             hidden_dim=cfg["hidden_dim"],
@@ -216,15 +168,7 @@ class VelocityTransformer(nn.Module):
         )
 
     def _sinusoidal_embedding(self, t: torch.Tensor, dim: int) -> torch.Tensor:
-        """Sinusoidal positional embedding for continuous time t in [0, 1].
-
-        Args:
-            t: (B,) time values.
-            dim: Embedding dimension.
-
-        Returns:
-            (B, dim) time embedding.
-        """
+        """Compute sinusoidal embeddings for continuous time steps."""
         half_dim = dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=t.device, dtype=torch.float32) * -emb)
@@ -232,7 +176,7 @@ class VelocityTransformer(nn.Module):
         return torch.cat([emb.sin(), emb.cos()], dim=-1)
 
     def attn_gates(self) -> dict[str, float]:
-        """Each block's learned DINO-attention gate, for logging (`logging.log_attn_gates`)."""
+        """Return learned attention gate values per transformer block."""
         return {
             f"gate_{i}": float(block.dino_gate.detach())
             for i, block in enumerate(self.blocks)
@@ -248,22 +192,18 @@ class VelocityTransformer(nn.Module):
         thumb: torch.Tensor | None = None,
         attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict the velocity field.
+        """Predict velocity field for noisy token inputs.
 
         Args:
-            z_t: (B, N, D) STANDARDIZED noisy tokens at time t.
-            t: (B,) time in [0, 1].
-            dino_features: (B, N, dino_dim) patch tokens from the encoder.
-            dino_attn: (B, N, N) head-averaged patch-to-patch DINO attention for the attention
-                bias. Detached first when `detach_dino_attn` is set, then turned into the
-                additive bias `log(A + 1e-6)`.
-            thumb: (B, 1, gy, gx) thermal thumbnail (`DINOEncoder.thumbnail`). Omitted means no
-                thumbnail stream.
-            attn_bias: (B, 1, N, N) the bias already in log space, as `encode` returns it. Pass
-                this or `dino_attn`; if both arrive, `dino_attn` wins.
+            z_t: Standardized noisy tokens at time t of shape (B, N, D).
+            t: Continuous time values of shape (B,) in [0, 1].
+            dino_features: Conditioning patch tokens of shape (B, N, dino_dim).
+            dino_attn: Optional patch attention weights of shape (B, N, N).
+            thumb: Optional thermal thumbnail tensor of shape (B, 1, gy, gx).
+            attn_bias: Optional precomputed log attention bias of shape (B, 1, N, N).
 
         Returns:
-            v: (B, N, D) predicted velocity, standardized.
+            Predicted velocity tensor of shape (B, N, D).
         """
         x = self.input_proj(z_t) + self.dino_proj(dino_features) + self.pos_embed
         if thumb is not None:
@@ -282,5 +222,6 @@ class VelocityTransformer(nn.Module):
         return self.output_proj(self.final_adaln(x, t_emb))
 
     def num_params(self) -> int:
-        """Total parameter count (about 7M at the plan's size)."""
+        """Return total parameter count."""
         return sum(p.numel() for p in self.parameters())
+

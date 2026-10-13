@@ -1,16 +1,4 @@
-"""The a*b* bins of L_color: derivation, soft encoding and per-patch histograms.
-
-The bins are the 261 occupied cells of a 10-unit a*b* grid over the 8-bit sRGB gamut, derived in
-code (no download, no file): map every 8-bit sRGB colour to CIELAB, round a* and b* to the grid,
-keep the cells that occur, sorted by a* then b* (docs/conventions.md section 6.1). The plan's 313
-is Zhang et al.'s set for the full Lab gamut; this is the set we can actually render.
-
-`soft_encode` is Zhang, Isola & Efros (ECCV 2016): the `k` nearest bins with a Gaussian of width
-`sigma` over the a*b* distance, normalized to sum to 1. `patch_histograms` averages the soft
-encodings of the pixels of each token's patch, masked, at render size (8x8 samples per patch at
-the default 256x320) so that the cost stays small: it never builds a dense (pixels, bins) tensor
-for the whole batch.
-"""
+"""Color bin derivation, soft encoding, and per-patch histogram computation."""
 
 from __future__ import annotations
 
@@ -22,18 +10,20 @@ from dawn.data.color import linear_to_lab, srgb8_to_linear
 from dawn.data.resample import area_downsample
 
 BIN_STEP = 10  # a*b* units
-NUM_BINS = 261  # occupied cells of the 10-unit grid over the sRGB gamut (`ab_bin_centers`)
+NUM_BINS = 261  # occupied cells of the 10-unit grid over the sRGB gamut
 _CHUNK = 1 << 14  # pixels per distance matrix: (_CHUNK, 261) floats
 
 
 @functools.lru_cache(maxsize=None)
 def ab_bin_centers(step: int = BIN_STEP, code_step: int = 1) -> torch.Tensor:
-    """The occupied a*b* bin centres, `(Q, 2)` float32, sorted by a* then b*.
+    """Compute occupied Lab color bin centers within the sRGB gamut.
 
     Args:
-        step: Grid spacing in a*b* units.
-        code_step: Use every `code_step`-th 8-bit code per channel (1 = all 16.7M colours; the
-            set is the same for 2, which is what the unit test checks). Cached per argument.
+        step: Grid spacing in Lab units.
+        code_step: Sampling step across 8-bit color channels.
+
+    Returns:
+        Tensor of shape (Q, 2) containing sorted bin centers.
     """
     codes = torch.arange(0, 256, code_step, dtype=torch.uint8)
     green_blue = torch.cartesian_prod(codes, codes)  # (G, 2)
@@ -50,16 +40,16 @@ def ab_bin_centers(step: int = BIN_STEP, code_step: int = 1) -> torch.Tensor:
 def soft_encode(
     ab: torch.Tensor, k: int = 5, sigma: float = 5.0, centers: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """Soft-encode a*b* values over the bins (Zhang et al.).
+    """Soft-encode Lab color coordinates onto discrete bin centers.
 
     Args:
-        ab: `(..., 2)` a*, b* in CIELAB units.
-        k: Number of nearest bins that share the mass.
-        sigma: Gaussian width over the a*b* distance.
-        centers: `(Q, 2)` bin centres; the 261 by default.
+        ab: Color coordinates of shape (..., 2).
+        k: Number of nearest bins.
+        sigma: Gaussian kernel bandwidth.
+        centers: Optional bin centers tensor of shape (Q, 2).
 
     Returns:
-        `(..., Q)` non-negative, summing to 1 over the last dimension, `k` nonzeros at most.
+        Soft assignments of shape (..., Q) summing to 1 along the last dimension.
     """
     index, weight = _nearest(ab.reshape(-1, 2), k, sigma, centers)
     out = weight.new_zeros(
@@ -72,7 +62,7 @@ def soft_encode(
 def _nearest(
     ab: torch.Tensor, k: int, sigma: float, centers: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`(index, weight)`, both `(P, k)`: the k nearest bins and their normalized Gaussian mass."""
+    """Find k nearest bin centers and compute normalized Gaussian weights."""
     centers = (ab_bin_centers() if centers is None else centers).to(ab)
     indices, weights = [], []
     for start in range(0, ab.shape[0], _CHUNK):
@@ -100,16 +90,17 @@ def patch_histograms(
     k: int = 5,
     sigma: float = 5.0,
 ) -> torch.Tensor:
-    """Per-patch soft histograms over the bins: the masked mean of the pixels' soft encodings.
+    """Compute masked per-patch soft color histograms across bins.
 
     Args:
-        ab_map: `(B, 2, H, W)` a*, b* in CIELAB units, at the size the histograms are built at.
-        mask: `(B, 1, H, W)` keep weights in [0, 1] (fractions are fine).
-        patch_size: Pixels per patch `(ph, pw)` (or one int) at this size; must divide `(H, W)`.
+        ab_map: Color map of shape (B, 2, H, W).
+        mask: Loss mask of shape (B, 1, H, W).
+        patch_size: Spatial patch dimensions (ph, pw) or scalar.
+        k: Number of nearest bins per pixel.
+        sigma: Gaussian bandwidth.
 
     Returns:
-        `(B, N, Q)`, patches row-major (`n = y * (W / pw) + x`, the token order). Each histogram
-        sums to 1 over the bins, or is all zero when the patch has no weight.
+        Histogram tensor of shape (B, N, Q).
     """
     ph, pw = _pair(patch_size)
     batch, _, height, width = ab_map.shape
@@ -133,8 +124,9 @@ def patch_histograms(
 
 
 def patch_mask_fraction(mask: torch.Tensor, patch_size: int | tuple[int, int]) -> torch.Tensor:
-    """Kept share of every patch, `(B, N)`: the mask area-averaged to the patch grid."""
+    """Compute average mask coverage fraction for each spatial patch."""
     ph, pw = _pair(patch_size)
     height, width = mask.shape[-2:]
     _check_divides((height, width), (ph, pw))
     return area_downsample(mask.to(torch.float32), (height // ph, width // pw)).flatten(1)
+

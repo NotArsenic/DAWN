@@ -1,9 +1,4 @@
-"""Bounded residual denoiser (Stage 2).
-
-A tiny depthwise-separable CNN that refines the grid-enhanced image.
-Bounded output: out = y + 0.1 * tanh(residual), so it can only adjust
-per-pixel brightness by ±10%. Cannot structurally modify the image.
-"""
+"""Bounded residual denoiser."""
 
 from __future__ import annotations
 
@@ -26,17 +21,7 @@ class DepthwiseSeparableConv(nn.Module):
 
 
 class BoundedDenoiser(nn.Module):
-    """Tiny denoiser with bounded output.
-
-    Architecture:
-        - Input: enhanced image (3) + log-variance map (1) = 4 channels.
-        - 2 depthwise-separable conv blocks, 24 hidden channels.
-        - Output: out = enhanced + 0.1 * tanh(residual).
-        - Receptive field: 9x9 pixels at 5x5 kernels with 2 blocks.
-        - Cannot draw VisDrone-scale objects (smallest is ~16x16).
-
-    Total: ~3K params.
-    """
+    """Compact residual network with bounded tanh output for image refinement."""
 
     def __init__(
         self,
@@ -69,13 +54,13 @@ class BoundedDenoiser(nn.Module):
         """Refine enhanced image using variance information.
 
         Args:
-            enhanced: (B, 3, H, W) grid-enhanced LINEAR RGB image.
-            log_variance: (B, 1, H, W) log of pixel-wise variance.
+            enhanced: Enhanced linear RGB image of shape (B, 3, H, W).
+            log_variance: Log variance map of shape (B, 1, H, W).
 
         Returns:
-            refined: (B, 3, H, W) refined linear RGB image. The caller applies
-                linear_to_srgb for display (docs/conventions.md section 1).
+            Refined linear RGB image of shape (B, 3, H, W).
         """
         x = torch.cat([enhanced, log_variance], dim=1)
         residual = self.net(x)
         return (enhanced + self.residual_scale * torch.tanh(residual)).clamp(0.0, 1.0)
+

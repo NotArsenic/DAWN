@@ -1,21 +1,4 @@
-"""ODE sampler for flow matching inference.
-
-Samples tokens by integrating the velocity field from t=0 to t=1.
-Uses Euler or midpoint method with 1-2 function evaluations (NFE).
-
-Works in STANDARDIZED token space, (B, N, D): the result must go through `unstandardize` once
-before rendering (docs/conventions.md section 5). `sample_parts` does that, unpacks the tokens
-with the layout and hands back RAW parts, which is what `render` expects.
-
-NFE is the number of velocity evaluations, not the number of integration steps: Euler spends
-one per step and midpoint two, so "2 NFE" is two Euler steps but a SINGLE midpoint step. Both
-cost the same and that is the comparison worth logging.
-
-The encoder runs once, outside the loop: `sample_parts` takes conditioning that is already
-computed and keeps it fixed across steps and across the K ensemble members. The noise of an image
-can come from its ID (`noise_for_ids`), so validation curves are comparable across runs and
-independent of how the loader batches.
-"""
+"""ODE numerical integration samplers for flow matching inference."""
 
 from __future__ import annotations
 
@@ -38,17 +21,15 @@ def euler_sample(
     z_0: torch.Tensor,
     num_steps: int = 2,
 ) -> torch.Tensor:
-    """Euler ODE integration from z_0 to z_1.
-
-    z_{k+1} = z_k + dt * v(z_k, t_k, c)
+    """Integrate velocity field using Euler method.
 
     Args:
-        velocity_fn: Callable(z_t, t) -> v. Should capture conditioning internally.
-        z_0: (B, N, D) initial noise sample.
-        num_steps: Number of Euler steps (NFE = num_steps).
+        velocity_fn: Callable computing velocity field v(z_t, t).
+        z_0: Initial noise tensor of shape (B, N, D).
+        num_steps: Number of integration steps.
 
     Returns:
-        z_1: (B, N, D) predicted tokens, standardized.
+        Sampled tokens z_1 of shape (B, N, D).
     """
     dt = 1.0 / num_steps
     z_t = z_0.clone()
@@ -65,15 +46,15 @@ def midpoint_sample(
     z_0: torch.Tensor,
     num_steps: int = 1,
 ) -> torch.Tensor:
-    """Midpoint method ODE integration. NFE = 2 * num_steps.
+    """Integrate velocity field using midpoint method.
 
     Args:
-        velocity_fn: Callable(z_t, t) -> v.
-        z_0: (B, N, D) initial noise.
+        velocity_fn: Callable computing velocity field v(z_t, t).
+        z_0: Initial noise tensor of shape (B, N, D).
         num_steps: Number of midpoint steps.
 
     Returns:
-        z_1: (B, N, D) predicted tokens, standardized.
+        Sampled tokens z_1 of shape (B, N, D).
     """
     dt = 1.0 / num_steps
     z_t = z_0.clone()
@@ -96,12 +77,7 @@ SAMPLERS: dict[str, Callable] = {"euler": euler_sample, "midpoint": midpoint_sam
 
 
 def steps_for_nfe(method: Method, nfe: int) -> int:
-    """Integration steps that spend exactly `nfe` velocity evaluations.
-
-    Raises:
-        ValueError: Unknown method, `nfe` below one, or an `nfe` the method cannot hit
-            exactly (midpoint only lands on even counts).
-    """
+    """Compute number of integration steps corresponding to given NFE count."""
     if method not in EVALS_PER_STEP:
         raise ValueError(f"method must be one of {sorted(EVALS_PER_STEP)}, got {method!r}")
     per_step = EVALS_PER_STEP[method]
@@ -113,7 +89,7 @@ def steps_for_nfe(method: Method, nfe: int) -> int:
 
 
 def nfe_for_steps(method: Method, num_steps: int) -> int:
-    """Velocity evaluations `num_steps` steps of `method` cost."""
+    """Compute number of velocity evaluations required for given step count."""
     if method not in EVALS_PER_STEP:
         raise ValueError(f"method must be one of {sorted(EVALS_PER_STEP)}, got {method!r}")
     return EVALS_PER_STEP[method] * num_steps
@@ -126,16 +102,16 @@ def integrate(
     method: Method = "euler",
     nfe: int = 2,
 ) -> torch.Tensor:
-    """Integrate 0 -> 1 with `method`, spending `nfe` velocity evaluations.
+    """Integrate flow trajectory from t=0 to t=1 using specified ODE solver.
 
     Args:
-        velocity_fn: Callable(z_t, t) -> v, conditioning captured.
-        z_0: (B, N, D) standardized noise.
-        method: "euler" or "midpoint".
-        nfe: Velocity evaluations (see the module docstring).
+        velocity_fn: Callable computing velocity field v(z_t, t).
+        z_0: Initial noise tensor of shape (B, N, D).
+        method: Solver method name ('euler' or 'midpoint').
+        nfe: Total number of velocity function evaluations.
 
     Returns:
-        z_1: (B, N, D), still standardized.
+        Integrated tokens z_1 of shape (B, N, D).
     """
     return SAMPLERS[method](velocity_fn, z_0, steps_for_nfe(method, nfe))
 
@@ -148,12 +124,7 @@ def noise_for_ids(
     sample: int = 0,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """`(B, N, D)` standard normal noise, image `i` drawn from `generator_for(id_i, salt)`.
-
-    The same ID gives the same noise on any machine, in any batch composition and order
-    (docs/conventions.md section 10.3). Ensemble member `sample > 0` adds its index to the salts;
-    member 0 is exactly `generator_for(id, salt)`.
-    """
+    """Generate reproducible initial noise vectors seeded by sample identifiers."""
     salts = (salt,) if sample == 0 else (salt, sample)
     noise = [
         torch.randn(num_tokens, dim, generator=generator_for(image_id, *salts))
@@ -179,32 +150,25 @@ def sample_parts(
     generator: torch.Generator | None = None,
     image_ids: Sequence[str] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Sample RAW parts for a batch of already-encoded images.
-
-    The encoder has run before this call and its outputs are reused for every step and every
-    ensemble member, so the cost is `nfe * num_samples` velocity passes and no DINO passes.
-    The K members are stacked into one batch and integrated together; the tokens are
-    unstandardized ONCE, at the end.
+    """Sample and unpack raw token parts for encoded conditioning inputs.
 
     Args:
-        velocity_model: `VelocityTransformer` (or anything with the same call signature).
-        dino_features: (B, N, C) patch tokens.
-        layout: The token layout, to unpack the sampled tokens.
-        mean: (D,) stats, from the checkpoint.
-        std: (D,) stats, from the checkpoint.
-        dino_attn: (B, N, N) head-averaged attention, or None.
-        attn_bias: (B, 1, N, N) the same thing already in log space, or None.
-        thumb: (B, 1, gy, gx) thermal thumbnail, or None.
-        method: "euler" or "midpoint".
-        nfe: Velocity evaluations per sample.
-        num_samples: K ensemble members, drawn from independent noise.
-        generator: RNG for z_0, so a sample can be reproduced. Ignored with `image_ids`.
-        image_ids: One ID per image: z_0 is then drawn from `noise_for_ids` (member `s` of image
-            `i` from its ID), independent of the batch, for comparable validation curves.
+        velocity_model: Velocity transformer model.
+        dino_features: Conditioning patch tokens of shape (B, N, C).
+        layout: TokenLayout defining token structure.
+        mean: Normalization mean vector of shape (D,).
+        std: Normalization standard deviation vector of shape (D,).
+        dino_attn: Optional patch attention tensor of shape (B, N, N).
+        attn_bias: Optional precomputed attention bias of shape (B, 1, N, N).
+        thumb: Optional thermal thumbnail tensor of shape (B, 1, gy, gx).
+        method: ODE solver method name.
+        nfe: Number of velocity function evaluations per sample.
+        num_samples: Number of ensemble samples to draw per input image.
+        generator: Optional random number generator.
+        image_ids: Optional sample identifiers for reproducible seeding.
 
     Returns:
-        raw parts, each with a leading `(num_samples, B)`: `grid (S, B, 2, K, gy, gx)`,
-        `ab (S, B, 2, hc, wc)` and, with the correction, `corr (S, B, 1, hc, wc)`.
+        Dictionary mapping part names to tensors with leading shape (num_samples, B).
     """
     if num_samples < 1:
         raise ValueError(f"num_samples must be at least 1, got {num_samples}")

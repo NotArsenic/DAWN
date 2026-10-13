@@ -1,11 +1,4 @@
-"""Data loaders of the flow stage: train, validation split by pair kind, and the stats batches.
-
-Everything comes from `dawn.data.pairs.AlignedPairs`. Validation is split into the two kinds of
-pair (`configs/flow.yaml: pairs`): **box-aligned** (the headline and model-selection set) and
-**fallback** (aligned by edge correlation only; a separate robustness number).
-
-`--overfit N` trains and validates on the first N train pairs with no augmentation.
-"""
+"""Data loaders for training, validation, and token statistics."""
 
 from __future__ import annotations
 
@@ -26,7 +19,7 @@ SUBSETS = ("box_aligned", "fallback")
 
 
 def load_config(config: str, data_config: str, overrides: Iterable[str] = ()) -> dict:
-    """flow.yaml + data.yaml + every override file, later files winning, as a plain dict."""
+    """Merge configuration files and return resolved dictionary."""
     cfg = OmegaConf.merge(OmegaConf.load(config), OmegaConf.load(data_config))
     for path in overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.load(path))
@@ -35,7 +28,7 @@ def load_config(config: str, data_config: str, overrides: Iterable[str] = ()) ->
 
 @dataclass
 class FlowLoaders:
-    """`train` yields augmented batches; `val` maps each non-empty subset to its loader."""
+    """Container for training and validation data loaders."""
 
     train: DataLoader
     val: dict[str, DataLoader]
@@ -56,8 +49,7 @@ def _loader(dataset: Dataset, cfg: Mapping, batch_size: int, shuffle: bool, drop
 
 
 def split_by_pair_kind(dataset: AlignedPairs, max_per_subset: int | None) -> dict[str, Subset]:
-    """`{"box_aligned": ..., "fallback": ...}` subsets (first `max_per_subset` of each, in
-    manifest order; an empty subset is left out)."""
+    """Split dataset into box-aligned and fallback subsets."""
     kinds: dict[str, list[int]] = {name: [] for name in SUBSETS}
     for index, image_id in enumerate(dataset.image_ids):
         kinds["fallback" if image_id in dataset.fallback_ids else "box_aligned"].append(index)
@@ -69,11 +61,14 @@ def split_by_pair_kind(dataset: AlignedPairs, max_per_subset: int | None) -> dic
 
 
 def build_loaders(cfg: Mapping, overfit: int | None = None) -> FlowLoaders:
-    """Train and validation loaders from the merged flow.yaml + data.yaml config.
+    """Build training and validation data loaders from configuration.
 
     Args:
-        cfg: The parsed, merged config (`dronevehicle`, `augment`, `loader`, `optim`, `logging`).
-        overfit: When set, train AND validate on the first `overfit` train pairs, no augmentation.
+        cfg: Configuration mapping.
+        overfit: Optional number of training samples to overfit on without augmentation.
+
+    Returns:
+        FlowLoaders container.
     """
     batch_size = int(cfg["optim"]["batch_size"])
     max_val = int(cfg["logging"]["num_val_samples"])
@@ -86,8 +81,6 @@ def build_loaders(cfg: Mapping, overfit: int | None = None) -> FlowLoaders:
     else:
         train_set = AlignedPairs.from_config(cfg, "train_pairs", train=True)
         val_sets = split_by_pair_kind(AlignedPairs.from_config(cfg, "val_pairs"), max_val)
-    # `pairs.report_fallback_separately: false` drops the fallback robustness number; the headline
-    # subset (`pairs.eval_subset`) is always validated, whatever it is.
     policy = cfg["pairs"]
     keep = {policy["eval_subset"], "box_aligned"}
     if policy["report_fallback_separately"]:
@@ -107,25 +100,18 @@ def build_loaders(cfg: Mapping, overfit: int | None = None) -> FlowLoaders:
 def stats_batches(
     cfg: Mapping, num_samples: int, device: torch.device | str = "cpu"
 ) -> Iterator[dict]:
-    """Prepared batches (`prepare_batch`) of `num_samples` unaugmented train pairs for the stats.
-
-    The pairs are spread evenly over the sorted train manifest (consecutive frames of one flight
-    are near-duplicates, so the first N would be a few flights). Fallback pairs are included: the
-    targets are masked the same way training masks them.
-    """
+    """Yield prepared training batches sampled across the dataset for normalization statistics."""
     dataset = AlignedPairs.from_config(cfg, "train_pairs", train=False)
     count = min(int(num_samples), len(dataset))
     indices = np.unique(np.linspace(0, len(dataset) - 1, count).round().astype(int)).tolist()
     loader = DataLoader(Subset(dataset, indices), batch_size=8, num_workers=0)
     size = tuple(cfg["encoder"]["input_size"])
-    # This pass fits a grid per pair and runs before step 1 of every training run that misses the
-    # cache: minutes of silence otherwise (dawn/progress.py).
     for raw in progress(loader, f"token stats ({count} pairs)"):
         yield prepare_batch(raw, size, cfg["pairs"], device)
 
 
 def cycle(loader: Iterable) -> Iterator:
-    """Iterate a loader forever, restarting (and so reshuffling) when it runs out."""
+    """Yield batches from an iterable loader infinitely."""
     while True:
         yielded = False
         for batch in loader:
@@ -133,3 +119,4 @@ def cycle(loader: Iterable) -> Iterator:
             yield batch
         if not yielded:
             raise ValueError("the training loader yielded no batches")
+

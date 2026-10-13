@@ -1,37 +1,4 @@
-"""Stage 1 training: one step, one validation pass, one checkpoint.
-
-`scripts/train_flow.py` is a thin CLI over this module. Everything that has to be testable
-lives here, so `tests/test_flow_train.py` can run the same step the script runs.
-
-What one step does (docs/conventions.md sections 2 to 6):
-
-    1. A batch from `AlignedPairs` (thermal, linear RGB, masks) is moved to the device and
-       area-downsampled to `encoder.input_size` if the stored frames are bigger; the pixel mask
-       becomes fractions (`prepare_batch`).
-    2. In float32 with no gradient (`build_targets`): guidance, L = L*/100 of the RGB, the
-       brightness fit (`grid.refine_steps`), the oracle brightness, the a*b* (and correction)
-       targets and the loss weights; then `pack` and `standardize` give z_1.
-    3. The encoder runs ONCE per image on the thermal, and once more with the adapters disabled
-       on the paired RGB for the L_align target. The colour head reads the adapted patch tokens.
-    4. The conditioning is repeated `flow.timesteps_per_image` times; the encoder is not.
-    5. Per (image, timestep): z_0 ~ N(0, I), t ~ U(0, 1), z_t = (1-t) z_0 + t z_1, v = net(...),
-       z1_hat = z_t + (1-t) v, unstandardize, unpack, `render` at `flow.render_size`.
-    6. L_flow + 0.1 L_render + 0.5 L_align + 0.2 L_color, backward, clip, step, EMA.
-
-Precision: bf16 autocast wraps the network forward passes on CUDA only. Target building, the fit,
-the render and the losses run in float32, and no module is ever cast with `.to(bf16)` (DINOv3's
-RoPE tables must stay fp32). On MPS and CPU the run is fp32 whatever `optim.precision` says.
-
-`flow.warmup_steps` gates the conditioning detach: until then the encoder's patch tokens are cut
-off from the velocity net, so LoRA is trained by L_align and L_color alone. After it,
-`flow.warmup_ramp_steps` eases that gradient in over a few hundred steps rather than switching it
-on between two steps (`conditioning_scale`); a ramp of 0 is the old hard gate exactly.
-
-Besides the losses, one step reports `cond_scale`, `ema_decay`, per-module gradient norms and each
-term's share of the total (`train_step(detailed=True)`). `validate` adds the patch-retrieval
-diagnostic and the colourfulness ratios; `validate_loss` runs the training objective itself on
-held-out pairs, which is the curve that shows memorization.
-"""
+"""Training loop, validation routines, and checkpoint management for flow matching."""
 
 from __future__ import annotations
 
@@ -62,26 +29,12 @@ from dawn.models.velocity import VelocityTransformer
 
 logger = logging.getLogger(__name__)
 
-# Parameters that never get weight decay: 0-dim tensors (the per-block attention gates),
-# biases, normalization weights and the learned positional embedding.
+# Parameters that never get weight decay.
 NO_DECAY_SUFFIXES = ("bias", "dino_gate", "pos_embed")
 
 
 class EMA:
-    """Exponential moving average of the trainable parameters.
-
-    Tracks the velocity net, the LoRA adapters and the colour head (`optim.ema_decay`, 0.999).
-    The shadow is kept in float32 whatever the parameters are, and `applied()` swaps it in for
-    validation and inference without touching the optimizer's view of the live weights.
-
-    **Warmup** (`optim.ema_warmup`, on by default). A fixed decay of 0.999 leaves the shadow
-    `0.999 ** n` initialization after `n` updates: 61% random weights at step 500 and still 5%
-    at step 3,000. Every validation inside that window measures the initialization as much as
-    the model, which matters now that `logging.val_every` is 500 rather than 2,500. The warmup
-    uses the standard `min(decay, (1 + n) / (10 + n))`, which drives the initialization's share
-    to about 1e-5 within ten updates and reaches the configured decay from below. It only ever
-    *lowers* the decay, so the late-training average is exactly the one `ema_decay` asks for.
-    """
+    """Exponential moving average tracker for model parameters."""
 
     def __init__(
         self, params: Mapping[str, nn.Parameter], decay: float = 0.999, warmup: bool = True
@@ -93,7 +46,7 @@ class EMA:
         self.shadow = {name: p.detach().clone().float() for name, p in self.params.items()}
 
     def current_decay(self) -> float:
-        """The decay actually applied at this update: ramped from 0.1 when `warmup`."""
+        """Compute effective decay factor for current update step."""
         if not self.warmup:
             return self.decay
         return min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
@@ -107,7 +60,7 @@ class EMA:
 
     @contextmanager
     def applied(self) -> Iterator[None]:
-        """Temporarily replace the live parameters with the averaged ones."""
+        """Context manager temporarily swapping parameter weights with shadow copies."""
         backup = {name: p.detach().clone() for name, p in self.params.items()}
         try:
             with torch.no_grad():
@@ -128,18 +81,14 @@ class EMA:
         }
 
     def load_state_dict(self, state: Mapping) -> None:
-        """Restore the shadow and the update count.
-
-        A checkpoint written before the warmup existed has no `num_updates`. Restarting the
-        count at 0 would re-ramp the decay and let the resumed weights swamp a converged
-        average, so a missing count is read as "warmup long over".
-        """
+        """Restore EMA shadow parameters and update count."""
         self.decay = float(state["decay"])
         self.warmup = bool(state.get("warmup", self.warmup))
         self.num_updates = int(state.get("num_updates", 10**9))
         for name, value in state["shadow"].items():
             if name in self.shadow:
                 self.shadow[name].copy_(value.to(self.shadow[name].device))
+
 
 
 def split_param_groups(
@@ -150,12 +99,10 @@ def split_param_groups(
     lora_lr: float,
     weight_decay: float,
 ) -> list[dict]:
-    """Four AdamW groups: LoRA vs the rest, each split into decayed and undecayed.
+    """Split parameters into AdamW parameter groups for LoRA and main modules.
 
-    The encoder's only trainable parameters are the LoRA ones (peft froze everything else), and
-    they get `encoder.lora_lr`. Norms, biases, the attention gates and the positional embedding
-    are not shrunk toward zero: weight decay on a gate initialized at 0 is a prior that it
-    should stay 0, which is exactly the thing being learned.
+    Separates trainable weights into LoRA and main groups, excluding biases,
+    normalization parameters, gates, and positional embeddings from weight decay.
     """
     groups = {
         (scope, decay): {
@@ -201,29 +148,17 @@ def one_cycle_schedule(
     div_factor: float = 25.0,
     final_div_factor: float = 1.0e4,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Smith's one cycle: cosine up to each group's configured LR, then cosine down to nearly 0.
-
-    The difference from `cosine_warmup_schedule` is not the shape of the tail but the length of
-    the ramp (20-30% of the run, against the 5% of `lr_warmup_steps`) and the floor it starts
-    from (`lr / div_factor`). A group's configured LR is the **peak**, not the plateau, so
-    `optim.lr` and `encoder.lora_lr` keep their ratio and neither is exceeded.
-
-    This is a **fixed-budget** schedule: the anneal lands at `total_steps`, and most of the gain
-    is in the last low-LR stretch, so a run stopped early gets a worse model than a shorter cycle
-    would have. Decide the budget before starting, do not early-stop a cycle.
-
-    Like `cosine_warmup_schedule` the factor clamps past `total_steps` rather than raising (what
-    `torch.optim.lr_scheduler.OneCycleLR` does), so an extra step on resume is not fatal.
+    """Create a 1-cycle learning rate schedule with cosine warmup and anneal.
 
     Args:
-        optimizer: its groups' `lr` values are the per-group peaks.
-        total_steps: the whole budget, `flow.num_train_steps`.
-        pct_start: fraction of the budget spent ramping up.
-        div_factor: the ramp starts at `peak / div_factor`.
-        final_div_factor: the anneal ends at `peak / final_div_factor`.
+        optimizer: Optimizer containing parameter groups with target peak learning rates.
+        total_steps: Total number of training steps.
+        pct_start: Fraction of total steps spent ramping up.
+        div_factor: Initial learning rate divisor relative to peak learning rate.
+        final_div_factor: Final learning rate divisor relative to peak learning rate.
 
     Raises:
-        ValueError: `pct_start` is not in (0, 1), or a divisor is not positive.
+        ValueError: If pct_start is not in (0, 1) or divisors are non-positive.
     """
     if not 0.0 < pct_start < 1.0:
         raise ValueError(f"one_cycle.pct_start must be in (0, 1), got {pct_start}")
@@ -244,12 +179,7 @@ def one_cycle_schedule(
 
 
 class MomentumCycler:
-    """The other half of one cycle: AdamW's beta1, cycled opposite to the learning rate.
-
-    High momentum while the LR is small, low momentum while it is large, so the two never push
-    hard at once. Stepped beside the LR scheduler; a no-op when `enabled` is false, which is the
-    default for the plain cosine schedule.
-    """
+    """Cycles optimizer beta1 inversely with learning rate for 1-cycle scheduling."""
 
     def __init__(
         self,
@@ -302,7 +232,7 @@ class MomentumCycler:
 def build_schedule(
     optimizer: torch.optim.Optimizer, cfg: Mapping
 ) -> tuple[torch.optim.lr_scheduler.LambdaLR, MomentumCycler]:
-    """The LR schedule and its momentum cycler, from `optim.schedule` (`cosine` | `one_cycle`)."""
+    """Build the learning rate scheduler and momentum cycler configured by cfg."""
     optim, flow = cfg["optim"], cfg["flow"]
     total = int(flow["num_train_steps"])
     name = str(optim.get("schedule", "cosine"))
@@ -337,22 +267,14 @@ def build_schedule(
 
 
 def budget_summary(cfg: Mapping, train_size: int) -> dict[str, float]:
-    """The step-denominated knobs re-expressed in epochs, for the start-of-run log.
-
-    Every schedule knob in `flow.yaml` is counted in steps, so raising `optim.batch_size`
-    without rescaling them quietly runs a different experiment: 3,662 pairs over a batch of 128
-    are 29 steps an epoch, and a 100-epoch budget would then be 2,900 steps -- under
-    `flow.warmup_steps`, so the conditioning detach would never lift
-    (docs/training_budget_and_changes.md section 1). `FlowTrainer` already warns about that one
-    case; this prints the whole picture so the trap is visible rather than inferred.
+    """Compute epoch-denominated training budget metrics for logging.
 
     Args:
-        cfg: The merged config.
-        train_size: Number of training pairs the loader actually serves.
+        cfg: Merged training configuration.
+        train_size: Number of training pairs in the dataset.
 
     Returns:
-        `steps_per_epoch`, `epochs`, `detach_epochs` (how long the conditioning stays detached),
-        `val_points`, `save_points` and `samples_per_step` (images x timesteps).
+        Dictionary mapping budget metric names to epoch and step counts.
     """
     flow, optim, log = cfg["flow"], cfg["optim"], cfg["logging"]
     batch, total = int(optim["batch_size"]), int(flow["num_train_steps"])
@@ -375,28 +297,19 @@ def patch_retrieval(
     grid: tuple[int, int],
     weight: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Does each adapted (thermal) patch token retrieve its own frozen (RGB) token?
+    """Evaluate nearest-neighbor retrieval between adapted and frozen patch tokens.
 
-    L_align pulls thermal patch `n` toward RGB patch `n` by cosine distance. The loss value
-    alone cannot say whether the result is *localized*: a thermal encoder that mapped every
-    patch to the frame's average RGB feature would also drive `1 - cos` down. This measures the
-    thing directly, and is the evidence that decides whether a contrastive L_align would buy
-    anything (docs/proposals_review.md section 4.1) -- without the cost or the risk of adding
-    one. Chance is `1 / N`, about 0.08% at 1,280 tokens.
-
-    `within_1` is the honest companion: pairs are aligned to 1-3 px against a 16 px patch, so a
-    retrieval that lands on an immediate neighbour is residual misalignment, not a feature that
-    failed to localize. A high `within_1` with a low `top1` means the features are fine and the
-    labels are off by a patch.
+    Computes top-1 and 1-neighbor patch retrieval accuracy between adapted thermal
+    tokens and frozen RGB reference tokens.
 
     Args:
-        adapted: `(B, N, C)` LoRA-adapted patch tokens on thermal.
-        frozen: `(B, N, C)` frozen patch tokens on the paired RGB.
-        grid: `(gy, gx)`, so a flat index becomes a cell.
-        weight: `(B, N)` kept share per patch; masked patches do not count. None weights all.
+        adapted: Adapted patch tokens with shape `(B, N, C)`.
+        frozen: Frozen reference patch tokens with shape `(B, N, C)`.
+        grid: Token grid dimensions `(gy, gx)`.
+        weight: Optional token weights with shape `(B, N)`.
 
     Returns:
-        `top1` and `within_1`, each `(B,)` in [0, 1].
+        Dictionary with 'top1' and 'within_1' accuracy tensors of shape `(B,)`.
     """
     if adapted.shape != frozen.shape or adapted.ndim != 3:
         raise ValueError(
@@ -427,7 +340,7 @@ def patch_retrieval(
 def build_models(
     cfg: Mapping, layout: TokenLayout, device: torch.device
 ) -> tuple[DINOEncoder, VelocityTransformer, ColorHead]:
-    """Encoder (+LoRA), velocity transformer and colour head, on `device`."""
+    """Instantiate the encoder, velocity transformer, and color head modules."""
     encoder = DINOEncoder.from_config(
         cfg["encoder"], detach_attn=cfg["velocity"]["detach_dino_attn"]
     ).to(device)
@@ -442,7 +355,7 @@ def build_models(
 
 
 class FlowTrainer:
-    """Owns the models, the optimizer and the schedule; runs steps and validations."""
+    """Coordinates model training, optimization, and evaluation for flow matching."""
 
     def __init__(
         self,
@@ -485,14 +398,11 @@ class FlowTrainer:
             self.input_size[0] // self.layout.grid[0],
             self.input_size[1] // self.layout.grid[1],
         )
-        # The patch-retrieval diagnostic costs one extra frozen DINO pass per validation batch.
         self.val_retrieval = bool(cfg["logging"].get("val_retrieval", True))
         self.soft_k, self.soft_sigma = int(color["soft_k"]), float(color["soft_sigma"])
         self.bin_count_weighting = bool(flow["bin_count_weighting"])
         self.timesteps_per_image = int(flow["timesteps_per_image"])
         self.warmup_steps = int(flow["warmup_steps"])
-        # How long the conditioning gradient is ramped in after the detach lifts. `null` (or a
-        # missing key) derives it from the warmup, so the short overlays scale with it.
         ramp = flow.get("warmup_ramp_steps")
         self.warmup_ramp_steps = (
             max(1, self.warmup_steps // 6) if ramp is None else max(0, int(ramp))
@@ -558,17 +468,7 @@ class FlowTrainer:
             )
 
     def _warn_if_warmup_eats_the_run(self) -> None:
-        """A budget near its own warmup is almost never the run someone meant to start.
-
-        The way in is raising `optim.batch_size` without rescaling the step counts: the 3,662
-        train pairs over a batch of 128 are 29 steps an epoch, so a 100-epoch budget is 2,900
-        steps, under `flow.warmup_steps`. The conditioning detach would then never lift and the
-        velocity net would train on frozen features for the whole run -- a wrong result that
-        looks like a healthy one (docs/training_budget_and_changes.md section 1).
-
-        A warning, not an error: short deliberate runs (the overfit and debug overlays) scale
-        `warmup_steps` down with the budget and are fine.
-        """
+        """Warn if total training steps are too close to warmup steps."""
         total, warmup = int(self.num_train_steps), int(self.warmup_steps)
         if warmup and total < warmup * 2:
             verdict = (
@@ -584,7 +484,7 @@ class FlowTrainer:
             )
 
     def set_stats(self, stats: Mapping[str, Mapping[str, torch.Tensor]]) -> None:
-        """Install per-segment stats (kept for checkpoints) and their `(D,)` vectors."""
+        """Set per-segment target standardization statistics and vectors."""
         self.stats = {
             name: {key: value.detach().cpu() for key, value in segment.items()}
             for name, segment in stats.items()
@@ -592,10 +492,9 @@ class FlowTrainer:
         mean, std = self.layout.stats_vector(self.stats)
         self.mean, self.std = mean.to(self.device), std.to(self.device)
 
-    # --- bookkeeping ----------------------------------------------------------------------
 
     def trainable_parameters(self) -> dict[str, nn.Parameter]:
-        """Every parameter the optimizer and the EMA touch, prefixed by its module."""
+        """Return all trainable model parameters prefixed by module name."""
         out = {}
         for prefix, module in self.modules().items():
             for name, param in module.named_parameters():
@@ -611,7 +510,7 @@ class FlowTrainer:
         }
 
     def param_counts(self) -> dict[str, tuple[int, int]]:
-        """`{module: (trainable, total)}`, plus a 'total' row."""
+        """Return trainable and total parameter counts for each module and in total."""
         counts = {
             name: (
                 sum(p.numel() for p in module.parameters() if p.requires_grad),
@@ -631,29 +530,13 @@ class FlowTrainer:
             module.eval()
 
     def _autocast(self):
-        """bf16 autocast for network forwards; a no-op unless CUDA bf16 was asked for.
-
-        Everything outside these blocks -- target building, the fit, the render, the losses --
-        therefore runs in float32, which docs/conventions.md section 1 requires. No module is ever
-        cast with `.to(bfloat16)`.
-        """
+        """Context manager for bfloat16 mixed precision on CUDA devices."""
         if self.precision == "bf16" and self.device.type == "cuda":
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return nullcontext()
 
-    # --- the step -------------------------------------------------------------------------
-
     def conditioning_scale(self) -> float:
-        """How much velocity-loss gradient reaches the encoder at this step: 0, 1 or in between.
-
-        `flow.warmup_steps` is a gate, not a ramp: before it the patch tokens are detached, so
-        LoRA trains on L_align and L_color alone. Flipping it on in one step hands the velocity
-        net -- which has spent the whole warmup fitting a *frozen* feature distribution -- a
-        suddenly moving one, and hands LoRA a loss it has never seen. `flow.warmup_ramp_steps`
-        scales that gradient linearly from 0 to 1 over the steps after the gate instead. The
-        forward pass is identical either way (the scaling is on the gradient only), so a ramp of
-        0 reproduces the hard gate exactly.
-        """
+        """Compute the gradient scaling factor for conditioning features at current step."""
         if self.step < self.warmup_steps:
             return 0.0
         if self.warmup_ramp_steps <= 0:
@@ -663,18 +546,14 @@ class FlowTrainer:
     def compute_losses(
         self, raw_batch: Mapping[str, Any], generator: torch.Generator | None = None
     ) -> tuple[dict, dict]:
-        """Every loss of one step for `raw_batch` (an `AlignedPairs` batch), with gradients.
+        """Compute all training losses for a single batch.
 
         Args:
-            raw_batch: One `AlignedPairs` batch.
-            generator: A CPU generator for `t` and `z_0`. `None` uses the global RNG (training);
-                `validate_loss` passes a fixed one so the held-out curve is low-variance and
-                comparable from one validation to the next.
+            raw_batch: Batch dictionary from AlignedPairs loader.
+            generator: Optional random number generator for time and noise draws.
 
         Returns:
-            `(losses, info)`: the `FlowLoss` dict (tensors, `total` first to backpropagate) and
-            `{"detach_cond": bool, "cond_scale": float}` -- whether the encoder was cut off from
-            the velocity net, and how much of that gradient was let through.
+            Tuple of (losses_dict, info_dict) containing computed loss tensors and conditioning metadata.
         """
         batch = prepare_batch(raw_batch, self.input_size, self.policy, self.device)
         thermal, rgb, mask, fallback = (
@@ -692,8 +571,6 @@ class FlowTrainer:
                 node_weights = torch.ones_like(node_weights)
             z_1 = standardize(layout.pack(targets.parts), self.mean, self.std)
             token_weights = layout.weights(node_weights, targets.fraction)
-            # Render-size targets: Lab of the area-downsampled linear RGB, and the colour
-            # histograms built from its a*b* (8x8 samples per 16-px patch at the defaults).
             thermal_r = area_downsample(thermal, self.render_size)
             lab_r = linear_to_lab(area_downsample(rgb, self.render_size).clamp(0.0, 1.0))
             mask_r = area_downsample(mask, self.render_size)
@@ -715,7 +592,6 @@ class FlowTrainer:
         elif scale >= 1.0:
             patch_tokens = feat_adapted
         else:
-            # Same forward value, gradient multiplied by `scale`.
             patch_tokens = feat_adapted.detach() + scale * (feat_adapted - feat_adapted.detach())
 
         batch_size = thermal.shape[0]
@@ -727,7 +603,7 @@ class FlowTrainer:
         if generator is None:
             t = torch.rand(repeats * batch_size, device=self.device, dtype=torch.float32)
             z_0 = torch.randn_like(z_1_rep)
-        else:  # drawn on the CPU so one seed gives the same draw on any device
+        else:
             t = torch.rand(repeats * batch_size, generator=generator, dtype=torch.float32)
             z_0 = torch.randn(z_1_rep.shape, generator=generator, dtype=torch.float32)
             t, z_0 = t.to(self.device), z_0.to(self.device)
@@ -764,12 +640,7 @@ class FlowTrainer:
         return losses, {"detach_cond": detach_cond, "cond_scale": scale}
 
     def loss_contributions(self, losses: Mapping[str, torch.Tensor]) -> dict[str, float]:
-        """Each term's share of `total`: `weight * value / total`, summing to 1.
-
-        The one number that makes loss balancing legible. Four hand-set weights over terms on
-        different scales can leave one of them doing nothing (or everything) without any curve
-        looking wrong on its own; the shares say so directly.
-        """
+        """Calculate the proportional contribution of each loss term to the weighted total."""
         criterion, out = self.criterion, {}
         total = float(losses["total"].detach())
         weights = {
@@ -784,12 +655,7 @@ class FlowTrainer:
         return out
 
     def grad_norms(self) -> dict[str, float]:
-        """Per-module gradient L2 norm, read before clipping.
-
-        One global `grad_norm` cannot say whether the LoRA adapters are receiving anything, and
-        the step where that changes -- `flow.warmup_steps`, smoothed by `conditioning_scale` --
-        is the single most load-bearing moment in the schedule. These three curves show it.
-        """
+        """Compute per-module gradient L2 norms before clipping."""
         out = {}
         for name, module in self.modules().items():
             total = 0.0
@@ -800,13 +666,14 @@ class FlowTrainer:
         return out
 
     def train_step(self, batch: Mapping[str, Any], detailed: bool = False) -> dict[str, float]:
-        """One optimizer step. Returns every loss separately, plus the learning rates.
+        """Execute a single training step and return logged metric values.
 
         Args:
-            batch: One `AlignedPairs` batch.
-            detailed: Also return per-module gradient norms (`grad/<module>`) and each loss
-                term's share of the total (`contrib/<term>`). Costs one extra pass over the
-                gradients, so the caller asks for it only on the steps it logs.
+            batch: Training data batch.
+            detailed: Whether to compute detailed gradient norms and loss contributions.
+
+        Returns:
+            Dictionary of scalar training metrics including losses, norms, and learning rates.
         """
         self.train()
         losses, info = self.compute_losses(batch)
@@ -838,13 +705,12 @@ class FlowTrainer:
         return out
 
     def _render_index(self, total: int) -> torch.Tensor:
-        """Which of the B*T samples get the render loss (`flow.render_subset`, null = all)."""
+        """Return sample indices selected for rendering loss evaluation."""
         if not self.render_subset or self.render_subset >= total:
             return torch.arange(total, device=self.device)
         return torch.randperm(total, device=self.device)[: int(self.render_subset)]
 
-    # --- validation -----------------------------------------------------------------------
-
+    # validation
     @torch.no_grad()
     def validate(
         self,
@@ -852,17 +718,15 @@ class FlowTrainer:
         nfe: int | None = None,
         max_batches: int | None = None,
     ) -> dict[str, float]:
-        """Full-resolution metrics at `nfe` for both samplers, next to the fitted-grid oracle.
+        """Evaluate validation metrics comparing sampled predictions against ground truth and oracle.
 
-        Everything is at the working resolution (`encoder.input_size`) on the pixels the losses
-        count (the pixel mask; images with no weight are skipped), so the oracle is a real ceiling:
-        the fitted target parts rendered by the very same `render`. Noise comes from each image's
-        ID, so a validation curve is comparable across runs and batchings.
+        Args:
+            loader: Validation data loader.
+            nfe: Number of function evaluations for sampling steps.
+            max_batches: Optional maximum number of batches to evaluate.
 
         Returns:
-            Means over images: `psnr_L/{oracle,euler,midpoint}` (L*, peak 100),
-            `psnr_L/gap_to_oracle` (oracle - euler), `ciede2000/{...}`, `colorfulness/{...,gt}` and
-            `num_images`.
+            Dictionary of aggregated validation metrics including psnr_L, ciede2000, and colorfulness.
         """
         self.eval()
         nfe = self.inference_nfe if nfe is None else nfe
@@ -893,7 +757,6 @@ class FlowTrainer:
 
             score("oracle", render(targets.parts, thermal, self.input_size, self.render_settings))
             record("colorfulness/gt", colorfulness(linear_to_srgb(rgb) * 255.0), keep)
-            # Only the network forwards run under autocast; the render and the metrics are float32.
             with self._autocast():
                 cond = self.encoder.encode(thermal, return_attn=True)
                 if self.val_retrieval:
@@ -928,12 +791,8 @@ class FlowTrainer:
             count += int(keep.sum())
         out = {key: value / max(count, 1) for key, value in totals.items()}
         if "psnr_L/oracle" in out:
-            # Both gaps are "how far from the ceiling", so both are positive when the model is
-            # behind: PSNR is higher-is-better, CIEDE2000 lower-is-better.
             out["psnr_L/gap_to_oracle"] = out["psnr_L/oracle"] - out["psnr_L/euler"]
             out["ciede2000/gap_to_oracle"] = out["ciede2000/euler"] - out["ciede2000/oracle"]
-            # Colourfulness is only readable against the ground truth's: 1.0 is "as vivid as the
-            # real photo", below 1 is the washed-out brown that averaging colourisers fall into.
             truth = out.get("colorfulness/gt", 0.0)
             if truth > 0:
                 for method in ("oracle", "euler", "midpoint"):
@@ -950,22 +809,15 @@ class FlowTrainer:
         max_batches: int | None = None,
         seed: int = 1234,
     ) -> dict[str, float]:
-        """The training objective itself, on held-out pairs: the overfitting signal.
+        """Compute training loss terms on a held-out validation set.
 
-        `validate` measures sampled image quality, which is what the model is *for*; this
-        measures the loss it is actually minimizing, which is what tells you it has started
-        memorizing. A train curve falling while this one turns up is the signal, and nothing
-        else in the run reports it. With 3,662 train pairs over ~87 epochs that is the headline
-        risk (docs/training_budget_and_changes.md section 1).
-
-        `t` and `z_0` come from a generator seeded with `seed`, not the global RNG, so the
-        curve is low-variance and comparable across validations: a change in it is the model
-        changing, not the draw. The conditioning detach follows `self.step` exactly as in
-        training, so the two curves stay comparable across the warmup gate.
+        Args:
+            loader: Validation data loader.
+            max_batches: Optional maximum number of batches to evaluate.
+            seed: Random seed for time and noise sampling.
 
         Returns:
-            Every `FlowLoss` term, averaged over images, prefixed `loss/` (`loss/total`,
-            `loss/flow`, `loss/render`, ...), plus `num_images`.
+            Dictionary mapping loss names to mean scalar values across validation samples.
         """
         self.eval()
         generator = torch.Generator().manual_seed(int(seed))
@@ -983,17 +835,12 @@ class FlowTrainer:
         out["num_images"] = float(count)
         return out
 
-    # --- checkpoints ----------------------------------------------------------------------
-
+    # checkpoints
     def state_dict(self) -> dict:
-        """Everything a resume needs, plus the config, the layout and the stats it was trained with.
+        """Return complete trainer state dictionary for checkpointing.
 
-        The frozen DINO backbone is NOT stored: peft never changes it, and a checkpoint that
-        carried 29M frozen floats would be 30x bigger for nothing. A resume rebuilds it from
-        `encoder.model_ids` and loads the LoRA weights on top, so the pretrained weights have
-        to be the ones the run started from. The token stats and the layout descriptor, by
-        contrast, ARE embedded, because inference must never read stats from the cache file
-        (docs/conventions.md section 5) and a checkpoint is tied to its resolution.
+        Includes trainable model weights, optimizer and scheduler state,
+        token layout descriptor, and target standardization statistics.
         """
         return {
             "step": self.step,
@@ -1012,11 +859,14 @@ class FlowTrainer:
         }
 
     def load_state_dict(self, state: Mapping, strict: bool = True) -> None:
-        """Restore a checkpoint.
+        """Restore trainer and model state from a checkpoint dictionary.
+
+        Args:
+            state: Saved state dictionary.
+            strict: Whether to require all expected LoRA weights to be present.
 
         Raises:
-            ValueError: the checkpoint's token layout or resolution is not this run's, or it
-                lacks LoRA weights this encoder expects.
+            ValueError: If checkpoint resolution, layout, or model weights are incompatible.
         """
         self.layout.check(state["layout"])
         if list(state["input_size"]) != list(self.input_size):
@@ -1040,6 +890,7 @@ class FlowTrainer:
         self.ema.load_state_dict(state["ema"])
 
     def save_checkpoint(self, path: str | Path) -> Path:
+        """Save trainer state dictionary to file."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.state_dict(), path)
@@ -1048,18 +899,14 @@ class FlowTrainer:
 
 
 def _repeat(tensor: torch.Tensor | None, repeats: int) -> torch.Tensor | None:
-    """Stack `repeats` copies along the batch axis, keeping image order inside each copy.
-
-    Copy j holds the whole batch, so sample `j * B + i` is always image `i`: the conditioning,
-    the target grid and the night pixels all line up without a second encoder pass.
-    """
+    """Repeat tensor along the batch dimension."""
     if tensor is None or repeats == 1:
         return tensor
     return tensor.repeat(repeats, *([1] * (tensor.ndim - 1)))
 
 
 def _plain(value):
-    """OmegaConf containers -> plain dicts, so a checkpoint loads without omegaconf."""
+    """Convert OmegaConf containers to plain Python dictionaries and lists."""
     try:
         from omegaconf import DictConfig, ListConfig, OmegaConf
 

@@ -1,39 +1,4 @@
-"""DINOv3 ViT-S+/16 encoder with peft LoRA adapters, behind one interface for two backends.
-
-Backends (config: encoder.backend):
-    timm          timm.create_model(model_id); needs timm >= 1.0.20.
-    transformers  AutoModel.from_pretrained(model_id); needs the `transformers` extra and
-                  approved access to the gated facebook/dinov3-* repo.
-
-Both are wrapped so `DINOEncoder.forward` returns the same `EncoderOutput`; nothing outside
-this module knows which backend is in use.
-
-LoRA comes from peft only (no hand-rolled LoRA layer). That also gives the L_align target for
-free: `disable_adapter()` runs the same network with the adapters off, i.e. the frozen
-pretrained features (see `forward_frozen`).
-
-Backend libraries are imported lazily inside the loaders so this module imports without them.
-
-The input is THERMAL, `(B, 1, H, W)` = code / 255 at `input_size = (H, W)` (640x512 in the plan,
-given as (512, 640)): it is copied to three channels and normalized with the ImageNet mean/std.
-Thermal is camera codes, not light, so it never goes through `linear_to_srgb` (docs/conventions.md
-section 1). The paired RGB goes through `forward_frozen` (adapters disabled) for the L_align
-target, and THAT path is linear -> sRGB -> ImageNet mean/std, because DINO was pretrained on sRGB.
-
-What the flow stage actually consumes is the dict from `encode`, which bundles the conditioning
-tensors of docs/conventions.md section 7:
-
-    patch_tokens (B, N, 384)      patch tokens, row-major: token n = y * gx + x
-    patch_map   (B, 384, gy, gx)  the same tokens as a feature map
-    cls         (B, 384)          the CLS token
-    attn_bias   (B, 1, N, N)      log(A + 1e-6) of the last layer's patch-to-patch attention
-    thumb       (B, 1, gy, gx)    area_downsample(thermal, (gy, gx)): one value per patch
-
-RoPE position augmentation (random shift / jitter / rescale) is a pretraining augmentation and
-is switched OFF here on both backends. It would otherwise make two forward passes of the same
-image disagree, which would turn the L_align target into noise (timm ships it off already; the
-transformers config defaults to `pos_embed_rescale = 2.0`).
-"""
+"""DINOv3 ViT-S+/16 encoder with LoRA adapters for thermal conditioning."""
 
 from __future__ import annotations
 
@@ -52,15 +17,11 @@ logger = logging.getLogger(__name__)
 
 Backend = Literal["timm", "transformers"]
 
-# DINO is pretrained on ImageNet-normalized sRGB (timm's pretrained_cfg for the DINOv3 models).
-# The thermal path uses the same mean/std but skips the sRGB encoding (thermal is not light).
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 ATTN_FLOOR = 1e-6  # attn_bias = log(attention + ATTN_FLOOR)
 
-# Architecture of DINOv3 ViT-S+/16, for the `pretrained=False` path where no hub config is
-# downloaded. Matches timm's vit_small_plus_patch16_dinov3 (28.7M parameters).
 VITS_PLUS = {
     "hidden_size": 384,
     "intermediate_size": 1536,
@@ -75,23 +36,15 @@ VITS_PLUS = {
 
 
 class EncoderOutput(NamedTuple):
-    """Backend-independent encoder result.
-
-    N = (H / 16) * (W / 16) patches in row-major (y, x) order (1,280 at 512 x 640); C = 384.
-    CLS and register tokens are stripped from the patch outputs (layout: [CLS, 4 registers,
-    patches]).
-    """
+    """Container for encoder outputs."""
 
     patch_tokens: torch.Tensor  # (B, N, C)
     cls_token: torch.Tensor  # (B, C)
-    patch_attn: torch.Tensor | None  # (B, N, N) last layer, head-averaged; only if requested
+    patch_attn: torch.Tensor | None  # (B, N, N)
 
 
 class DINOEncoder(nn.Module):
-    """DINOv3 ViT-S+/16 with LoRA on the attention qkv and output projections.
-
-    The pretrained weights are frozen; only the LoRA parameters train (peft freezes the rest).
-    """
+    """DINOv3 ViT-S+/16 encoder with parameter-efficient fine-tuning via LoRA."""
 
     def __init__(
         self,
@@ -143,11 +96,7 @@ class DINOEncoder(nn.Module):
 
     @classmethod
     def from_config(cls, cfg: Mapping, detach_attn: bool = True) -> "DINOEncoder":
-        """Build from the `encoder:` section of configs/flow.yaml.
-
-        `detach_attn` belongs to the velocity net's `velocity.detach_dino_attn`: the attention
-        bias is produced here, so it is also cut here.
-        """
+        """Instantiate encoder from configuration mapping."""
         backend = cfg["backend"]
         targets = cfg["lora_targets"][backend]
         return cls(
@@ -166,10 +115,9 @@ class DINOEncoder(nn.Module):
             backbone_kwargs=cfg.get("backbone_kwargs"),
         )
 
-    # --- construction ---------------------------------------------------------------------
-
+    # construction
     def _load_backbone(self, backend: Backend, model_id: str, pretrained: bool) -> nn.Module:
-        """Load the raw (not yet LoRA-wrapped) backbone for the chosen backend."""
+        """Load vision backbone for the specified backend."""
         if backend == "timm":
             return self._load_timm(model_id, pretrained)
         if backend == "transformers":
@@ -177,7 +125,7 @@ class DINOEncoder(nn.Module):
         raise ValueError(f"Unknown encoder backend {backend!r}; expected 'timm' or 'transformers'.")
 
     def _load_timm(self, model_id: str, pretrained: bool) -> nn.Module:
-        """timm.create_model(model_id, ...) at `input_size` (H, W), no classifier head."""
+        """Load and configure timm backbone."""
         import timm
 
         model = timm.create_model(
@@ -193,12 +141,9 @@ class DINOEncoder(nn.Module):
                 f"{model_id} has {prefix} prefix tokens, config says {self.num_prefix_tokens} "
                 "(1 CLS + encoder.num_register_tokens)"
             )
-        # The LAST block always computes explicit softmax attention (so a hook can capture it).
-        # It must not depend on whether this call asks for the attention: under gradient
-        # checkpointing the backward pass recomputes the block, and a different attention path
-        # there than in the forward raises a CheckpointError. The other 11 blocks stay fused.
+        # Compute explicit softmax attention in last block for hook capture.
         model.blocks[-1].attn.fused_attn = False
-        # timm's RotaryEmbeddingDinoV3 ships with the coordinate augmentation off; make sure.
+        # Disable coordinate augmentation in rotary embeddings.
         rope = getattr(model, "rope", None)
         for name in ("shift_coords", "jitter_coords", "rescale_coords"):
             if getattr(rope, name, None) is not None:
@@ -207,7 +152,7 @@ class DINOEncoder(nn.Module):
         return model
 
     def _load_transformers(self, model_id: str, pretrained: bool) -> nn.Module:
-        """AutoModel.from_pretrained(model_id); attention maps need the eager attention path."""
+        """Load and configure transformers backbone."""
         from transformers import AutoModel
         from transformers.models.dinov3_vit import DINOv3ViTConfig, DINOv3ViTModel
 
@@ -229,9 +174,7 @@ class DINOEncoder(nn.Module):
                 f"{model_id} has {registers} register tokens, config says "
                 f"{self.num_prefix_tokens - 1} (encoder.num_register_tokens)"
             )
-        # Give the last block's attention its own config object and keep it on the eager path (the
-        # only one that materializes attention weights) for good, without slowing the other 11:
-        # under gradient checkpointing the recompute must take the same path as the forward.
+        # Use eager attention on the last block to materialize attention weights.
         last = self._transformers_layers(model)[-1].attention
         last.config = copy.deepcopy(last.config)
         last.config._attn_implementation = "eager"
@@ -245,12 +188,7 @@ class DINOEncoder(nn.Module):
         dropout: float,
         targets: str | list[str] | None,
     ) -> nn.Module:
-        """Wrap the backbone with peft: get_peft_model(backbone, LoraConfig(...)).
-
-        `targets` is peft's target_modules: a str is a regex (full match), a list matches
-        module-name suffixes. They must hit only the attention qkv / output projections of
-        every block, NOT patch_embed.proj. peft freezes all non-LoRA parameters.
-        """
+        """Attach LoRA adapters to backbone attention projection layers."""
         from peft import LoraConfig, get_peft_model
 
         config = LoraConfig(
@@ -259,7 +197,7 @@ class DINOEncoder(nn.Module):
             lora_dropout=dropout,
             target_modules=targets,
             bias="none",
-            init_lora_weights=True,  # A ~ Kaiming, B = 0: the adapter starts as a no-op
+            init_lora_weights=True,
         )
         model = get_peft_model(backbone, config)
         adapted = self.lora_target_names(model)
@@ -272,7 +210,7 @@ class DINOEncoder(nn.Module):
 
     @staticmethod
     def lora_target_names(peft_model: nn.Module) -> list[str]:
-        """Names of the modules peft actually wrapped, without the peft prefixes."""
+        """Return names of adapted modules without adapter prefixes."""
         names = []
         for name, _ in peft_model.named_modules():
             if name.endswith(".lora_A"):
@@ -280,14 +218,9 @@ class DINOEncoder(nn.Module):
         return names
 
     def _enable_grad_checkpointing(self, backbone: nn.Module) -> None:
-        """Recompute block activations in the backward pass (16 GB card, 1,280 tokens, batch 16).
-
-        Non-reentrant checkpointing only. The frozen patch embedding produces an input that
-        does not require grad, and reentrant checkpointing skips the backward of a block whose
-        inputs are all leaf-free, which would silently drop every LoRA gradient.
-        """
+        """Enable non-reentrant gradient checkpointing on backbone."""
         if self.backend == "timm":
-            backbone.set_grad_checkpointing(True)  # timm defaults to use_reentrant=False
+            backbone.set_grad_checkpointing(True)
         else:
             backbone.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -302,11 +235,10 @@ class DINOEncoder(nn.Module):
     def _transformers_layers(backbone: nn.Module) -> nn.ModuleList:
         return backbone.model.layer
 
-    # --- forward --------------------------------------------------------------------------
-
+    # forward
     @property
     def patch_grid(self) -> tuple[int, int]:
-        """`(gy, gx)` patch tokens for the configured input size: (32, 40) at 512 x 640."""
+        """Return (grid_h, grid_w) patch token counts for input size."""
         return self.input_size[0] // self.patch_size, self.input_size[1] // self.patch_size
 
     def _normalize(self, image: torch.Tensor) -> torch.Tensor:
@@ -321,21 +253,21 @@ class DINOEncoder(nn.Module):
             )
 
     def _preprocess_thermal(self, thermal: torch.Tensor) -> torch.Tensor:
-        """Thermal -> three channels -> ImageNet mean/std. No sRGB: thermal is not light."""
+        """Preprocess thermal tensor by repeating channels and normalizing."""
         self._check_size(thermal)
         return self._normalize(thermal.clamp(0.0, 1.0).expand(-1, 3, -1, -1))
 
     def _preprocess_rgb(self, image_linear: torch.Tensor) -> torch.Tensor:
-        """Linear RGB -> sRGB -> ImageNet mean/std: the L_align target's input (DINO saw sRGB)."""
+        """Convert linear RGB to sRGB and normalize."""
         self._check_size(image_linear)
         return self._normalize(linear_to_srgb(image_linear.clamp(0.0, 1.0)))
 
     def _base_model(self) -> nn.Module:
-        """The wrapped backbone itself (LoRA layers are substituted in place inside it)."""
+        """Return underlying base model unwrapped from LoRA."""
         return self.backbone.get_base_model()
 
     def _tokens(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """All tokens of the last layer, `(B, prefix + N, C)`."""
+        """Extract all tokens from final layer, shape (B, prefix + N, C)."""
         model = self._base_model()
         if self.backend == "timm":
             return model.forward_features(pixel_values)
@@ -343,23 +275,18 @@ class DINOEncoder(nn.Module):
 
     @contextmanager
     def _capture_attention(self) -> Iterator[dict[str, torch.Tensor]]:
-        """Capture the last block's softmax attention with a hook.
-
-        The last block computes explicit attention whether or not it is captured (set at load time:
-        a fused kernel never materializes the matrix, and the path must not change between a
-        forward and its checkpoint recompute), so asking for the attention only adds the hook.
-        """
+        """Context manager to capture attention weights from final block via forward hook."""
         captured: dict[str, torch.Tensor] = {}
         model = self._base_model()
         if self.backend == "timm":
 
-            def pre_hook(_module, args):  # args[0] is the softmaxed attention
+            def pre_hook(_module, args):
                 captured["attn"] = args[0]
 
             handle = model.blocks[-1].attn.attn_drop.register_forward_pre_hook(pre_hook)
         else:
 
-            def hook(_module, _args, output):  # (attn_output, attn_weights)
+            def hook(_module, _args, output):
                 captured["attn"] = output[1]
 
             handle = self._transformers_layers(model)[-1].attention.register_forward_hook(hook)
@@ -369,13 +296,7 @@ class DINOEncoder(nn.Module):
             handle.remove()
 
     def _patch_attention(self, full_attn: torch.Tensor) -> torch.Tensor:
-        """`(B, heads, T, T)` -> `(B, N, N)`: drop the prefix, average heads, renormalize rows.
-
-        Dropping the CLS and register columns takes mass out of every row, so the rows are
-        divided by what is left; the result is a proper distribution over patches again.
-        Detached when `detach_attn` is set: the bias conditions the velocity net, it is not a
-        gradient path into the encoder.
-        """
+        """Strip prefix tokens, average across heads, and renormalize patch attention rows."""
         if full_attn is None:
             raise RuntimeError("the attention hook captured nothing; the backend changed shape")
         prefix = self.num_prefix_tokens
@@ -399,17 +320,14 @@ class DINOEncoder(nn.Module):
         thermal: torch.Tensor,
         return_attn: bool = False,
     ) -> EncoderOutput:
-        """Extract patch features (and optionally attention) from a thermal frame.
+        """Extract patch features and optional attention from thermal input.
 
         Args:
-            thermal: (B, 1, H, W) = code / 255 in [0, 1] at `input_size`, already resized by the
-                caller (area averaging). Copied to 3 channels, ImageNet mean/std; no sRGB.
-            return_attn: Also return the last-layer patch-to-patch attention, head-averaged,
-                with CLS and register rows/columns stripped.
+            thermal: Thermal tensor of shape (B, 1, H, W).
+            return_attn: Whether to return last-layer patch attention.
 
         Returns:
-            EncoderOutput with patch_tokens (B, N, 384), cls_token (B, 384) and
-            patch_attn (B, N, N) or None.
+            EncoderOutput containing patch tokens, CLS token, and optional attention.
         """
         return self._run(self._preprocess_thermal(thermal), return_attn)
 
@@ -418,14 +336,14 @@ class DINOEncoder(nn.Module):
         image_linear: torch.Tensor,
         return_attn: bool = False,
     ) -> EncoderOutput:
-        """The paired RGB through the same network with the LoRA adapters disabled.
-
-        The pretrained features of the daylight image are the L_align target. DINO is pretrained
-        on sRGB, so the linear RGB is converted to sRGB plus ImageNet mean/std here and callers
-        never pre-convert (docs/conventions.md section 1). No gradients.
+        """Extract features with adapters disabled for alignment targets.
 
         Args:
-            image_linear: (B, 3, H, W) linear RGB in [0, 1] at `input_size`.
+            image_linear: Linear RGB image of shape (B, 3, H, W).
+            return_attn: Whether to return last-layer patch attention.
+
+        Returns:
+            EncoderOutput containing frozen patch tokens, CLS token, and optional attention.
         """
         pixel_values = self._preprocess_rgb(image_linear)
         with torch.no_grad(), self.backbone.disable_adapter():
@@ -436,15 +354,14 @@ class DINOEncoder(nn.Module):
         thermal: torch.Tensor,
         return_attn: bool = True,
     ) -> dict[str, torch.Tensor]:
-        """The conditioning bundle the flow stage consumes (module docstring).
+        """Extract conditioning tensor dictionary from thermal input.
 
         Args:
-            thermal: (B, 1, H, W) thermal in [0, 1] at `input_size`.
-            return_attn: Compute `attn_bias`. `False` leaves it out of the dict.
+            thermal: Thermal tensor of shape (B, 1, H, W).
+            return_attn: Whether to compute and include attention bias.
 
         Returns:
-            dict with 'patch_tokens' (B, N, C), 'patch_map' (B, C, gy, gx), 'cls' (B, C),
-            'thumb' (B, 1, gy, gx) and, if asked for, 'attn_bias' (B, 1, N, N).
+            Dictionary containing patch_tokens, patch_map, cls, thumb, and optional attn_bias.
         """
         out = self.forward(thermal, return_attn=return_attn)
         grid_h, grid_w = self.patch_grid
@@ -462,21 +379,26 @@ class DINOEncoder(nn.Module):
         return bundle
 
     def thumbnail(self, thermal: torch.Tensor) -> torch.Tensor:
-        """`area_downsample(thermal, patch_grid)`, `(B, 1, gy, gx)`: one value per patch.
+        """Downsample thermal image to patch grid resolution via area averaging.
 
-        Area averaging is the project's only downsample (docs/conventions.md section 4a). One
-        channel, no log: thermal is not photon-starved. Autocast is switched off so the average
-        is exact.
+        Args:
+            thermal: Thermal tensor of shape (B, 1, H, W).
+
+        Returns:
+            Downsampled tensor of shape (B, 1, gy, gx).
         """
         thermal = thermal.to(torch.float32).clamp(0.0, 1.0)
         with torch.autocast(device_type=thermal.device.type, enabled=False):
             return area_downsample(thermal, self.patch_grid)
 
     def last_layer_attention(self, thermal: torch.Tensor) -> torch.Tensor:
-        """Raw per-head attention of the last block, `(B, heads, T, T)`, `T = prefix + N`.
+        """Extract raw multi-head attention weights from last transformer block.
 
-        Rows sum to 1 here; `forward(return_attn=True)` is this, sliced to patches, averaged
-        over heads and renormalized. Exposed for tests and for attention visualizations.
+        Args:
+            thermal: Thermal tensor of shape (B, 1, H, W).
+
+        Returns:
+            Attention tensor of shape (B, heads, num_tokens, num_tokens).
         """
         pixel_values = self._preprocess_thermal(thermal)
         with self._capture_attention() as captured:
@@ -484,22 +406,17 @@ class DINOEncoder(nn.Module):
         return captured["attn"]
 
     def num_trainable_params(self) -> int:
-        """Return count of trainable parameters (0.22M: rank 8 on qkv + proj, 12 blocks)."""
+        """Return total count of trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 def attention_to_bias(patch_attn: torch.Tensor, floor: float = ATTN_FLOOR) -> torch.Tensor:
-    """`(B, N, N)` attention -> `(B, 1, N, N)` additive logit bias `log(A + floor)`.
-
-    The leading 1 is the head axis: the same bias is added to every head of every velocity
-    block, scaled by that block's learned gate. The floor keeps zero attention finite
-    (log 1e-6 = -13.8), so a zero gate multiplies a finite number and cannot produce NaNs.
-    """
+    """Convert attention weights of shape (B, N, N) to additive logit bias of shape (B, 1, N, N)."""
     return torch.log(patch_attn.to(torch.float32) + floor).unsqueeze(1)
 
 
 def _as_size(size: tuple[int, int] | list[int] | int) -> tuple[int, int]:
-    """`(H, W)` from a pair, or a square from one int."""
+    """Convert size specification to (height, width) tuple."""
     if isinstance(size, int):
         return size, size
     height, width = size
