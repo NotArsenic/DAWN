@@ -11,7 +11,7 @@ histograms that `wandb.watch` recorded, extracted from the run's local `.wandb` 
 
 `results/` in the repo is that layout with the checkpoints left out (committed); `--export`
 refreshes it from a real `runs/`. Every figure is written twice, `<name>.svg` for a light page and
-`<name>_dark.svg` for a dark one, with a transparent background so it sits on either, and every
+`<name>_dark.svg` for a dark one (white and black backgrounds), and every
 number the README quotes from these curves is written to `numbers.json` next to them.
 
     python scripts/plot_runs.py                          # results/ -> docs/images/plots/
@@ -66,9 +66,11 @@ QKV = tuple(n for n in HIST_TENSORS if n.endswith(".qkv.weight"))
 # Paul Tol's colour-blind-safe schemes: "bright" on a light page, "light" on a dark one.
 THEMES: Mapping[str, Mapping] = {
     "light": {
+        "background": "#ffffff",
         "ink": "#1f2328",
         "muted": "#59636e",
         "band": "#1f2328",
+        "band_alpha": 0.07,
         "blue": "#4477AA",
         "red": "#EE6677",
         "green": "#228833",
@@ -79,9 +81,11 @@ THEMES: Mapping[str, Mapping] = {
         "diverging": "RdBu",
     },
     "dark": {
+        "background": "#000000",
         "ink": "#e6edf3",
         "muted": "#9198a1",
         "band": "#e6edf3",
+        "band_alpha": 0.14,
         "blue": "#77AADD",
         "red": "#EE8866",
         "green": "#44BB99",
@@ -419,9 +423,9 @@ def apply_theme(theme: Mapping) -> None:
             "axes.titlelocation": "left",
             "axes.titlepad": 4,
             "axes.labelpad": 2,
-            "axes.facecolor": "none",
-            "figure.facecolor": "none",
-            "savefig.facecolor": "none",
+            "axes.facecolor": theme["background"],
+            "figure.facecolor": theme["background"],
+            "savefig.facecolor": theme["background"],
             "xtick.direction": "in",
             "ytick.direction": "in",
             "xtick.top": True,
@@ -444,7 +448,7 @@ def apply_theme(theme: Mapping) -> None:
             "svg.fonttype": "path",
             "savefig.dpi": 300,
             "savefig.bbox": "tight",
-            "savefig.pad_inches": 0.03,
+            "savefig.pad_inches": 0.08,
         }
     )
 
@@ -475,8 +479,10 @@ def shade_detach(
     centred at `label_y` (axes fraction), set vertically inside the band unless the band is wide
     enough for it to read across.
     """
-    ax.axvspan(0, warmup, color=theme["band"], alpha=0.07, lw=0, zorder=0)
-    ax.axvspan(warmup, warmup + ramp, color=theme["band"], alpha=0.035, lw=0, zorder=0)
+    ax.axvspan(0, warmup, color=theme["band"], alpha=theme["band_alpha"], lw=0, zorder=0)
+    ax.axvspan(
+        warmup, warmup + ramp, color=theme["band"], alpha=theme["band_alpha"] / 2, lw=0, zorder=0
+    )
     if label:
         ax.text(
             warmup * 0.5,
@@ -1199,7 +1205,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         for name, build in figures.items():
             fig = build(theme)
             path = args.out / f"{name}{suffix}.{args.format}"
-            fig.savefig(path, transparent=True)
+            fig.savefig(path)
             plt.close(fig)
             logger.info("wrote %s", path.relative_to(ROOT) if path.is_relative_to(ROOT) else path)
     logger.info("wrote %s", args.out / "numbers.json")
