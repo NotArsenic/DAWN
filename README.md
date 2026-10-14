@@ -15,12 +15,13 @@
 </p>
 
 <p align="center">
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#results">Results</a> ·
-  <a href="#architecture">Architecture</a> ·
-  <a href="#quick-start">Quick start</a> ·
+  <a href="#abstract">Abstract</a> ·
+  <a href="#2-method">Method</a> ·
+  <a href="#5-results">Results</a> ·
+  <a href="#6-training-dynamics-what-the-run-did-on-its-own">Training dynamics</a> ·
+  <a href="#9-reproducing">Reproducing</a> ·
   <a href="#status">Status</a> ·
-  <a href="#known-limitations">Limitations</a>
+  <a href="#8-limitations">Limitations</a>
 </p>
 
 <p align="center">
@@ -40,8 +41,9 @@
   <td align="center"><b>20.05 dB</b><br><sub>L*&nbsp;PSNR</sub></td>
   <td align="center"><b>8.31</b><br><sub>CIEDE2000</sub></td>
   <td align="center"><b>40 FPS</b><br><sub>at K=8 samples</sub></td>
+  <td align="center"><b>ρ = 0.77</b><br><sub>spread vs error, per frame</sub></td>
   <td align="center"><b>5,385</b><br><sub>aligned real pairs</sub></td>
-  <td align="center"><b>7.6 M</b><br><sub>generator params</sub></td>
+  <td align="center"><b>7.8 M</b><br><sub>generator params</sub></td>
 </tr>
 </table>
 
@@ -53,59 +55,497 @@
 
 ---
 
-## How it works
+## Abstract
 
-Dawn treats thermal as a one-channel image and splits the job in two, because there is far more
-evidence behind one half than the other.
+Dawn turns a daytime drone thermal frame (640×512, one channel) into the matching daytime colour
+photograph in **two velocity-network evaluations**, with per-pixel brightness and colour
+uncertainty. Brightness is not generated as pixels: it is an affine bilateral grid of thermal
+intensity (per 16×16 cell and per intensity bin, a gain and an offset), and the best such grid
+fitted to the real photograph (the *oracle*) already reaches 25.1 dB L\* PSNR. What is generated,
+by a 7.8M-parameter flow-matching transformer conditioned on a LoRA-tuned DINOv3 ViT-S+, is that
+grid's coefficients and a 128×160 a\*b\* colour map; the image is assembled in CIELAB. On **781
+held-out box-aligned DroneVehicle pairs** the model reaches **20.05 dB L\* PSNR and 8.31
+CIEDE2000**, against a ceiling of 25.13 dB and 3.25, and runs at **40 FPS with eight uncertainty
+samples** on an RTX 5090. Its sample spread ranks test frames by their real error (Spearman
+ρ = 0.77) but understates it about 5×, and its colour reaches 64% of the photograph's
+colourfulness: the model has collapsed toward the conditional mean.
 
-|  | | |
-|:--:|---|---|
-| **1** | **Brightness comes from a fitted curve** | A per-region curve maps thermal intensity to lightness: 8 intensity bins × (gain, offset) per 16×16 cell. Thermal really does carry this, and an oracle fit measures the ceiling at 25.1 dB before any model runs. |
-| **2** | **Colour is generated** | Flow matching produces a 128×160 a\*b\* map, conditioned on a LoRA-tuned DINOv3 that learns to read thermal the way it reads daylight. Nothing in a heat image implies colour, so this half is a learned prior. |
-| **3** | **Uncertainty is the spread of K samples** | K samples are drawn, rendered, and reduced to a spread in L\* and a\*b\* units. One DINO pass serves all K, which is why eight samples still run at 40 FPS. |
+The most interesting thing the run did by itself is in its **attention gates**: six scalars,
+initialised at zero, that decide how strongly each generator block follows DINO's own attention.
+All six opened, two of them nearly fully (0.94 and 0.85); one opened and then **closed again**
+as soon as the encoder began to receive the generator's gradient; and on 100 memorised frames
+none of them opened much ([§6.1](#61-the-attention-gates-opened-themselves)).
 
-The training data are real thermal/RGB day pairs from
-[DroneVehicle](https://huggingface.co/datasets/McCheng/DroneVehicle), kept only if they survive a
-strict alignment filter. The full design is in
+<details>
+<summary><b>Contents</b></summary>
+
+1. [The problem](#1-the-problem)
+2. [Method](#2-method): brightness grid, colour map, tokens, flow matching, gated DINO attention, objective, schedule, uncertainty, refiner
+3. [Data](#3-data)
+4. [Experimental setup](#4-experimental-setup) and the campaign's gates
+5. [Results](#5-results): ceiling, test metrics, the gap, vehicles, uncertainty, colour, refiner, speed
+6. [Training dynamics](#6-training-dynamics-what-the-run-did-on-its-own): attention gates, schedule, validation, losses, convergence
+7. [What this run settled](#7-what-this-run-settled)
+8. [Limitations](#8-limitations)
+9. [Reproducing](#9-reproducing): install, data, oracle, training, the campaign, inference, the figures
+10. [Project structure](#10-project-structure)
+11. [Status](#status) · [References](#references) · [Citation](#citation) · [License](#license)
+
+</details>
+
+---
+
+## 1. The problem
+
+Input: a daytime thermal frame $`T \in [0,1]^{H\times W}`$ (the camera's 8-bit codes / 255,
+never gamma-converted). Output: the paired daytime photograph $`y`$ (linear RGB). The two
+cameras are a few centimetres apart and expose at slightly different times, so training pairs
+are only as good as their alignment ([§3](#3-data)).
+
+Two observations shape the whole design:
+
+1. **Brightness is mostly a function of thermal intensity, locally.** Asphalt, roofs and
+   vegetation each have a fairly stable relation between how warm they are and how bright they
+   look, but that relation changes across the frame. A per-region curve of thermal can therefore
+   explain most of the lightness, and how much it explains can be *measured* before any model is
+   trained (the oracle, [§5.1](#51-the-ceiling)).
+2. **Colour is ambiguous.** Nothing in a heat image says whether a car is red or blue. A
+   regressor averages the possibilities into grey-brown; a generative model can commit to one
+   plausible answer. Colour is the half that gets the generative machinery.
+
+| Symbol | Meaning | Value |
+|---|---|---|
+| $`H, W`$ | input size (`encoder.input_size`) | 512 × 640 |
+| $`g_y, g_x`$ | token / brightness-cell / DINO-patch grid, $`(H, W)/16`$ | 32 × 40 |
+| $`N`$ | tokens, $`g_y g_x`$ | 1,280 |
+| $`K`$ | thermal-intensity bins of the brightness grid | 8 |
+| $`D`$ | values per token, $`2K + 2\cdot 4^2`$ | 48 |
+| $`Q`$ | quantised a\*b\* bins (occupied cells of the sRGB gamut) | 261 |
+| $`L`$ | lightness the grid predicts, $`L = L^\ast/100`$ | $`[0, 1]`$ |
+| $`t`$ | flow time, 0 = noise, 1 = data | $`[0, 1]`$ |
+
+Every layout, unit and coordinate convention is pinned in
+[`docs/conventions.md`](docs/conventions.md); the original design is the plan,
 [`docs/Dawn Night-Vision to Day Colorization for Drone Imagery.md`](docs/Dawn%20Night-Vision%20to%20Day%20Colorization%20for%20Drone%20Imagery.md).
 
 ---
 
-## Results
+## 2. Method
 
-One model, trained 8 October 2026 on a rented RTX 5090 (0.40 s/step, 17.1 GB peak, 20K steps in
-~2.3 h; best checkpoint at step 18,000). Headline is the **781 box-aligned test pairs**, euler at
-NFE 2. Full tables, the ceiling they are read against, and the design questions this run settled:
-[`docs/results.md`](docs/results.md).
+### 2.1 Overview
 
-| Metric | Model | Ceiling | |
-|---|:--|:--|---|
-| L\* PSNR | **20.05 dB** | 25.13 | 5.1 dB short |
-| CIEDE2000 | **8.31** | 3.25 | 5.06 short |
-| SSIM / LPIPS | 0.556 / 0.535 | | |
-| Colourfulness vs real | 0.64 | 0.93 | |
-| Vehicles (PSNR / CIEDE2000) | 16.44 / 12.54 | | the predicted weak point |
-| Latency | **40 FPS** at K=8, 58 at K=1 | | 25 ms/frame, 232 GMACs |
+<p align="center">
+  <img src="docs/architecture.svg" width="860"
+       alt="Dawn architecture: a LoRA-tuned DINOv3 ViT-S+/16 encoder tower conditions a 6-block DiT velocity tower; the velocity is integrated, unpacked into a brightness grid and an a*b* map, rendered in CIELAB and optionally refined into a daytime RGB frame.">
+</p>
 
-The overfit gate finished 3.0 dB short of its own oracle on memorized frames, so roughly 3 dB of
-the 5.1 is structural (2-step generation from noise) and ~2 dB is generalization. Fallback pairs
-score the same as box-aligned ones (20.11 / 8.37), which justifies keeping the 44% of the data
-aligned by edge correlation alone.
+**Figure 1: the whole model on one sheet**, laid out in the idiom of Figure 1 of *Attention Is
+All You Need*. The left tower is the conditioning encoder: 12 identical blocks of self-attention
+(LoRA on qkv and the output projection; everything else frozen) and a gated MLP. The right tower
+is the generator: 6 DiT blocks in which adaLN-Zero injects the flow time $`t`$ and the residuals
+are *gated* rather than normalised, so a freshly initialised block is the identity. Blue marks the
+two routes the thermal conditioning takes: patch tokens **added** to the input tokens alongside
+the thumbnail and position embedding, and the encoder's own last-layer attention entering
+**every** block as an additive logit bias behind a per-block gate that starts at 0. Above the
+generator is everything that is not a network: two Euler steps, the unpack into the only two
+things the model generates, the render in CIELAB, and the optional stage-2 refiner that touches
+$`L`$ alone.
 
-| What works | What does not |
+<sub>Orange blocks are self-attention, blue feed-forward, yellow normalisation and the gated
+residuals, green conditioning (adaLN-Zero, and the render), grey what goes in and comes out.
+Black arrows carry data, grey a residual around a sub-layer, blue the thermal conditioning,
+green the flow time.</sub>
+
+One frame costs **one** DINO pass and $`\text{NFE}\times K`$ passes of the small velocity net
+($`2\times 8`$ at inference). That asymmetry is the main structural bet: eight uncertainty
+samples cost about 8 ms more than one, not eight times as much ([§5.8](#58-speed)).
+
+### 2.2 Brightness: an affine bilateral grid on thermal
+
+The guidance is the thermal itself, lightly blurred:
+
+```math
+g = \operatorname{clamp}\big(\operatorname{box}_{5\times 5}(T),\ 0,\ 1\big)
+```
+
+with replicate padding and no log or contrast stretch: thermal is not photon-starved like a dark
+photograph, and a per-frame p1–p99 stretch bought only +0.06 dB because thermal already spans most
+of $`[0, 1]`$. The grid
+$`\Gamma \in \mathbb{R}^{2\times K\times g_y\times g_x}`$ holds a gain $`a_n`$ and an offset
+$`b_n`$ at every node $`n = (k, i, j)`$: intensity bin $`k`$, cell row $`i`$, cell column $`j`$.
+Each pixel $`p`$ sits at continuous grid coordinates
+
+```math
+\Big(\tfrac{(r_p + 0.5)\,g_y}{H} - 0.5,\ \ \tfrac{(c_p + 0.5)\,g_x}{W} - 0.5,\ \ g(p)\,K - 0.5\Big),
+```
+
+nodes at cell *centres*, and reads its 8 surrounding nodes with trilinear weights $`w_n(p)`$
+(summing to 1, edges replicated). Lightness is an affine function of thermal whose coefficients
+vary smoothly in space and in intensity:
+
+```math
+\hat L(p) = \operatorname{clamp}\Big(\sum_{n \in \mathcal N(p)} w_n(p)\,\big[a_n\,T(p) + b_n\big],\ 0,\ 1\Big),
+\qquad \hat L^\ast(p) = 100\,\hat L(p).
+```
+
+This is the bilateral-grid idea of Chen et al. (2007), used as in HDRNet (Gharbi et al., 2017) but
+with a *one-channel* input and $`L = L^\ast/100`$ as the output, which measured 24.72 dB against
+24.52 for fitting linear luminance and optimises the quantity that is evaluated.
+
+**Fitting the target grid.** Training targets are fitted per image, on the GPU, with no gradient.
+Each node solves a weighted ridge regression against the pixels that touch it, pulled toward a
+coarser fit so that empty or sparse bins stay sensible:
+
+```math
+(a_n, b_n) = \arg\min_{a,\,b}\ \sum_p m(p)\,w_n(p)\,\big(a\,T(p) + b - L(p)\big)^2
+\;+\; \lambda_n\Big[(a - \bar a_{c(n)})^2 + (b - \bar b_{c(n)})^2\Big],
+```
+
+where $`m`$ is the pixel mask ([§3](#3-data)), $`(\bar a_c, \bar b_c)`$ is the same fit for
+the node's whole cell (all bins pooled), which is itself pulled toward the whole-image fit, and
+$`\lambda_n = 10^{-3}`$ times the mean node weight. Each is a 2×2 system with a closed form. The
+per-node solve treats every node as if it alone explained its pixels, while the render blends
+eight, so one **refinement pass** fits the render residual and adds it (+0.5 dB of ceiling).
+
+### 2.3 Colour and assembly in CIELAB
+
+Colour is a generated a\*b\* map $`A \in \mathbb{R}^{2\times 4g_y\times 4g_x}`$ (128×160: a 4×4
+block of colour pixels per token), upsampled **bilinearly** to the output and combined with the
+grid's lightness:
+
+```math
+\hat y = \operatorname{clip}_{[0,1]}\Big(\operatorname{Lab}^{-1}\big(100\,\hat L,\ \operatorname{Up}(A)\big)\Big).
+```
+
+The plan specified bilateral guided upsampling (Chen et al., 2016) so that colour edges would
+follow brightness edges. On the real data it was worse at every grid swept (mean
+$`|\Delta a^\ast b^\ast|`$ ceiling 0.90 bilinear against 1.28 for the best BGU), **and worse at
+edges too** (1.45 against 2.37 on the top decile of gradient magnitude), because its per-cell
+affine model of colour on $`L`$ smooths away colour that is not a function of $`L`$. This single
+render path, `dawn/flow/render.py`, serves `L_render`, validation, the oracle and inference alike.
+
+### 2.4 One token per DINO patch
+
+The brightness cells, the DINO patches and the generator's tokens are the same 32×40 grid. Token
+$`n = i\,g_x + j`$ carries everything the model generates for its patch:
+
+```math
+x_n = \big[\underbrace{a_{0,n},\, b_{0,n},\, \dots,\, a_{K-1,n},\, b_{K-1,n}}_{2K = 16\ \text{brightness}}\ \big|\
+\underbrace{a^\ast_{n,1..16},\ b^\ast_{n,1..16}}_{32\ \text{colour: its}\ 4\times 4\ \text{block}}\big] \in \mathbb{R}^{48},
+```
+
+standardised per *segment* (a bin-0 offset and a bin-7 offset never share a mean):
+$`z = (x - \mu)/\sigma`$, with $`\mu, \sigma`$ fitted once on 2,000 training targets and stored in
+every checkpoint. `dawn/flow/tokens.py` is the only place that packs or unpacks this layout.
+
+### 2.5 Flow matching
+
+The generator is a conditional rectified flow (Lipman et al., 2023; Liu et al., 2023) on the
+standardised tokens $`z_1`$:
+
+```math
+z_t = (1 - t)\,z_0 + t\,z_1, \qquad z_0 \sim \mathcal N(0, I), \qquad t \sim \mathcal U[0, 1],
+```
+
+and the velocity net $`v_\theta`$ regresses the straight-line velocity $`z_1 - z_0`$:
+
+```math
+\mathcal L_\text{flow} = \sum_{s\,\in\,\{\text{bri},\,\text{col}\}} \frac{D_s}{D}\;
+\mathbb{E}\Big[\,\overline{\omega_s \odot \big(v_\theta(z_t, t, c) - (z_1 - z_0)\big)^{2}}\,\Big],
+\qquad D_\text{bri} = 16,\ D_\text{col} = 32.
+```
+
+The weights $`\omega`$ are the number of (masked) pixels behind each brightness node, and the
+kept fraction of each colour pixel, normalised to mean 1 per segment and sample, so a node
+nobody saw does not count. At inference the flow is integrated with **two Euler steps** (NFE 2):
+
+```math
+z_{k+1} = z_k + \tfrac{1}{S}\,v_\theta\big(z_k,\ \tfrac{k}{S},\ c\big), \qquad k = 0, \dots, S-1,\quad S = 2,
+```
+
+then unstandardised once, unpacked into $`(\Gamma, A)`$ and rendered.
+
+### 2.6 The conditioning: LoRA-DINOv3 and gated attention
+
+**Encoder.** DINOv3 ViT-S+/16 (28.7M parameters, frozen) reads the thermal copied to three
+channels. Every attention block's qkv and output projection carries a rank-8 LoRA adapter
+(Hu et al., 2022), 0.22M trainable parameters in 24 modules:
+
+```math
+W' = W + \tfrac{\alpha}{r}\,BA, \qquad r = 8,\ \alpha = 16,\ B = 0 \text{ at initialisation},
+```
+
+so at step 0 the adapted encoder is exactly the pretrained one (the smoke test logs
+`|adapted - adapters off| = 0.000e+00`). It produces 1,280 patch tokens $`f \in \mathbb R^{N\times 384}`$
+and its last layer's patch-to-patch attention $`A \in \mathbb{R}^{N\times N}`$ (heads averaged,
+CLS and the 4 register tokens stripped, rows renormalised, detached).
+
+**Velocity net.** Six DiT blocks (Peebles & Xie, 2023), width 256, 4 heads, 7.82M parameters. The
+input embedding adds the conditioning to every token:
+
+```math
+h^{(0)}_n = W_z\,z_{t,n} + W_f\,f_n + W_\tau\,\tau_n + P_n ,
+```
+
+with $`\tau`$ the thermal area-averaged to 32×40 and $`P`$ a learned position embedding. Time
+enters each block by adaLN-Zero; the shift $`\beta`$, scale $`s`$ and residual gate $`\gamma`$
+come from a zero-initialised projection of the time embedding, so every block starts as the
+identity:
+
+```math
+h \leftarrow h + \gamma_1(t) \odot \operatorname{Attn}_\ell\big((1 + s_1(t)) \odot \operatorname{LN}(h) + \beta_1(t)\big),
+\qquad
+h \leftarrow h + \gamma_2(t) \odot \operatorname{MLP}\big((1 + s_2(t)) \odot \operatorname{LN}(h) + \beta_2(t)\big).
+```
+
+**Gated DINO attention.** DINO's attention enters every block as an additive logit bias, scaled by
+one learned scalar per block, $`g_\ell`$, **initialised at 0**:
+
+```math
+\operatorname{Attn}_\ell(Q, K, V) = \operatorname{softmax}\!\Big(\frac{QK^{\top}}{\sqrt d} + g_\ell\,\log(A + \epsilon)\Big)\,V,
+\qquad g_\ell^{(0)} = 0,\ \ \epsilon = 10^{-6}.
+```
+
+Because the bias is a *log*, the gate is an exponent on DINO's attention:
+
+```math
+\operatorname{softmax}(\cdot)_{ij} \;=\;
+\frac{\exp\!\big(q_i \cdot k_j / \sqrt d\big)\,(A_{ij} + \epsilon)^{g_\ell}}
+     {\sum_{j'} \exp\!\big(q_i \cdot k_{j'} / \sqrt d\big)\,(A_{ij'} + \epsilon)^{g_\ell}} .
+```
+
+At $`g_\ell = 0`$ the block ignores DINO; at $`g_\ell = 1`$ its attention is the product of its own
+and DINO's (a product of experts); in between, DINO's prior is tempered. A starts detached, so no
+gradient reaches the encoder through this path, but the gate itself always gets one,
+
+```math
+\frac{\partial \mathcal L}{\partial g_\ell} = \sum_{i,j} \frac{\partial \mathcal L}{\partial S^{(\ell)}_{ij}}\,\log(A_{ij} + \epsilon),
+```
+
+where $`S^{(\ell)}`$ are block $`\ell`$'s attention logits, and it carries no weight decay. Nothing
+forces a gate open: starting at 0, the generator is free to never use DINO's attention.
+[§6.1](#61-the-attention-gates-opened-themselves) shows what it chose.
+
+### 2.7 Training objective
+
+Four terms, all masked so that invalid warp pixels and moving vehicles never contribute:
+
+```math
+\mathcal L = \mathcal L_\text{flow} + 0.1\,\mathcal L_\text{render} + 0.5\,\mathcal L_\text{align} + 0.2\,\mathcal L_\text{color}.
+```
+
+**Render.** The one-step estimate of the clean tokens, rendered at 256×320 and compared with the
+photograph in CIELAB (fallback-aligned pairs, [§3](#3-data), count half: $`\rho_b = 0.5`$):
+
+```math
+\hat z_1 = z_t + (1 - t)\,v_\theta(z_t, t, c), \qquad
+\mathcal L_\text{render} = \mathbb E_b\!\left[\rho_b\,
+\frac{\sum_p m(p)\,\tfrac{1}{300}\,\big\lVert \operatorname{Lab}\big(\mathcal R(\hat z_1)\big)(p) - \operatorname{Lab}(y)(p)\big\rVert_1}{\sum_p m(p)}\right].
+```
+
+**Align.** The adapted encoder on thermal should produce the features the *frozen* encoder
+(adapters disabled with peft's `disable_adapter()`) produces on the paired RGB:
+
+```math
+\mathcal L_\text{align} = \frac{\sum_n \pi_n\,\big(1 - \cos\big(f_\phi(T)_n,\ f_{\phi_0}(y)_n\big)\big)}{\sum_n \pi_n},
+```
+
+with $`\pi_n`$ the kept fraction of patch $`n`$. **Colour.** A linear head on each adapted patch
+token predicts the patch's soft a\*b\* histogram over the 261 bins (Zhang et al., 2016: 5 nearest
+bins, Gaussian $`\sigma = 5`$), counted only for patches at least half unmasked:
+
+```math
+\mathcal L_\text{color} = -\frac{\sum_n \pi'_n \sum_{q=1}^{261} h_{nq}\,\log \operatorname{softmax}(\ell_n)_q}{\sum_n \pi'_n},
+\qquad \pi'_n = \pi_n\,[\pi_n \ge 0.5].
+```
+
+$`\mathcal L_\text{align}`$ and $`\mathcal L_\text{color}`$ train LoRA only (and the head); the head
+is discarded at inference.
+
+### 2.8 Schedule: detach, then ramp
+
+For the first 3,000 steps the encoder's patch tokens reach the velocity net **detached**, so LoRA
+learns from $`\mathcal L_\text{align}`$ and $`\mathcal L_\text{color}`$ alone while the generator
+fits a slowly moving feature distribution. The velocity gradient is then eased in over 500 steps
+instead of switched on, leaving the forward pass untouched:
+
+```math
+\tilde f = \operatorname{sg}(f) + s(k)\,\big(f - \operatorname{sg}(f)\big), \qquad
+s(k) = \begin{cases} 0, & k < 3000,\\[2pt] \min\!\big(1,\ \tfrac{k - 3000 + 1}{500}\big), & k \ge 3000,\end{cases}
+```
+
+where $`\operatorname{sg}`$ is stop-gradient. AdamW, peak learning rate $`2\times10^{-4}`$
+($`10^{-4}`$ for LoRA), 1,000 steps of linear warmup then cosine to zero at step 20,000, gradient
+clip 1.0, bf16 autocast. The EMA used for validation and the checkpoints warms up as
+$`\beta_n = \min\big(0.999,\ \tfrac{1+n}{10+n}\big)`$, so early validations measure trained
+weights rather than the initialisation. One encoder pass feeds 8 timesteps per image, so a step
+of 16 images is 128 velocity samples. The curves are in [§6.2](#62-the-schedule).
+
+### 2.9 Uncertainty from samples
+
+$`K`$ independent noises $`z_0^{(k)}`$ give $`K`$ renders from **one** encoder pass. The maps are
+their spread, on rendered L\*a\*b\* (never on tokens), unbiased:
+
+```math
+\sigma_{L^\ast}(p) = \sqrt{\tfrac{1}{K-1}\textstyle\sum_{k}\big(L^{\ast}_{k}(p) - \bar L^{\ast}(p)\big)^{2}},
+\qquad
+\sigma_{ab}(p) = \sqrt{\operatorname{Var}_k\,a^{\ast}_{k}(p) + \operatorname{Var}_k\,b^{\ast}_{k}(p)} .
+```
+
+$`\sigma_{ab}`$ is a chroma distance on the same scale as a CIEDE2000, so the two can be ranked
+against each other. There is no variance head and no calibration target: a spread is a
+*disagreement*, not an error bar, and how well it tracks the error is measured, not assumed
+([§5.5](#55-uncertainty-measured)). The image to *display* is one member, not the ensemble mean,
+which is smoother and less colourful.
+
+### 2.10 Stage 2: the local refiner
+
+An optional 2,545-parameter depthwise-separable CNN on lightness only, with a 9×9 receptive field
+(far smaller than a vehicle, which is the point), bounded so it can sharpen but not invent:
+
+```math
+L' = L + 0.1\,\tanh\big(r_\psi(L,\ T)\big).
+```
+
+It is trained on the *fitted* (oracle) grid's $`L`$ and meets the *generated* one at inference; that
+mismatch is the plan's, and is what lets stage 2 train before stage 1 exists. Colour is untouched,
+and without `--refiner` inference is byte-identical to stage 1.
+
+---
+
+## 3. Data
+
+Real thermal/RGB pairs from **DroneVehicle** (Sun et al., 2022;
+[McCheng/DroneVehicle](https://huggingface.co/datasets/McCheng/DroneVehicle)): 840×712 frames with
+a 100-px white border, five vehicle classes boxed *separately* in each modality. The box centres
+give cross-modal correspondences without any feature matching.
+
+| Stage | train | val | test | total |
+|---|--:|--:|--:|--:|
+| stems in the image folders | 17,990 | 1,469 | 8,980 | 28,439 |
+| paired and readable | 17,951 | 1,469 | 8,980 | 28,400 |
+| day (median linear luminance of the RGB ≥ 0.20) | 5,818 | 532 | 2,184 | 8,534 |
+| aligned (geometry and edge checks) | 3,662 | 346 | 1,380 | 5,388 |
+| **final** (val/test near-duplicates of train dropped) | **3,662** | **345** | **1,378** | **5,385** |
+
+A pair is aligned one of two ways. **Box-aligned** (3,011): same-class boxes are matched as mutual
+nearest neighbours, a similarity transform is fitted by RANSAC (a homography only when the
+similarity's residual alone fails), and the pair is accepted only with ≥ 6 matches, inlier ratio
+≥ 0.6, median residual ≤ 2 px, scale within 5%, rotation under 2° and shift under 30 px, then
+checked independently by gradient-magnitude correlation. **Fallback** (2,374): where the boxes
+cannot judge (copied labels, too few vehicles), a global translation from the same edge
+correlation, accepted only with one clear peak and agreeing image quadrants. Against box-fitted
+pairs that estimate is within 2 px 86% of the time.
+
+The thermal is warped onto the RGB frame (the RGB is never resampled) and every pair carries a
+pixel mask
+
+```math
+m = \begin{cases} \texttt{valid} \wedge \neg\,\texttt{moving}, & \text{box-aligned},\\
+\texttt{valid} \wedge \neg\,\texttt{vehicles}, & \text{fallback},\end{cases}
+```
+
+where `valid` removes pixels the warp pulled from outside the thermal frame, `moving` removes
+vehicles whose own residual says they moved between the exposures, and `vehicles` (for fallback
+pairs, where nothing is known about motion) masks every vehicle, stretched 17.4 px along its
+heading where it may have moved: 12% of a frame on average. Counts at every stage:
+[`data/manifests/logs/summary.md`](data/manifests/logs/summary.md). The pipeline itself is in
+[§9.2](#92-data).
+
+---
+
+## 4. Experimental setup
+
+| | |
 |---|---|
-| Generalises, with no failure cluster hiding in the mean (PSNR p10 16.99, p90 23.89) | Colour reaches 64% of the real photo where the ceiling is 93% |
-| Its best decile nearly touches the ceiling (CIEDE2000 5.07 against 3.25) | Vehicles carry ~50% more colour error than the frame as a whole |
-| Structure survives (SSIM 0.556) and it runs in real time | LPIPS 0.535 has no oracle baseline, because `check_oracle.py` measures only PSNR and CIEDE2000 |
-| The 44% of fallback pairs needed none of the caution they were given | |
+| Hardware | one rented **RTX 5090** (32 GB), 8 October 2026 |
+| Trainable parameters | velocity 7.82M · LoRA 0.22M · colour head 0.10M = **8.14M** (of 36.8M) |
+| Batch | 16 images × 8 timesteps = 128 velocity samples per step; `L_render` on a random 64 of them |
+| Budget | 20,000 steps = 229 steps/epoch × **87.4 epochs**; detached for the first 13.1 epochs |
+| Speed | **0.40 s/step** median, **17.1 GB** peak, 2.5 h wall clock including validation |
+| Validation | every 500 steps on 64 box-aligned and 64 fallback val pairs, EMA weights, NFE 2, Euler and midpoint |
+| Model selection | lowest CIEDE2000 on box-aligned val (`logging.select_metric`), not L\* PSNR, which is mostly the thermal-fitted grid and blind to colour going wrong |
+| Test | 1,378 test pairs, reported separately for 781 box-aligned (the headline) and 597 fallback |
+| Config | [`configs/flow.yaml`](configs/flow.yaml) + [`configs/gpu_5090.yaml`](configs/gpu_5090.yaml), saved with every run as `run_config.json` |
+| Telemetry | W&B `my-team/dawn` (run `gvg887ou`) and `my-team/dawn-refiner` (`jb9zzar1`); every metric is mirrored locally, and the copies in [`results/`](results/) are what this page is built from |
 
-> [!NOTE]
-> **One thread ties the weaknesses together.** The sample spread is small (`l_std` 2.18),
-> averaging eight samples barely helps (+0.23 dB), and colour is muted. All three are the same
-> thing: the model has collapsed toward the conditional mean, behaving like a regressor rather
-> than a generator. Flow matching was chosen to avoid exactly that. It still works, but on this
-> evidence the generative machinery is not yet earning its keep over a simpler direct predictor,
-> and that is the single most interesting thing the run produced.
+### The campaign and its gates
+
+The run is one command, `scripts/run_pipeline.py --yes` ([§9.5](#95-the-whole-campaign-one-command)),
+and each stage is a gate for the next. A failed gate stops the campaign with a message that says
+what to do.
+
+| Stage | What it checks | Measured | Rule | Wall clock |
+|---|---|---|---|--:|
+| `gpu_probe` | VRAM and s/step of the real config, 50 steps | 17.1 GB, 0.41 s/step | fits in 32 GB | 3.6 min |
+| `smoke_dino` | real weights, shapes, LoRA targets, `B = 0` at init | 24 LoRA modules, 0.22M trainable | passes | 9 s |
+| `oracle` | can a brightness grid explain lightness at all? | **25.08 dB** on 345 val pairs | ≥ 24 dB | 54 s |
+| `overfit` | can the model memorise 100 frames? | **23.11 dB** against their 26.06 dB oracle (88.7%) | ≥ 85% | 27 min |
+| `baseline` | the real run | best at step 18,000 | | 2.5 h |
+| `refiner` | does stage 2 help? | **+0.070 dB** over the unrefined grid | ≥ 0 | 8.8 min |
+| `evaluation` | the test split | [§5.2](#52-test-results) | | 4.2 min |
+
+All seven passed: **3.2 h end to end**. The record is
+[`results/pipeline_state.json`](results/pipeline_state.json).
+
+---
+
+## 5. Results
+
+### 5.1 The ceiling
+
+`scripts/check_oracle.py` fits the best possible grid and colour map to each real val pair and
+renders them with the same code the trainer uses. These are the **best any model of this shape
+could do**, not results ([`results/oracle/report.md`](results/oracle/report.md), 345 val pairs):
+
+| | all (345) | box-aligned (194) | fallback (151) |
+|---|--:|--:|--:|
+| grid only, L\* PSNR, refine 0 / **1** | 24.60 / **25.08** | 24.61 / **25.13** | 24.58 / 25.02 |
+| grid + generated 128×160 L correction, refine 1 | 26.85 | 27.04 | 26.60 |
+| colour ceiling, mean $`\lvert\Delta a^\ast b^\ast\rvert`$, bilinear / BGU | **0.90** / 1.28 | 0.86 / 1.23 | 0.94 / 1.34 |
+| … at edges (top 10% of gradient magnitude), bilinear / BGU | **1.45** / 2.37 | 1.39 / 2.30 | 1.51 / 2.45 |
+| assembled oracle, grid only, bilinear colour, CIEDE2000 | **3.33** | **3.25** | 3.43 |
+| assembled oracle, with correction, CIEDE2000 | 2.77 | 2.66 | 2.91 |
+
+The grid alone clears the plan's 24 dB decision rule, so brightness really is a regional curve of
+thermal intensity on this data; that was the design's central bet, settled before a single step
+was trained. Box-aligned and fallback pairs have the **same** ceiling: loose alignment does not
+make a pair harder to *fit*, only harder to *learn from*. The oracle is measured on val, not test,
+so the test numbers below are read against the box-aligned val ceiling.
+
+### 5.2 Test results
+
+Box-aligned test pairs, NFE 2, K = 8 samples, best checkpoint (step 18,000, EMA). L\* PSNR has its
+peak at 100 and is masked like the losses; LPIPS (AlexNet) is whole-frame and unmasked.
+([`results/evaluation/report.md`](results/evaluation/report.md): p10/p50/p90 for every row.)
+
+| | Euler (default) | midpoint | fallback pairs, Euler | ceiling |
+|---|--:|--:|--:|--:|
+| frames | 781 | 781 | 597 | |
+| **L\* PSNR**, dB ↑ | **20.05** | 19.38 | 20.11 | 25.13 |
+| **CIEDE2000** ↓ | **8.31** | 8.98 | 8.37 | 3.25 |
+| SSIM on L\* ↑ | **0.556** | 0.543 | 0.552 | |
+| LPIPS ↓ | **0.535** | 0.543 | 0.532 | |
+| colourfulness, output / photo | 11.99 / 18.63 = 0.64 | 12.48 / 18.63 = **0.67** | 0.61 | 0.93 |
+| ensemble mean of 8: PSNR / CIEDE2000 | 20.28 / 8.04 | 19.87 / 8.43 | 20.31 / 8.16 | |
+| sample spread $`\sigma_{L^\ast}`$ / $`\sigma_{ab}`$ | 2.18 / 1.10 | 3.40 / 1.63 | 2.28 / 1.08 | |
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/test_distributions_dark.png">
+    <img src="docs/images/plots/test_distributions.png" width="900"
+         alt="Histograms of per-frame L* PSNR and CIEDE2000 on the test split. Box-aligned and fallback frames have almost the same distribution, with means of 20.05 and 20.11 dB; the oracle ceiling's distribution, measured on box-aligned val frames, sits well to the right with a mean of 25.13 dB and 3.25 CIEDE2000.">
+  </picture>
+</p>
+
+<p align="center"><sub><b>Figure 2.</b> One value per frame. Box-aligned and fallback test frames are
+indistinguishable, and there is no cluster of catastrophic failures hiding in the mean (PSNR p10
+16.99, p90 23.89). The dashed distribution is the oracle on box-aligned val frames.</sub></p>
+
+The best decile nearly touches the ceiling (CIEDE2000 p10 5.07 against 3.25); the average is
+dragged by the hard decile at 11.56. Fallback pairs, carried at half weight in `L_render` and kept
+out of model selection as a precaution, score the same as box-aligned ones, so the 44% of the data
+aligned by edge correlation alone was free.
 
 <p align="center">
   <img src="docs/images/sheets/best_cases.png" width="900"
@@ -117,48 +557,290 @@ aligned by edge correlation alone.
   <a href="docs/images/sheets/all_test_frames.png"><code>docs/images/sheets/all_test_frames.png</code></a>.</sub>
 </p>
 
-Four things this run settled, each previously an argument: **euler beats midpoint** at NFE 2 on
-every accuracy metric; **bilinear colour upsampling beats BGU at edges** (63% worse) and not only
-on average (42%), answering the colour-bleeding objection; the **DINO attention gates** rose from
-0 to as much as 0.85 while one block fell to 0.34, so the velocity net chose per block where that
-prior helps; and **patch retrieval** reached 0.92 within one patch against 0.49 exactly, showing
-the residual camera offset rather than features that fail to localize, which is why a contrastive
-`L_align` would have hurt.
+### 5.3 Where the 5 dB gap comes from
 
----
+The overfit gate trains the same model on 100 frames and validates on 16 of them: whatever gap
+remains on frames it has *memorised* cannot be generalisation, so it is structural (a 2-step
+generation from noise cannot reproduce an exactly-fitted grid). The rest is generalisation:
 
-## Architecture
+```math
+\underbrace{25.13 - 20.05}_{5.08\ \text{dB, test}}
+\;\approx\;
+\underbrace{26.06 - 23.11}_{2.96\ \text{dB on memorised frames: structural}}
+\;+\;
+\underbrace{2.12\ \text{dB}}_{\text{generalisation}} .
+```
+
+This is a decomposition, not a measurement on one set of frames (the two gaps are measured on
+different frames), so read it as "about 3 dB structural, about 2 dB generalisation". It is the
+reason the overfit gate exists.
+
+### 5.4 Vehicles are the weak point, as predicted
+
+| box-aligned test, Euler | whole frame | vehicle region |
+|---|--:|--:|
+| L\* PSNR, dB | 20.05 | **16.44** |
+| CIEDE2000 | 8.31 | **12.54** |
+| SSIM | 0.556 | **0.374** |
+
+About 50% more colour error on exactly the objects a drone application cares about. Thermal
+carries no paint, so a red car and a blue car are the same input and the model paints the
+statistically likely colour. The vehicle region is the `vehicles` mask (every vehicle, dilated);
+it exists only for box-aligned pairs in this evaluation, so the fallback rows of `report.md`
+(140 dB, 0.000) are placeholders for an empty region, not results.
+
+### 5.5 Uncertainty, measured
 
 <p align="center">
-  <img src="docs/architecture.svg" width="860"
-       alt="Dawn architecture: a LoRA-tuned DINOv3 ViT-S+/16 encoder tower conditions a 6-block DiT velocity tower; the velocity is integrated, unpacked into a brightness grid and an a*b* map, rendered in CIELAB and optionally refined into a daytime RGB frame.">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/per_frame_dark.png">
+    <img src="docs/images/plots/per_frame.png" width="900"
+         alt="Three scatter plots over the 781 box-aligned test frames. Left: per-frame brightness spread against realized L* RMSE, Spearman 0.77, every point far above the spread-equals-error line. Middle: colour spread against CIEDE2000, Spearman 0.76. Right: output colourfulness against the photo's, falling along a line of slope 0.64 rather than the diagonal.">
+  </picture>
 </p>
 
-**Figure 1: the whole model on one sheet**, laid out in the idiom of Figure 1 of *Attention Is All You Need*. The left tower is the conditioning encoder: 12 identical blocks of self-attention (LoRA on qkv and the output projection; everything else frozen) and a gated MLP. The right tower is the generator: 6 DiT blocks in which adaLN-Zero injects the flow time `t` and the residuals are *gated* rather than normalised, so a freshly initialised block is the identity. Blue marks the two routes the thermal conditioning takes: patch tokens **added** to the input tokens alongside the thumbnail and position embedding, and the encoder's own last-layer attention entering **every** block as an additive logit bias behind a per-block gate that starts at 0. Above the generator is everything that is not a network: two Euler steps, the unpack into the only two things the model generates, the render in CIELAB, and the optional stage-2 refiner that touches `L` alone.
+<p align="center"><sub><b>Figure 3.</b> One point per box-aligned test frame (781). Left and middle:
+the frame's mean sample spread against its realized error. Right: colourfulness of Dawn's output
+against the photograph's.</sub></p>
 
-**Reading the figure.** Orange blocks are self-attention, blue are feed-forward, yellow are
-normalisation and the gated residuals, green is conditioning (adaLN-Zero, and the render), and
-grey is what goes in and what comes out. Black arrows carry data, grey arrows a residual around
-a sub-layer, blue arrows the thermal conditioning from encoder to generator, and green arrows
-the flow time `t`.
+Per frame, the spread **ranks** the error well: Spearman ρ = 0.77 between $`\sigma_{L^\ast}`$ and
+the frame's L\* RMSE, and 0.76 between $`\sigma_{ab}`$ and its CIEDE2000 (0.77 and 0.67 on fallback
+frames). It does not **scale**: the mean RMSE is 10.45 L\* against a mean spread of 2.18, so the
+model's disagreement with itself is about **a fifth** of how wrong it is. Midpoint sampling ranks
+slightly better (ρ = 0.83) and understates less (3.3×), because one large step from noise keeps
+more of the noise. A per-frame correlation is weaker evidence than a per-pixel one; the per-pixel
+rank correlation and calibration curve in `dawn/eval/calibration.py` exist but were not part of
+this evaluation.
 
-**The training objective** is four terms, all masked so the invalid warp and the moving vehicles
-never contribute:
+### 5.6 One thread ties the weaknesses together
 
-| Term | What it measures | Weight |
-|---|---|--:|
-| `L_flow` | velocity MSE against `z₁ − z₀`, per token segment | ×1.0 |
-| `L_render` | masked L1 of Lab/100, at 256×320 | ×0.1 |
-| `L_align` | 1 − cos(adapted thermal tokens, frozen RGB tokens) | ×0.5 |
-| `L_color` | per-patch cross-entropy over the 261 a\*b\* bins | ×0.2 |
+| | |
+|---|---|
+| sample spread $`\sigma_{L^\ast}`$ | 2.18 L\*: the eight members barely differ |
+| ensemble mean vs one member | PSNR +0.23 dB, CIEDE2000 −0.28: averaging changes almost nothing |
+| colourfulness | 64% of the photograph where the ceiling is 93% and the overfit run reached 83% |
 
-Two things the sheet cannot show. **The conditioning is detached for the first 3,000 steps**, so LoRA is trained by L_align and L_color alone before it ever feels a velocity gradient, which is then ramped in over 500 steps rather than switched on. And **one encoder pass serves many velocity passes** (`timesteps_per_image` per optimizer step in training, `K × NFE` at inference), which is why K uncertainty samples cost a single DINO pass, and why 40 FPS survives K = 8.
+Three numbers that look independent are one phenomenon: **the model has collapsed toward the
+conditional mean**. It behaves like a regressor emitting one safe answer rather than a generator
+drawing from a distribution of plausible colourings; if its samples were genuinely diverse, their
+spread would be larger *and* averaging them would help far more than 0.23 dB. The duller end of
+the distribution is where it shows most (output p10 colourfulness 4.08 against the photographs'
+8.84), which is what defaulting to grey when the signal is weak looks like. Flow matching was
+chosen to avoid exactly this. The model is useful regardless, but on this evidence the generative
+machinery is not yet earning its keep over a simpler direct predictor, and that is the single most
+interesting finding of the run.
 
-One DINOv3 ViT-S+ pass on the thermal frame (LoRA, rank 8) conditions a 7.6M-parameter velocity transformer that generates, in 2 flow steps, one token per DINO patch: 16 values of its cell's brightness curve (8 thermal-intensity bins × gain and offset, mapping thermal to `L = L*/100`) and 32 values of its 4×4 block of a 128×160 a\*b\* map. The grid is applied at full resolution guided by the thermal; the colour map is upsampled bilinearly; the image is assembled in CIELAB and clipped to the sRGB gamut. Training uses four losses (flow, render, L_align on DINO features, L_color over 261 a\*b\* bins) on pairs whose pixel mask removes the invalid warp and the moving vehicles. Everything about layouts and units is in [`docs/conventions.md`](docs/conventions.md); the design and its reasons are in the plan.
+### 5.7 The refiner
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/refiner_dark.png">
+    <img src="docs/images/plots/refiner.png" width="900"
+         alt="Two line charts over 8,000 refiner steps. Left: refined minus unrefined L* PSNR rises from 0.017 to 0.070 dB on box-aligned val and to 0.040 dB on fallback val. Right: the mean absolute residual the refiner applies rises from 0.15 to 0.32 L*.">
+  </picture>
+</p>
+
+<p align="center"><sub><b>Figure 4.</b> Stage 2 over its 8,000 steps (fp32, 0.06 s/step), on 64 val pairs
+per subset with the <i>fitted</i> grid as input.</sub></p>
+
+The refiner passed its gate: **+0.070 dB** on box-aligned val (23.909 → 23.978 dB) and +0.040 on
+fallback, moving lightness by 0.32 L\* on average, and flattening as its learning rate reached zero. That is
+a real but small sharpening, and it was measured on the fitted grid. Whether it survives the
+generated grid, which is 5 dB worse, is **not measured**: the headline numbers above are stage 1
+alone.
+
+### 5.8 Speed
+
+`scripts/benchmark_latency.py`, RTX 5090, 640×512, NFE 2, K = 8:
+
+| component | GMACs | ms |
+|---|--:|--:|
+| encoder (DINOv3 + LoRA), **once** | 52.3 | 14.25 |
+| velocity × 2 NFE × 8 samples | 179.7 | 8.85 |
+| render (slice, upsample, Lab) | 0.06 | 1.88 |
+| **total per frame** | **232.1** | **24.98 → 40 FPS** |
+
+The encoder is 57% of the cost and runs once per frame regardless of $`K`$; at $`K = 1`$ a frame
+costs about 17 ms (58 FPS).
 
 ---
 
-## Quick start
+## 6. Training dynamics: what the run did on its own
+
+Everything in this section is rebuilt from the CSV mirrors in [`results/`](results/) by
+`python scripts/plot_runs.py`, which also writes every number quoted here to
+[`docs/images/plots/numbers.json`](docs/images/plots/numbers.json).
+
+### 6.1 The attention gates opened themselves
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/gates_dark.png">
+    <img src="docs/images/plots/gates.png" width="900"
+         alt="Six gate values over 20,000 training steps, all starting at zero. Block 4 rises to 0.94 and block 1 to 0.85; blocks 2, 3 and 0 settle at 0.55, 0.50 and 0.42; block 5 rises to 0.51 at step 3,900 and then falls to 0.31. A smaller panel shows the same gates on the 100-frame overfit run, where none exceeds 0.35.">
+  </picture>
+</p>
+
+<p align="center"><sub><b>Figure 5.</b> The six DINO-attention gates g<sub>ℓ</sub> of §2.6, logged every 100 steps
+(live weights). Dark band: LoRA detached from the velocity loss; light band: the 500-step ramp.
+Right: the same six gates in the overfit gate's run (100 frames, 3,000 steps).</sub></p>
+
+The gates start **closed**, at exactly zero, with no pressure to open: the generator could have
+trained to the end ignoring DINO's attention entirely. It did not.
+
+| block $`\ell`$ | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|--:|--:|--:|--:|--:|--:|
+| at step 3,000 (detach lifts) | 0.14 | 0.52 | 0.27 | 0.37 | 0.54 | 0.49 |
+| final, step 20,000 | 0.42 | **0.85** | 0.55 | 0.50 | **0.94** | **0.31** |
+| overfit run, final (3,000 steps) | 0.13 | 0.24 | 0.16 | **0.35** | 0.12 | 0.19 |
+
+Four things stand out:
+
+1. **They opened while the encoder was detached.** By step 3,000, while no velocity gradient had
+   yet reached LoRA, five of the six gates were already between 0.27 and 0.54. This is possible
+   because the gate's gradient (§2.6) flows through the *detached* bias $`\log(A + \epsilon)`$: the
+   generator was learning to use DINO's attention as a fixed prior before it could shape DINO's
+   features.
+2. **Two blocks went nearly all the way.** $`g_4 = 0.94`$ and $`g_1 = 0.85`$ are close to the product
+   of experts at $`g = 1`$: in those blocks the generator's attention is, in effect, its own
+   multiplied by DINO's.
+3. **One block opened and then closed.** $`g_5`$ rose with the others to **0.51 at step 3,900**,
+   400 steps after the ramp finished at 3,500, and then fell for the rest of the run to 0.31. Over
+   the same transition the encoder's gradient norm rose from a median 0.114 in the 1,000 steps
+   before the detach lifted to 0.185 in the 1,000 after the ramp: the encoder had started
+   receiving the generator's gradient. *A hypothesis, not a measurement:* once the patch tokens
+   themselves could be shaped for the velocity loss, the last block needed less of the raw
+   attention prior. Nothing in this run isolates that; the nearest existing test is the parked
+   `plain_schedule` ablation, which flips the detach in one step (and turns the EMA warmup off).
+4. **Memorising does not need them.** On 100 memorised frames the gates stayed between 0.12 and
+   0.35, in a different order (block 4, the most open on the full run, is the least open there).
+   That run is 3,000 steps with its own short schedule, so the comparison is qualitative, but it
+   points the same way as the rest: DINO's attention structure is a prior that pays off when the
+   model has to **generalise** across scenes, not when it can look frames up.
+
+[`docs/results.md`](docs/results.md) quotes the gates over steps 3,300 → 10,000 (block 4
+0.57 → 0.85, block 5 0.50 → 0.34), read off W&B mid-run; the values above are the full run's.
+
+### 6.2 The schedule
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/schedule_dark.png">
+    <img src="docs/images/plots/schedule.png" width="900"
+         alt="Three line charts over 20,000 steps. Learning rate: linear warmup to 2e-4 (1e-4 for LoRA) by step 1,000, then cosine to zero. Velocity gradient into LoRA: zero until step 3,000, linear to one by 3,500. EMA horizon: rising on a log scale to 1,000 steps by about step 9,000.">
+  </picture>
+</p>
+
+<p align="center"><sub><b>Figure 6.</b> The three schedules of §2.8 as logged: the learning rates,
+the velocity-gradient scale s(k), and the EMA horizon 1/(1 − β).</sub></p>
+
+### 6.3 Validation during training
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/validation_dark.png">
+    <img src="docs/images/plots/validation.png" width="900"
+         alt="Four line charts over training on 64 box-aligned val pairs. CIEDE2000 falls from 10.5 to 8.23 for Euler, staying above midpoint's error throughout, against a 3.55 ceiling. L* PSNR rises from 17.8 to 19.5 dB against a 23.9 ceiling. Colourfulness ratio dips during the detached phase and recovers to 0.64 against 0.93. Patch retrieval within one patch reaches 0.87 and exact retrieval 0.46, both almost entirely during the detached phase.">
+  </picture>
+</p>
+
+<p align="center"><sub><b>Figure 7.</b> Sampled image quality on 64 box-aligned val pairs (EMA weights)
+every 500 steps, against the oracle on the same pairs (dashed). Vertical line: the selected
+checkpoint.</sub></p>
+
+* **The detached phase builds the features, not the image.** CIEDE2000 drops from 10.53 to 9.23 in
+  the first 1,000 steps and then sits flat (9.15–9.30) until the detach lifts; colourfulness even
+  falls, 0.61 → 0.52. Meanwhile **patch retrieval** (is each adapted thermal token's nearest frozen
+  RGB token its own?) climbs from 0.70 to 0.865 within one patch by step 3,000, against 0.874 at
+  the end of the run. LoRA learned to see thermal as daylight from $`\mathcal L_\text{align}`$ and
+  $`\mathcal L_\text{color}`$ alone; once the generator's gradient reaches it, image quality starts
+  improving again and does so steadily to the end.
+* **Retrieval rules out a contrastive `L_align`.** Exact retrieval stops at 0.46 while within-one-patch
+  reaches 0.87 (chance 1/1,280): the features localise, off by about one 16-px patch, which is the
+  1–3 px residual camera offset. A contrastive loss that pushed a patch away from its neighbours
+  would punish the model for being right.
+* **Euler beats midpoint at every validation**, on every metric except colourfulness.
+
+### 6.4 Losses, and no memorisation
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/losses_dark.png">
+    <img src="docs/images/plots/losses.png" width="900"
+         alt="Six line charts of training losses against the same objective on held-out box-aligned val pairs. All held-out curves decrease to the end. Held-out exceeds train on the brightness segment of L_flow and on L_render, but matches train on the colour segment.">
+  </picture>
+</p>
+
+<p align="center"><sub><b>Figure 8.</b> Each term of §2.7. Blue: training loss, one batch per point
+(faint) and smoothed; train sees flips and random thermal contrast curves. Orange: the same
+objective on held-out box-aligned val pairs, live weights, 8 batches per point.</sub></p>
+
+The held-out objective is still at its **minimum at the last step** (total 0.928, `L_flow` 0.539),
+so on 3,662 pairs over 87 epochs nothing memorised. Where train and held-out part is informative:
+the brightness segment of `L_flow` is 0.78 on train against 0.93 held-out and `L_render` 0.018
+against 0.025, while the **colour segment matches** (0.32 against 0.34). The brightness half
+generalises imperfectly; the colour half has no gap at all, which fits the collapse of §5.6: a
+model predicting close to the mean colour does as well on unseen frames as on seen ones. The
+brightness segment is also the harder of the two throughout (0.78 against 0.32), which is an
+argument for the open `segment_balance: equal` ablation (per-value balance gives colour's 32 values
+twice brightness's 16), not a measurement of it.
+
+### 6.5 Convergence
+
+The selected checkpoint is step 18,000 (CIEDE2000 8.229), but every validation from step 16,000 to
+20,000 lies within **0.008** of it: the run converged as the cosine learning rate reached zero,
+rather than still improving at the end. The budget was right in the sense that matters (no
+overfitting, no wasted thousands of steps), and a longer run at the same schedule would mostly
+buy a longer tail.
+
+---
+
+## 7. What this run settled
+
+Each of these was an open argument before 8 October 2026; each is now a measurement
+([`docs/results.md`](docs/results.md) has the long form).
+
+| Question | Answer | Evidence |
+|---|---|---|
+| Can a brightness grid carry lightness? | **Yes** | oracle 25.08 dB ≥ the plan's 24 dB rule |
+| Euler or midpoint at NFE 2? | **Euler** | better on every accuracy metric, on both test subsets and at every validation; midpoint is more colourful and noisier |
+| Bilinear or BGU for colour? | **Bilinear, at edges too** | BGU 63% worse at edges against 42% whole-frame; the `bgu` ablation is retired |
+| Does the DINO attention bias earn its place? | **Yes, per block** | gates opened from 0 to 0.31–0.94, differently per block (§6.1) |
+| Contrastive `L_align`? | **No** | retrieval 0.87 within one patch against 0.46 exactly: misses are the camera offset |
+| Keep the fallback pairs? | **Yes** | 20.11 / 8.37 against box-aligned 20.05 / 8.31 at test |
+| `timesteps_per_image: 8` on 32 GB? | **Affordable** | 0.40 s/step, 17.1 GB |
+| Does the refiner earn its place? | **Marginally, on the fitted grid** | +0.070 dB; untested on the generated grid |
+
+Still open, and the two with measured headroom: the **brightness correction**
+(`configs/correction.yaml`: ceiling 25.08 → 26.85 dB, CIEDE2000 3.33 → 2.77; a layout change, so
+its own run) and the **colour-map resolution** (`color.block`), which is what caps the
+colourfulness ceiling at 93%. The full list is in `CLAUDE.md` under *Open decisions*.
+
+---
+
+## 8. Limitations
+
+1. **Invented detail.** Anything without a heat signature (paint, text, lane markings, a car's
+   colour) is guessed. Read the uncertainty maps next to the output.
+2. **A small training set.** 3,662 training pairs: only pairs that pass a strict alignment filter
+   are used, about 63% of the day pairs (35% by boxes alone, the rest through the edge fallback).
+3. **Residual misalignment.** The cameras are not co-registered; pairs are aligned to a pixel or
+   two, and vehicles that moved between the exposures are masked, not fixed.
+4. **Day only.** Night pairs and other thermal cameras are out of scope.
+5. **Colour is washed out on unseen scenes**: 64% of the photograph's colourfulness where the
+   parametrisation allows 93% (§5.6). The clearest target for a next run.
+6. **The uncertainty maps rank, they do not calibrate.** Per frame, ρ = 0.77 with the error, at
+   about a fifth of its size (§5.5). Per-pixel calibration is not yet measured.
+7. **No SSIM or LPIPS ceiling.** `check_oracle.py` measures only L\* PSNR and CIEDE2000, so how much
+   of LPIPS 0.535 is the design's floor is unknown.
+8. **One model, no ablations.** The five in `configs/experiments.yaml` are parked; nothing here
+   compares design choices that were not run, and §6.1's reading of block 5 is a hypothesis.
+
+---
+
+## 9. Reproducing
+
+### 9.1 Install
 
 ```bash
 git clone https://github.com/rzx01/dawn.git
@@ -170,36 +852,45 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 python -c "import torch; print(torch.cuda.get_arch_list())"   # 'sm_120' must be in there
 
 pip install -e ".[dev]"
-```
-
-`pyproject.toml` is the source of truth for what the package requires. For a reproducible training box, `requirements.in` / `requirements-dev.in` are the pip-tools inputs: `pip-compile requirements.in -o requirements.txt`, then `pip-sync`. Torch is deliberately left to the step above in both.
-
-- Python ≥ 3.10, PyTorch ≥ 2.1. The data pipeline runs on CPU.
-- The model phase wants PyTorch built for CUDA 12.8 or newer with `sm_120`. Training is on an **RTX 5090 (32 GB)** (`configs/gpu_5090.yaml`); `flow.yaml`'s defaults still fit the 16 GB RTX 5060 Ti the plan assumes. Same Blackwell architecture either way.
-- DINOv3 weights: the default `timm` backend loaded `vit_small_plus_patch16_dinov3.lvd1689m` without a Hugging Face token on 2026-10-06 (timm's own hosting). The `transformers` backend (`pip install -e ".[transformers]"`) needs the gated [facebook/dinov3-*](https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m) repo: accept its license and `export HF_TOKEN=...`. Either way the DINOv3 license applies. Tests never download weights.
-
-```bash
 pytest                       # CPU only, offline, does not need the dataset
 ruff check dawn scripts tests
 ```
 
----
+- Python ≥ 3.10, PyTorch ≥ 2.1. `pyproject.toml` is the source of truth for requirements;
+  `requirements.in` / `requirements-dev.in` are pip-tools inputs for a reproducible training box
+  (`pip-compile requirements.in -o requirements.txt`, then `pip-sync`). Torch is left to the step
+  above in both.
+- Training was on an **RTX 5090 (32 GB)** with `configs/gpu_5090.yaml`; `flow.yaml`'s defaults
+  still fit the 16 GB RTX 5060 Ti the plan assumes.
+- DINOv3 weights: the default `timm` backend loaded `vit_small_plus_patch16_dinov3.lvd1689m` without
+  a token (timm's own hosting). The `transformers` backend (`pip install -e ".[transformers]"`)
+  needs the gated [facebook/dinov3-*](https://huggingface.co/facebook/dinov3-vits16plus-pretrain-lvd1689m)
+  repo: accept its license and `export HF_TOKEN=...`. Either way the DINOv3 license applies. Tests
+  never download weights.
 
-<details>
-<summary><b>Data preparation</b>: fetching DroneVehicle, the day filter, alignment, dedup</summary>
-
-<br>
+### 9.2 Data
 
 ```bash
 python scripts/fetch_dronevehicle.py        # download ~14 GB, unpack, arrange, verify
 python scripts/prepare_dronevehicle.py all  # stats, day, align, dedup, write
 ```
 
-[McCheng/DroneVehicle](https://huggingface.co/datasets/McCheng/DroneVehicle) is **not** a `datasets`-format repo. It is three zip archives (`train.zip`, `val.zip`, `test.zip`) with no parquet shards and no loading script, so `load_dataset("McCheng/DroneVehicle")` does not work on it. `fetch_dronevehicle.py` downloads them, unpacks them and arranges the result as `data/DroneVehicle/{train,val,test}/{split}img`, `{split}imgr`, `{split}label`, `{split}labelr` (RGB images, thermal images, RGB XML, thermal XML), which is what `configs/data.yaml` expects.
+<details>
+<summary><b>What the pipeline does, stage by stage</b></summary>
 
-The Hub does not document what is inside those archives, so the script **searches** the extracted tree for the four folders by name instead of assuming a path. It does not matter whether a mirror unpacks to `trainimg/`, `train/trainimg/` or deeper. It symlinks rather than copies (the data is 14 GB; `--mode copy` or `--mode move` if you prefer), refuses any archive member that would write outside its own directory, skips an archive that is already unpacked, and finishes by checking that the stems really pair across all four folders and that a sample frame is the 840×712 everything downstream assumes. `--verify` re-runs just those checks; `--archives DIR` uses zips you already have.
+<br>
 
-Then the stages individually, if you want them one at a time:
+[McCheng/DroneVehicle](https://huggingface.co/datasets/McCheng/DroneVehicle) is **not** a
+`datasets`-format repo: it is three zip archives with no loading script, so
+`load_dataset("McCheng/DroneVehicle")` does not work. `fetch_dronevehicle.py` downloads them,
+unpacks them and **searches** the extracted tree for the four folders of each split by name
+(`{split}img`, `{split}imgr`, `{split}label`, `{split}labelr`) rather than assuming a path. It
+symlinks rather than copies (`--mode copy|move` if you prefer), refuses archive members that would
+write outside their directory, skips an archive already unpacked, and finishes by checking that the
+stems pair across all four folders and that a sample frame is 840×712. `--verify` re-runs only the
+checks; `--archives DIR` uses zips you already have. The upstream `train.zip` has 39 members that
+fail their CRC identically across downloads; they are skipped and cost nothing, as every one is in
+a pair the day or alignment filter discards anyway.
 
 ```bash
 python scripts/prepare_dronevehicle.py stats    # per-stem checks, luminance, perceptual hashes (minutes, once)
@@ -210,59 +901,92 @@ python scripts/prepare_dronevehicle.py write    # aligned PNGs, the three manife
 python scripts/audit_alignment.py               # 100 accepted + 100 rejected pairs with thermal edges over the RGB
 ```
 
-What the pipeline does to the 28,411 pairs (840×712 frames with a 100-px white border):
+1. **Crop** the 100-px border: 640×512.
+2. **Day filter** on the median linear luminance of the RGB (`day_filter.min_lum_median: 0.20`).
+   Luminance alone cannot separate day from dusk perfectly; 0.18 was tried and its extra slice was
+   about 15% dusk or night.
+3. **Match** each thermal box to the nearest RGB box of the same class (mutual nearest neighbours).
+   Boxes that are exact copies across the two label files have zero residual by construction and
+   are not evidence.
+4. **Fit** a similarity by RANSAC (a homography only if the similarity's residual alone fails) and
+   **accept** with the thresholds of §3.
+5. **Edge check**: gradient-magnitude correlation between thermal and RGB, independent of the boxes.
+6. **Edge-correlation fallback** for the pairs the boxes cannot judge.
+7. **Warp** the thermal onto the RGB frame with `valid`, `moving` and `vehicles` masks, and write
+   everything once as PNG under `data/dronevehicle_aligned/`.
+8. **Dedup**: a val/test pair whose RGB *and* thermal perceptual hashes are both within 6 bits of
+   the same train pair is dropped (3 pairs).
 
-1. **Crop** the border: 640×512.
-2. **Day filter** on the median linear luminance of the RGB (`day_filter.min_lum_median`). Luminance alone cannot separate day from dusk perfectly: a few percent of the admitted frames are dusk or night.
-3. **Match** each thermal box to the nearest RGB box of the same class (mutual nearest neighbours); boxes that are exact copies across the two label files are not evidence and are left out.
-4. **Fit** a similarity transform by RANSAC (a homography only if the similarity's residual alone fails), and **accept** only with enough matches, inlier ratio, a small median residual, and sane scale, rotation and shift.
-5. **Edge check**: gradient-magnitude correlation between thermal and RGB, independent of the boxes. It only rejects pairs that are more than about 3 px off or clearly worse after the warp.
-6. **Edge-correlation fallback** for the pairs the boxes cannot judge (copied labels, too few vehicles): a global translation estimated from the same edge correlation, accepted only with a clear single peak and agreeing image quadrants. These pairs are listed separately and carry no moving mask; a `vehicles` mask (every vehicle, dilated) covers for it.
-7. **Warp** the thermal onto the RGB frame (the RGB is never resampled), with a validity mask and a moving-vehicle mask, and write everything once as PNG under `data/dronevehicle_aligned/`.
-
-Outputs that are committed: `data/manifests/{train,val,test}_pairs.txt` (the final lists) and `data/manifests/logs/{day,align,dedup}.csv` plus `summary.md` (every decision, with the fitted transform of every pair). Everything bulky stays in `data/` and `outputs/`, which are ignored. Re-running is idempotent; `--force` redoes finished work.
-
-The aligned pairs are served by `dawn.data.pairs.AlignedPairs` (thermal `(1, 512, 640)` = code / 255, linear RGB `(3, 512, 640)`, a `valid`, a `moving` and a `vehicles` mask, a `fallback` flag; flips and a random thermal contrast curve in training). Conventions, coordinate systems and every definition are in [`docs/conventions.md`](docs/conventions.md).
-
-</details>
-
-<details>
-<summary><b>The oracle</b>: the measured ceiling any model of this shape could reach</summary>
-
-<br>
-
-`scripts/check_oracle.py` fits the best possible brightness grid and colour map to each real val pair, renders them with the same code the trainer validates with, and compares with the RGB. On all 345 val pairs at 640×512 (194 box-aligned, 151 fallback; `outputs/oracle/report.md` has p10/p50/p90 and each subset):
-
-| What | Mean |
-|---|---|
-| Brightness grid alone, L\* PSNR (peak 100), plain fit / refine 1 | 24.6 dB / 25.1 dB |
-| Grid + generated 128×160 L correction (bilinear), refine 1 | 26.9 dB |
-| Colour ceiling: true a\*b\* at 128×160, brought back up, mean \|Δa\*b\*\| (bilinear / best bilateral guided upsampling) | 0.90 / 1.28 |
-| Assembled oracle image, grid only, bilinear colour: CIEDE2000 | 3.33 |
-
-These are the **best any model could do with this parametrization**, not results. The grid alone is above the plan's 24 dB bar; the correction is off by default pending the worst-10% sheet (`outputs/oracle/worst10_grid_only_*.jpg`: cluttered yards, rubble, painted containers and roofs, and shadows, i.e. fine texture and surface paint that thermal does not carry). Bilateral guided upsampling, as the plan specifies, was worse than bilinear at every grid swept, so `color.upsample` is `bilinear` (`bgu` stays as a switch).
+Committed: `data/manifests/{train,val,test}_pairs.txt`, `fallback_pairs.txt` and
+`data/manifests/logs/{day,align,dedup}.csv` plus `summary.md` (every decision, with every pair's
+fitted transform). Every threshold lives in `configs/data.yaml`. Re-running is idempotent; `--force`
+redoes finished work. The pairs are served by `dawn.data.pairs.AlignedPairs`.
 
 </details>
 
+### 9.3 The oracle
+
+```bash
+python scripts/check_oracle.py      # the ceiling on all val pairs -> outputs/oracle/report.md + worst-10% sheets (CPU is fine)
+```
+
+The worst-10% sheets (`outputs/oracle/worst10_grid_only_*.jpg`) are cluttered yards, rubble,
+painted containers and roofs, and shadows: fine texture and surface paint that thermal does not
+carry.
+
+### 9.4 Training
+
+```bash
+python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu     # 40 steps on real pairs, ~30 s
+python scripts/train_flow.py --config configs/flow.yaml --override configs/mps.yaml --device mps --overfit 100   # Mac, fp32, half resolution
+python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_5090.yaml \
+    --device cuda --out-dir runs/baseline                                                              # the real run
+python scripts/train_refiner.py --device cuda --out-dir runs/refiner                                  # stage 2: 8K steps, fp32
+```
+
+Resume with `--resume runs/baseline/flow_last.pt`. Per step the trainer logs each loss, each
+term's share of the total, per-module gradient norms, the conditioning ramp and the attention
+gates; per validation, for box-aligned and fallback pairs separately, L\* PSNR, CIEDE2000 and
+colourfulness at NFE 2 (Euler and midpoint) next to their oracle, patch retrieval, and the training
+objective on held-out pairs. Everything that goes to W&B is also written under `--out-dir` as
+`train_log.jsonl`, `metrics/<kind>.csv` and `run_config.json`.
+
 <details>
-<summary><b>Training</b>: the real run, the one-command campaign, the GPU gates, stage 2</summary>
+<summary><b>The GPU gates by hand, and how to spend memory</b></summary>
 
 <br>
 
 ```bash
-python scripts/check_oracle.py                                   # the ceiling, on the val pairs (CPU is fine, minutes)
-python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu   # 40 steps, real pairs
-python scripts/train_flow.py --config configs/flow.yaml --override configs/mps.yaml --device mps --overfit 100   # Mac, fp32
-python scripts/train_flow.py --config configs/flow.yaml --device cuda   # the real run: batch 16 x 4 timesteps, bf16, 20K steps
+# 0. PyTorch built for CUDA 12.8+ with sm_120
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())"
+
+# 1. real weights, shapes, LoRA targets; peak VRAM of the encoder and the velocity net
+python scripts/smoke_dino.py --backend timm --batch-size 16
+
+# 2. the 50-step probe of the real configuration, BEFORE an overnight run. DINO's attention reaches
+#    the velocity net as a float mask, so SDPA cannot use a flash kernel; this tells you the cost.
+python scripts/train_flow.py --config configs/flow.yaml \
+    --override configs/gpu_probe.yaml configs/gpu_5090.yaml \
+    --device cuda --max-steps 50 --out-dir outputs/gpu_probe
+
+# 3. overfit-100 at full resolution: render L* PSNR must reach 85% of the matching oracle
+python scripts/train_flow.py --config configs/flow.yaml --override configs/overfit_gpu.yaml \
+    --device cuda --overfit 100 --out-dir outputs/overfit_gpu/off
 ```
 
-`flow.yaml` is the real configuration (20K steps, a 3K-step detach warmup ramped in over 500, batch 16 × 4, bf16 on CUDA only); overlays (`debug`, `mps`, `gpu_probe`, `overfit_gpu`, `correction`, `gpu_5090`) change a few keys each.
+**Spend spare VRAM on `flow.timesteps_per_image`, never on `optim.batch_size`.** Total work per
+epoch is `3,662 × 45 GMAC × 2 passes` of DINO plus `3,662 × timesteps × 10 GMAC` of velocity, and
+neither term contains the batch size: raising it only trades step count for step size. At batch
+128 the 87-epoch budget is 2,500 steps, *below* `flow.warmup_steps`, so the detach would never lift
+and the run would look healthy the whole way. If you do change the batch, rescale
+`flow.num_train_steps`, `flow.warmup_steps`, `flow.warmup_ramp_steps`, `logging.val_every` and
+`logging.save_every` with it; the start-of-run `Budget:` line prints the result in epochs.
+[`docs/training_budget_and_changes.md`](docs/training_budget_and_changes.md) §1, 1a and 1b have
+the reasoning.
 
-Validation runs every 500 steps (40 points over the run) and logs, for box-aligned and fallback pairs separately: full-resolution L\* PSNR, CIEDE2000 and colorfulness at NFE 2 (Euler and midpoint) next to the oracle and the gap to it, colorfulness as a ratio of the ground truth's, the patch-retrieval diagnostic, and the **training objective itself on held-out pairs**, the curve that shows memorization. Per step it logs each loss, each term's share of the total, per-module gradient norms, the conditioning ramp and the attention gates. `flow_best.pt` follows CIEDE2000 on the box-aligned subset, not L\* PSNR, because L\* is mostly the brightness grid and is blind to colour going wrong.
+</details>
 
-Everything that goes to Weights & Biases is also written under `--out-dir`: `train_log.jsonl`, `metrics/<kind>.csv` and `run_config.json`, so the plots can be rebuilt without it. Details and the reasoning: [`docs/training_budget_and_changes.md`](docs/training_budget_and_changes.md) §1a, §1b and §3.
-
-### One command for the whole campaign
+### 9.5 The whole campaign, one command
 
 ```bash
 python scripts/run_pipeline.py --list      # what would run, in order, with the GPU-hours
@@ -271,94 +995,58 @@ python scripts/run_pipeline.py --yes       # run it
 python scripts/run_pipeline.py --summary   # the comparison table, at any point
 ```
 
-`configs/experiments.yaml` declares the campaign and nothing else decides what runs. The default is the **essentials**: four gates, one stage-1 run, the refiner, and evaluation on the test split, about **10 GPU-hours**, one night, and it produces a shippable model plus the numbers for the README.
+`configs/experiments.yaml` declares the campaign and nothing else decides what runs. The default is
+the **essentials** of §4 (four gates, one stage-1 run, the refiner, test evaluation): about 10
+GPU-hours budgeted, 3.2 h measured on the 5090.
 
 | | stages | GPU-hours |
 |---|---|---|
-| **default** (essentials) | 7 | **~10**, one night |
-| default + `configs/fast.yaml` | 7 | ~7, an evening |
-| `--ablations` (research) | 12 | ~49, two days |
+| **default** (essentials) | 7 | **~10** budgeted, 3.2 measured |
+| default + `--extra-override configs/fast.yaml` | 7 | ~7 |
+| `--ablations` (research) | 12 | ~49 |
 
-The five ablations are **parked**, not deleted: they buy knowledge about the method rather than a better model. Run one on its own later if a curve makes you curious (`--only correction`), not as a matter of course. Three of the five answer an open decision in `CLAUDE.md`; `bgu` re-opens one the oracle already settled on measured numbers and `one_cycle` is not an open decision at all, so weigh those two before spending ~16 GPU-hours.
+- **It refuses to start without the data.** The manifests are committed but the 5,385 × 5 PNGs are
+  not, so a preflight checks both before anything else.
+- **Gates really gate**, and a finished stage is still judged on a re-run.
+- **Resumable and idempotent.** A finished stage is skipped, a half-finished run resumes; the record
+  is `runs/pipeline_state.json` and every stage streams to `runs/logs/<stage>.log`.
+- **One knob per ablation.** `correction`, `one_cycle`, `segment_equal`, `bgu` and `plain_schedule`
+  are each the baseline plus exactly one overlay (`tests/test_configs.py` pins that). They are
+  parked: they buy knowledge about the method, not a better model. Run one alone with
+  `--only correction`.
 
-- **It refuses to start without the data.** A preflight checks the manifests and the aligned PNGs before anything else, because the manifests are committed and the 5,385 × 5 PNGs are not. On a fresh clone that is the first thing that would otherwise fail, a minute into an overnight run.
-- **Gates really gate.** The oracle's 24 dB rule and "the overfit run must approach its own oracle" stop the campaign, and the failure prints what to do rather than only what broke.
-- **Resumable and idempotent.** A finished stage is skipped; a half-finished run restarts with `--resume`. Dying at 4 a.m. keeps everything that finished, and a finished stage is still judged: a gate whose check fails stops the re-run too, rather than being skipped as done. The record is `runs/pipeline_state.json`, and every stage streams to `runs/logs/<stage>.log`.
-- **The cost is measured, not guessed.** `gpu_probe` measures seconds/step on the real configuration and every later estimate is rescaled from it.
-- **One knob per ablation.** `baseline` first and alone; `correction`, `one_cycle`, `segment_equal`, `bgu` and `plain_schedule` are each the baseline plus exactly one overlay, so a difference is attributable. `tests/test_configs.py` pins that rule against the shipped file.
-
-`--only`, `--skip`, `--from`, `--ablations` and `--no-gates` select what runs; `--keep-going` carries on past a failed run (never past a failed gate). `--skip refiner` drops stage 2, which the plan lists first in its own cut order.
-
-**If one night is still too long**, `configs/fast.yaml` applies to every stage at once:
-
-```bash
-python scripts/run_pipeline.py --extra-override configs/fast.yaml --yes   # ~7 h
-```
-
-52 epochs instead of 87 and `timesteps_per_image` back to 4, with every step-denominated knob rescaled with the budget so the *shape* of the schedule is unchanged.
-
-**Note what is not on that list: `optim.batch_size`.** Total work per epoch is `3,662 × 45 GMAC × 2 passes` (DINO, fixed) plus `3,662 × timesteps × 10 GMAC` (velocity). Neither term contains the batch size, so raising it cannot save time; at a fixed epoch count it is half as many steps costing twice as much. What it does buy is fewer optimizer steps, and on 3,662 pairs that goes bad fast: batch 128 at the same epochs is 2,500 steps, *below* `flow.warmup_steps`, so the conditioning detach would never lift and the run would look healthy the whole way. The levers that work are epochs, timesteps, and how many runs you do.
-
-### GPU gate commands, by hand
-
-What the pipeline runs for you, in case you want one of them on its own. Each is a gate for the next. The Mac cannot measure VRAM at 640×512. Add `configs/gpu_5090.yaml` to every `--override` below if you are on the 32 GB card.
+### 9.6 Inference and evaluation
 
 ```bash
-# 0. setup: PyTorch built for CUDA 12.8+ with sm_120
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_arch_list())"
-
-# 1. real weights, shapes, LoRA targets; peak VRAM of the encoder (batch 16) and the velocity net (16 x 4)
-python scripts/smoke_dino.py --backend timm --batch-size 16
-
-# 2. THE 50-STEP PROBE of the real configuration: peak VRAM and seconds/step, BEFORE an overnight run.
-#    DINO's attention reaches the velocity net as a float mask, so PyTorch has to pick an attention
-#    kernel that keeps 1,280-token attention affordable; this tells you. On 16 GB, if it runs out of
-#    memory, put `optim: {batch_size: 8}` in a small YAML and add it to --override (the 8 x 4
-#    fallback). On the 5090 the overlay DOUBLES timesteps_per_image, so probe it as it will run.
-python scripts/train_flow.py --config configs/flow.yaml \
-    --override configs/gpu_probe.yaml configs/gpu_5090.yaml \
-    --device cuda --max-steps 50 --out-dir outputs/gpu_probe
-
-# 3. overfit-100 at full resolution, both modes: render L* PSNR must approach the matching oracle
-python scripts/train_flow.py --config configs/flow.yaml --override configs/overfit_gpu.yaml \
-    --device cuda --overfit 100 --out-dir outputs/overfit_gpu/off
-python scripts/train_flow.py --config configs/flow.yaml --override configs/overfit_gpu.yaml configs/correction.yaml \
-    --device cuda --overfit 100 --out-dir outputs/overfit_gpu/on
-
-# 4. the real run (resume with --resume checkpoints/run1/flow_last.pt)
-python scripts/train_flow.py --config configs/flow.yaml --override configs/gpu_5090.yaml \
-    --device cuda --out-dir checkpoints/run1
+python scripts/infer.py --checkpoint runs/baseline/flow_best.pt --input frames/ --device cuda    # RGB + l_std + ab_std maps, K=8
+python scripts/infer.py --checkpoint runs/baseline/flow_best.pt \
+    --refiner runs/refiner/refiner_best.pt --input frame.jpg --device cuda                       # with stage 2
+python scripts/evaluate.py --checkpoint runs/baseline/flow_best.pt --split test_pairs \
+    --device cuda --output runs/evaluation                                                        # -> report.md, summary.json, per_pair.csv
+python scripts/benchmark_latency.py --checkpoint runs/baseline/flow_best.pt --device cuda --samples 8
 ```
 
-Use the probe's seconds/step to sanity-check `logging.val_every` (500 by default): validation
-should stay a few percent of wall-clock.
+What each piece does and why: [`docs/inference_eval_phase.md`](docs/inference_eval_phase.md).
 
-### Stage 2: the optional refiner
+### 9.7 The figures on this page
 
 ```bash
-python scripts/train_refiner.py --device cuda --out-dir checkpoints/refiner   # 8K steps, ~35 epochs
-python scripts/infer.py --checkpoint checkpoints/run1/flow_best.pt \
-    --refiner checkpoints/refiner/refiner_best.pt --input frame.jpg
+python scripts/plot_runs.py                                            # results/ -> docs/images/plots/
+python scripts/plot_runs.py --runs runs --export results \
+    --oracle outputs/oracle                                            # refresh results/ from a new campaign first
 ```
 
-A 2,545-parameter depthwise-separable CNN on `L` only (inputs: the brightness grid's `L` and the
-thermal), bounded as `L + 0.1·tanh(residual)` so it can sharpen but not invent, with a 9×9
-receptive field, far smaller than a vehicle, which is the point. Colour is untouched.
+`results/` is a campaign's `runs/` with the checkpoints left out: the CSV mirrors and
+`run_config.json` of every run, the evaluation's `report.md`, `summary.json` and `per_pair.csv`, the
+oracle's report and per-pair rows, and `pipeline_state.json` (1.4 MB in all). Every figure is
+rendered for light and dark pages, and `numbers.json` holds every number §6 quotes.
 
-Validation answers one question, and the run prints the verdict in words: `psnr_L/improvement`,
-refined minus unrefined on the same val pairs. **If it is not positive the refiner has not earned
-its place**, and the plan lists it first in its own cut order.
+---
 
-One honest caveat, which `docs/proposals_review.md` §8 expands: it trains on the *fitted* (oracle)
-brightness grid but at inference meets the *generated* one, which is worse. That is what the plan
-specifies, and it is what makes stage 2 trainable before stage 1 has ever run. Without `--refiner`,
-inference is byte-identical to stage 1 alone; the uncertainty maps always describe the unrefined
-ensemble.
-
-</details>
+## 10. Project structure
 
 <details>
-<summary><b>Project structure</b>: what lives where</summary>
+<summary><b>What lives where</b></summary>
 
 <br>
 
@@ -367,38 +1055,42 @@ dawn/
 ├── configs/
 │   ├── data.yaml            # DroneVehicle paths and every data threshold (commented)
 │   ├── flow.yaml            # stage 1: resolution, grid, colour, losses, schedule, optimizer
-│   ├── debug.yaml, mps.yaml, gpu_probe.yaml, overfit_gpu.yaml, correction.yaml,
-│   │                        # gpu_5090.yaml (32 GB), abl_*.yaml (one knob each)  # overlays
+│   ├── debug.yaml, mps.yaml, gpu_probe.yaml, overfit_gpu.yaml, correction.yaml, fast.yaml,
+│   │   gpu_5090.yaml (32 GB), abl_*.yaml (one knob each)                    # overlays
 │   ├── refiner.yaml         # stage 2
-│   ├── experiments.yaml     # the whole campaign: gates, baseline, ablations, stage 2, eval
-│   └── eval.yaml            # parked (inference/eval phase)
+│   ├── eval.yaml            # evaluation: subsets, NFE, K, vehicle region
+│   └── experiments.yaml     # the whole campaign: gates, baseline, ablations, stage 2, eval
 ├── docs/
-│   ├── conventions.md       # layouts, coordinates, color spaces, token layout, data rules (read first)
+│   ├── conventions.md       # layouts, coordinates, colour spaces, token layout, data rules (read first)
+│   ├── results.md           # the first run's numbers and what they settled, long form
+│   ├── architecture.svg     # Figure 1
+│   ├── images/plots/        # Figures 2-8, light + dark, and numbers.json (scripts/plot_runs.py)
 │   └── Dawn Night-Vision to Day Colorization for Drone Imagery.md   # the plan / spec
-├── data/manifests/          # {train,val,test}_pairs.txt and logs/ (committed)
+├── data/manifests/          # {train,val,test}_pairs.txt, fallback_pairs.txt, logs/ (committed)
+├── results/                 # the first campaign's telemetry and evaluation, no checkpoints (committed)
 ├── release/visdrone_labels/ # earlier VisDrone day/night hand labels, pending a separate release
 ├── dawn/
 │   ├── data/                # dronevehicle, day_filter, align, dedup, pairs, report, audit, sheets,
 │   │                        # color (sRGB, CIELAB), resample (area_downsample), seeding
-│   ├── grid/                # layout (gain/offset), guidance (thermal), slice, fit (one-input affine
-│   │                        # grid), upsample (bilinear | BGU), normalize (token standardization)
+│   ├── grid/                # layout, guidance, slice, fit (the affine grid), upsample, normalize
 │   ├── flow/                # tokens (the one token layout), targets, render (the one render path),
-│   │                        # color_bins (261 bins), loss, sampler, trainer, loaders, oracle
-│   ├── models/              # encoder (DINOv3 + LoRA, thermal in), velocity (DiT), color_head,
-│   │                        # refiner (stage 2: bounded local sharpener on L)
-│   ├── runlog.py            # W&B + the JSONL / CSV mirrors, shared by both training scripts
-│   ├── eval/metrics.py      # masked L* PSNR, CIEDE2000, colorfulness (the rest is parked)
-│   └── uncertainty/         # parked: sample-spread maps land with the inference phase
+│   │                        # color_bins (261 bins), loss, sampler, trainer, loaders, oracle, inference
+│   ├── models/              # encoder (DINOv3 + LoRA), velocity (DiT + gated attention), color_head, refiner
+│   ├── eval/                # metrics (masked L* PSNR, SSIM, CIEDE2000, colourfulness, LPIPS),
+│   │                        # calibration, visualize
+│   ├── uncertainty/         # spread: the sample-spread maps (§2.9)
+│   ├── pipeline.py          # the testable half of run_pipeline.py
+│   └── runlog.py            # W&B + the JSONL / CSV mirrors, shared by both training scripts
 ├── scripts/
-│   ├── prepare_dronevehicle.py, audit_alignment.py   # data
-│   ├── run_pipeline.py                               # the whole campaign, one command
-│   ├── check_oracle.py, smoke_dino.py, train_flow.py # model phase (stage 1)
-│   ├── train_refiner.py                              # stage 2
-│   └── infer.py, evaluate.py, benchmark_latency.py   # parked
+│   ├── fetch_dronevehicle.py, prepare_dronevehicle.py, audit_alignment.py   # data
+│   ├── check_oracle.py, smoke_dino.py, train_flow.py, train_refiner.py       # model
+│   ├── infer.py, evaluate.py, benchmark_latency.py                            # inference / eval
+│   ├── run_pipeline.py                                                        # the whole campaign
+│   └── plot_runs.py, make_readme_figure.py, make_readme_sheets.py             # this page's figures
 └── tests/                   # CPU, offline; tiny tensors, a tiny fake aligned tree, random-weight DINO
 ```
 
-"Parked" means a stub the inference/eval phase fills in; its `--help` works and nothing else is promised.
+Every script takes `--help`, and so does every subcommand of `prepare_dronevehicle.py`.
 
 </details>
 
@@ -408,50 +1100,51 @@ dawn/
 
 | Part | State |
 |---|---|
-| Data pipeline | Done. Run on the real data: 5,385 aligned pairs out of 28,411 |
-| Model and training code | Done. One 20K-step run, RTX 5090, 8 October 2026 |
-| Inference, uncertainty, evaluation | Done. Run on the trained model, the numbers above |
-| Stage 2 refiner | Built and tested, **not trained**. One number decides whether it ships |
-| Ablations | Not run. Five are parked in `configs/experiments.yaml` |
-
-<details>
-<summary>Part by part, with the files</summary>
-
-<br>
-
-| Part | State |
-|---|---|
-| Data pipeline (DroneVehicle read, day filter, box-matched alignment, dedup, masks, aligned PNGs, dataset) | **Works.** Implemented, tested and run on the real data |
-| Alignment audit (contact sheets, fit histograms) | Works; thresholds are starting values awaiting the maintainer's decision |
-| Model code (DINO encoder with LoRA, velocity transformer on 1,280 tokens, brightness grid, colour map, the four losses, sampler, trainer, validation metrics) | **Done, tested and trained.** The debug and overfit gates were run first; the full 20K-step run finished on an RTX 5090 on 8 October 2026 |
-| Brightness / colour oracle (`scripts/check_oracle.py`) | **Measured** on all 345 val pairs; the ceiling is under **The oracle** above |
-| Inference and the uncertainty maps | **Works, run on the trained model.** `scripts/infer.py`, `dawn/uncertainty/spread.py` (the spread of K samples, in L\* and a\*b\* units) and `dawn/flow/inference.py` were tested against random weights first, then run for real |
-| Evaluation, calibration, latency | **Works, run on the trained model** (the numbers above). `scripts/{evaluate,benchmark_latency}.py`, `configs/eval.yaml` and `dawn/eval/{metrics,calibration,visualize}.py`: L\* PSNR and SSIM, CIEDE2000, colorfulness, LPIPS, the uncertainty rank correlation, comparison sheets and per-component GMACs. See [`docs/inference_eval_phase.md`](docs/inference_eval_phase.md) |
-| The optional refiner (the plan's stage 2) | **Built and tested; nothing trained.** `dawn/models/refiner.py` (2,545 parameters, a 9×9 field, bounded at ±10 L\*), `scripts/train_refiner.py`, `configs/refiner.yaml`, and `--refiner` in `scripts/infer.py`. Whether it earns its place is one number, `psnr_L/improvement`; the plan still lists it first in its own cut order |
-| Results | **Measured.** One model trained 8 October 2026 on an RTX 5090: 20.05 dB L\* PSNR and 8.31 CIEDE2000 on the 781 box-aligned test pairs, 40 FPS with 8 uncertainty samples. Full numbers and what they settle: [`docs/results.md`](docs/results.md) |
-
-</details>
-
-Few pairs survive the filter: of the 28,411 DroneVehicle pairs, about 8,500 are daytime and 5,385 pass alignment and dedup (3,662 train, 345 val, 1,378 test; `data/manifests/logs/summary.md`). 2,374 of them were aligned by the edge-correlation fallback instead of by boxes, so they are less trustworthy and have no moving mask (`data/manifests/fallback_pairs.txt`); for those a per-vehicle `vehicles` mask (every vehicle, stretched along its heading where it may have moved) stands in for it. Without the fallback it is 3,011. A small training set is the largest risk the plan names, and the audit exists to decide what else to loosen.
+| Data pipeline | **Done**, run on the real data: 5,385 aligned pairs out of 28,439 |
+| Model and training code | **Done**, one 20K-step run on an RTX 5090, 8 October 2026 |
+| Inference, uncertainty, evaluation | **Done**, run on the trained model (§5) |
+| Stage 2 refiner | **Trained**, passed its gate at +0.070 dB on the fitted grid; not yet evaluated on the generated grid, not in the headline numbers |
+| Per-pixel uncertainty calibration | Implemented (`dawn/eval/calibration.py`), **not yet run**; per-frame ρ = 0.77 is measured (§5.5) |
+| Ablations | Not run; five are parked in `configs/experiments.yaml` |
+| Left to build | `visualize.py` is not wired into `evaluate.py` (`report.num_examples` is read by nothing) |
 
 ---
 
-## Known limitations
+## References
 
-1. **Invented detail.** Anything without a heat signature (paint, text, lane markings, a car's color) is guessed. Read the uncertainty maps next to the output.
-2. **A small training set.** Only the pairs that pass a strict alignment filter are used, and the filter currently keeps about 63% of the day pairs (35% by boxes alone, the rest through the edge fallback). The thresholds are under review.
-3. **Residual misalignment.** The cameras are not co-registered; pairs are aligned to roughly a pixel or two, and vehicles that moved between the exposures are masked, not fixed.
-4. **Day only.** Night pairs and other thermal cameras are out of scope.
-5. **Colour is washed out on unseen scenes.** The model reaches 64% of the real photo's colourfulness where the parametrization's own ceiling is 93%, so it hedges toward desaturated colour when unsure. The clearest target for a future run.
-6. **The uncertainty maps rank, they do not calibrate.** Measured: the sample spread averages 2.2 L\* units against a realized error of ~9.9. They show *where* the model disagrees with itself, which is not the same as how wrong it is (`docs/conventions.md` §11).
-7. **One model, no ablations.** The five in `configs/experiments.yaml` are parked; nothing here compares design choices that were not run.
+- Sun, Cao, Zhu, Hu. *Drone-based RGB-Infrared Cross-Modality Vehicle Detection via
+  Uncertainty-Aware Learning.* IEEE TCSVT, 2022. [arXiv:2003.02437](https://arxiv.org/abs/2003.02437) (DroneVehicle)
+- Siméoni et al. *DINOv3.* 2025. [arXiv:2508.10104](https://arxiv.org/abs/2508.10104)
+- Hu et al. *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR 2022. [arXiv:2106.09685](https://arxiv.org/abs/2106.09685)
+- Lipman, Chen, Ben-Hamu, Nickel, Le. *Flow Matching for Generative Modeling.* ICLR 2023. [arXiv:2210.02747](https://arxiv.org/abs/2210.02747)
+- Liu, Gong, Liu. *Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow.* ICLR 2023. [arXiv:2209.03003](https://arxiv.org/abs/2209.03003)
+- Peebles, Xie. *Scalable Diffusion Models with Transformers.* ICCV 2023. [arXiv:2212.09748](https://arxiv.org/abs/2212.09748)
+- Chen, Paris, Durand. *Real-time Edge-Aware Image Processing with the Bilateral Grid.* SIGGRAPH 2007.
+- Gharbi, Chen, Barron, Hasinoff, Durand. *Deep Bilateral Learning for Real-Time Image Enhancement.* SIGGRAPH 2017.
+- Chen, Adams, Wadhwa, Hasinoff. *Bilateral Guided Upsampling.* SIGGRAPH Asia 2016.
+- Zhang, Isola, Efros. *Colorful Image Colorization.* ECCV 2016.
+- Sharma, Wu, Dalal. *The CIEDE2000 Color-Difference Formula.* Color Research & Application, 2005.
+- Hasler, Süsstrunk. *Measuring Colourfulness in Natural Images.* SPIE Human Vision and Electronic Imaging, 2003.
+- Zhang, Isola, Efros, Shechtman, Wang. *The Unreasonable Effectiveness of Deep Features as a Perceptual Metric.* CVPR 2018 (LPIPS).
 
----
+## Citation
+
+```bibtex
+@software{dawn2026,
+  title  = {Dawn: Day Thermal to Colour for Drone Imagery},
+  author = {NotArsenic@Github, rzx01@Github},
+  year   = {2026},
+  url    = {https://github.com/rzx01/dawn}
+}
+```
 
 ## License
 
 The code is MIT (see `LICENSE`). Three things are not covered by it:
 
-- **DroneVehicle.** Its license terms have not been checked yet. Do not release aligned pairs, manifests derived from it or checkpoints trained on it until they are.
+- **DroneVehicle.** Its license terms have not been checked yet. Do not release aligned pairs,
+  manifests derived from it or checkpoints trained on it until they are. The per-pair rows in
+  `results/` name DroneVehicle image IDs and carry no image content.
 - **DINOv3 weights** are gated and have their own license; accept it on Hugging Face before use.
-- **VisDrone labels** in `release/visdrone_labels/` are our own hand labels of VisDrone-DET frames and wait for a separate release; the images are not included and VisDrone's terms apply to them.
+- **VisDrone labels** in `release/visdrone_labels/` are our own hand labels of VisDrone-DET frames and
+  wait for a separate release; the images are not included and VisDrone's terms apply to them.
