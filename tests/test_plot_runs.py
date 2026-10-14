@@ -1,0 +1,160 @@
+"""Tests for scripts/plot_runs.py: the README figures and numbers rebuilt from the CSV mirrors."""
+
+import csv
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("matplotlib")
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "plot_runs.py"
+WARMUP, RAMP, TOTAL = 30, 10, 100
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location("plot_runs", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _flow_run(root: Path, name: str) -> None:
+    run = root / name
+    run.mkdir(parents=True)
+    flow = {"warmup_steps": WARMUP, "warmup_ramp_steps": RAMP, "num_train_steps": TOTAL}
+    (run / "run_config.json").write_text(json.dumps({"flow": flow}), encoding="utf-8")
+    train = []
+    for step in range(0, TOTAL, 10):
+        row = {"step": step}
+        for i in range(5):
+            row[f"gate/gate_{i}"] = step / TOTAL * (i + 1) / 6
+        row["gate/gate_5"] = 0.5 - abs(step - 40) / 100  # rises to a peak at step 40, then falls
+        for key in ("flow_brightness", "flow_color", "render", "align", "color", "total"):
+            row[f"loss/{key}"] = 1.0 / (1 + step)
+        row.update(
+            {
+                "loss/lr_main": 2e-4,
+                "loss/lr_lora": 1e-4,
+                "loss/ema_decay": 0.9,
+                "loss/cond_scale": min(1.0, max(0.0, (step - WARMUP + 1) / RAMP)),
+                "grad/encoder": 0.1 if step < WARMUP else 0.2,
+            }
+        )
+        train.append(row)
+    _write_csv(run / "metrics" / "train.csv", train)
+    val, valloss = [], []
+    for step in range(10, TOTAL + 1, 10):
+        row = {"step": step}
+        prefix = "val_box_aligned/"
+        for method, offset in (("euler", 0.0), ("midpoint", 0.5), ("oracle", -3.0)):
+            row[f"{prefix}ciede2000/{method}"] = 9.0 - step / 100 + offset
+            row[f"{prefix}psnr_L/{method}"] = 18.0 + step / 100 - offset
+        for method in ("euler", "midpoint", "oracle"):
+            row[f"{prefix}colorfulness/ratio_{method}"] = 0.6
+        row[f"{prefix}retrieval/top1"] = 0.4
+        row[f"{prefix}retrieval/within_1"] = 0.8
+        val.append(row)
+        loss_row = {"step": step}
+        for key in ("flow_brightness", "flow_color", "render", "align", "color", "total"):
+            loss_row[f"valloss_box_aligned/loss/{key}"] = 1.0 / (1 + step)
+        valloss.append(loss_row)
+    val[-3][f"{prefix}ciede2000/euler"] = 0.0  # the best checkpoint is the third-to-last point
+    _write_csv(run / "metrics" / "val_box_aligned.csv", val)
+    _write_csv(run / "metrics" / "valloss_box_aligned.csv", valloss)
+
+
+def _tree(root: Path) -> None:
+    _flow_run(root, "baseline")
+    _flow_run(root, "overfit")
+    pairs = []
+    for subset in ("box_aligned", "fallback"):
+        for method in ("euler", "midpoint"):
+            for i in range(12):
+                pairs.append(
+                    {
+                        "subset": subset,
+                        "method": method,
+                        "psnr": 25.0 - i,
+                        "ciede2000": 3.0 + i,
+                        "l_std": 1.0 + 0.1 * i,
+                        "ab_std": 0.5 + 0.05 * i,
+                        "colorfulness": 10.0,
+                        "colorfulness_target": 20.0,
+                    }
+                )
+    _write_csv(root / "evaluation" / "per_pair.csv", pairs)
+    refiner = [
+        {
+            "step": s,
+            "val_box_aligned/psnr_L/improvement": s / 1000,
+            "val_box_aligned/residual/abs_mean_Lstar": 0.3,
+        }
+        for s in (100, 200)
+    ]
+    _write_csv(root / "refiner" / "metrics" / "val_box_aligned.csv", refiner)
+    oracle = [
+        {"fallback": i % 2 == 1, "psnr_grid_r1": 25.0, "de_grid_only_bilinear": 3.0}
+        for i in range(6)
+    ]
+    (root / "oracle").mkdir()
+    (root / "oracle" / "rows_val.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in oracle) + "\n", encoding="utf-8"
+    )
+
+
+def test_every_figure_is_written_in_both_themes_with_its_numbers(tmp_path):
+    runs, out = tmp_path / "runs", tmp_path / "plots"
+    _tree(runs)
+    _load_script().main(["--runs", str(runs), "--out", str(out), "--dpi", "30"])
+    names = (
+        "gates",
+        "schedule",
+        "losses",
+        "validation",
+        "per_frame",
+        "test_distributions",
+        "refiner",
+    )
+    for name in names:
+        assert (out / f"{name}.png").stat().st_size > 0, name
+        assert (out / f"{name}_dark.png").stat().st_size > 0, name
+
+    numbers = json.loads((out / "numbers.json").read_text(encoding="utf-8"))
+    assert numbers["schedule"] == {
+        "warmup_steps": WARMUP,
+        "ramp_steps": RAMP,
+        "num_train_steps": TOTAL,
+    }
+    assert numbers["gates"]["block_5"]["peak_step"] == 40, (
+        "a gate that turns back is found at its peak"
+    )
+    assert numbers["gates"]["block_5"]["final"] < numbers["gates"]["block_5"]["peak"]
+    assert numbers["validation"]["best_step"] == 80, "best is the lowest CIEDE2000, not the last"
+    assert numbers["encoder_grad_norm"]["1k_after_ramp"] == pytest.approx(0.2)
+    frame = numbers["per_frame"]["box_aligned/euler"]
+    assert frame["spearman_l_std_vs_lstar_rmse"] == pytest.approx(1.0), "spread grows with error"
+    assert frame["colourfulness_ratio_of_means"] == pytest.approx(0.5)
+
+
+def test_export_copies_only_the_small_files(tmp_path):
+    runs, dest = tmp_path / "runs", tmp_path / "results"
+    _tree(runs)
+    (runs / "baseline" / "flow_best.pt").write_bytes(b"not copied")
+    (runs / "evaluation" / "report.md").write_text("# Evaluation\n", encoding="utf-8")
+    module = _load_script()
+    module.export(runs, dest, oracle=runs / "oracle")
+    assert (dest / "baseline" / "metrics" / "train.csv").exists()
+    assert (dest / "baseline" / "run_config.json").exists()
+    assert (dest / "evaluation" / "report.md").exists()
+    assert (dest / "oracle" / "rows_val.jsonl").exists()
+    assert not list(dest.rglob("*.pt")), "checkpoints stay out of the committed results"

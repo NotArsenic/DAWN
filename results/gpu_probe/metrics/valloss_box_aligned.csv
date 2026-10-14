@@ -1,0 +1,2 @@
+step,valloss_box_aligned/loss/flow,valloss_box_aligned/loss/flow_brightness,valloss_box_aligned/loss/flow_color,valloss_box_aligned/loss/render,valloss_box_aligned/loss/align,valloss_box_aligned/loss/color,valloss_box_aligned/loss/total,valloss_box_aligned/num_images
+50,2.1674866676330566,2.4162579774856567,2.0431007742881775,0.053018346428871155,0.19673720747232437,5.929950952529907,3.4571473598480225,8.0

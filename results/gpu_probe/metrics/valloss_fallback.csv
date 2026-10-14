@@ -1,0 +1,2 @@
+step,valloss_fallback/loss/flow,valloss_fallback/loss/flow_brightness,valloss_fallback/loss/flow_color,valloss_fallback/loss/render,valloss_fallback/loss/align,valloss_fallback/loss/color,valloss_fallback/loss/total,valloss_fallback/num_images
+50,2.519900321960449,2.0972042083740234,2.731248140335083,0.026020805351436138,0.20559290796518326,5.832867622375488,3.7918723821640015,8.0

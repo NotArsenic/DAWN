@@ -1,0 +1,53 @@
+{
+  "stages": {
+    "gpu_probe": {
+      "status": "ok",
+      "seconds": 214.5,
+      "returncode": 0,
+      "detail": "",
+      "finished_at": "2026-10-08 19:33:55"
+    },
+    "smoke_dino": {
+      "status": "ok",
+      "seconds": 9.0,
+      "returncode": 0,
+      "detail": "",
+      "finished_at": "2026-10-08 19:35:32"
+    },
+    "oracle": {
+      "status": "ok",
+      "seconds": 54.0,
+      "returncode": 0,
+      "detail": "psnr_grid_r1 25.08 dB over 345 pairs (needs >= 24.0)",
+      "finished_at": "2026-10-08 19:36:26"
+    },
+    "overfit": {
+      "status": "ok",
+      "seconds": 1616.5,
+      "returncode": 0,
+      "detail": "psnr_L/euler 23.106 vs psnr_L/oracle 26.061 (needs >= 85%)",
+      "finished_at": "2026-10-08 20:03:23"
+    },
+    "baseline": {
+      "status": "ok",
+      "seconds": 9014.9,
+      "returncode": 0,
+      "detail": "",
+      "finished_at": "2026-10-08 22:33:37"
+    },
+    "refiner": {
+      "status": "ok",
+      "seconds": 528.0,
+      "returncode": 0,
+      "detail": "psnr_L/improvement 0.0695 (needs >= 0.0)",
+      "finished_at": "2026-10-08 22:42:25"
+    },
+    "evaluation": {
+      "status": "ok",
+      "seconds": 249.1,
+      "returncode": 0,
+      "detail": "",
+      "finished_at": "2026-10-08 22:46:35"
+    }
+  }
+}
