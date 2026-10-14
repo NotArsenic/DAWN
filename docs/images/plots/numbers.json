@@ -62,6 +62,72 @@
     "block_4": 0.117,
     "block_5": 0.185
   },
+  "gate_gradient_snapshots": {
+    "turn_step": 3900,
+    "block_0": {
+      "opening_before_turn": "5/8",
+      "closing_after_turn": "10/32"
+    },
+    "block_1": {
+      "opening_before_turn": "8/8",
+      "closing_after_turn": "11/32"
+    },
+    "block_2": {
+      "opening_before_turn": "6/8",
+      "closing_after_turn": "14/32"
+    },
+    "block_3": {
+      "opening_before_turn": "6/8",
+      "closing_after_turn": "14/32"
+    },
+    "block_4": {
+      "opening_before_turn": "8/8",
+      "closing_after_turn": "13/32"
+    },
+    "block_5": {
+      "opening_before_turn": "8/8",
+      "closing_after_turn": "23/32"
+    }
+  },
+  "weight_distributions": {
+    "first_snapshot_step": 400,
+    "last_snapshot_step": 19800,
+    "adaln_weight_std": [
+      0.00149,
+      0.00885
+    ],
+    "output_proj_weight_std": [
+      0.00488,
+      0.0173
+    ],
+    "qkv_weight_std": [
+      0.0363,
+      0.0384
+    ],
+    "adaln_grad_std": [
+      0.00081,
+      3.84e-05
+    ],
+    "adaln_grad_snapshot_steps": [
+      400,
+      19900
+    ]
+  },
+  "gradient_shrink": {
+    "early_step": 2400,
+    "adaln": {
+      "by_early_step": 7.1,
+      "overall": 21.1
+    },
+    "output_proj": {
+      "by_early_step": 4.5,
+      "overall": 16.5
+    },
+    "qkv": {
+      "by_early_step": 3.7,
+      "overall": 5.9
+    }
+  },
   "per_frame": {
     "box_aligned/euler": {
       "frames": 781,

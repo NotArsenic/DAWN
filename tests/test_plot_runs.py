@@ -1,10 +1,13 @@
-"""Tests for scripts/plot_runs.py: the README figures and numbers rebuilt from the CSV mirrors."""
+"""Tests for scripts/plot_runs.py: the README figures and numbers rebuilt from local telemetry."""
 
 import csv
 import importlib.util
 import json
+import struct
+import zlib
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 pytest.importorskip("matplotlib")
@@ -73,9 +76,42 @@ def _flow_run(root: Path, name: str) -> None:
     _write_csv(run / "metrics" / "valloss_box_aligned.csv", valloss)
 
 
-def _tree(root: Path) -> None:
+HIST_STEPS = list(range(10, TOTAL, 10))
+TURN = 40  # gate 5's peak in _flow_run
+
+
+def _histograms(module, root: Path) -> None:
+    """Weights that fan out, gradients that shrink, and gate gradients that turn at TURN."""
+    steps = np.array(HIST_STEPS)
+    grow, shrink = steps / TOTAL, 1.0 - steps / (2 * TOTAL)
+    counts = np.tile(np.exp(-(np.linspace(-3, 3, 64) ** 2)), (len(steps), 1)) * 1000
+    hist = {}
+    for name in module.HIST_TENSORS:
+        if name.endswith("dino_gate"):
+            opening = -1e-3 * np.ones(len(steps))
+            if name == "blocks.5.dino_gate":
+                opening = np.where(steps <= TURN, -1e-3, 1e-3)
+            for kind, values in (("parameters", grow), ("gradients", opening)):
+                hist[f"{kind}/{name}"] = {
+                    "steps": steps,
+                    "counts": np.ones((len(steps), 64), dtype=np.int64),
+                    "bins": np.repeat(values[:, None], 65, axis=1).astype(np.float32),
+                }
+            continue
+        for kind, width in (("parameters", 0.01 * grow), ("gradients", 1e-3 * shrink)):
+            hist[f"{kind}/{name}"] = {
+                "steps": steps,
+                "counts": counts.astype(np.int64),
+                "bins": (width[:, None] * np.linspace(-1, 1, 65)).astype(np.float32),
+            }
+    module.save_histograms(hist, root / "baseline" / "histograms.npz")
+
+
+def _tree(root: Path, module=None) -> None:
     _flow_run(root, "baseline")
     _flow_run(root, "overfit")
+    if module is not None:
+        _histograms(module, root)
     pairs = []
     for subset in ("box_aligned", "fallback"):
         for method in ("euler", "midpoint"):
@@ -114,10 +150,12 @@ def _tree(root: Path) -> None:
 
 def test_every_figure_is_written_in_both_themes_with_its_numbers(tmp_path):
     runs, out = tmp_path / "runs", tmp_path / "plots"
-    _tree(runs)
-    _load_script().main(["--runs", str(runs), "--out", str(out), "--dpi", "30"])
+    module = _load_script()
+    _tree(runs, module)
+    module.main(["--runs", str(runs), "--out", str(out)])
     names = (
         "gates",
+        "distributions",
         "schedule",
         "losses",
         "validation",
@@ -126,8 +164,8 @@ def test_every_figure_is_written_in_both_themes_with_its_numbers(tmp_path):
         "refiner",
     )
     for name in names:
-        assert (out / f"{name}.png").stat().st_size > 0, name
-        assert (out / f"{name}_dark.png").stat().st_size > 0, name
+        assert (out / f"{name}.svg").stat().st_size > 0, name
+        assert (out / f"{name}_dark.svg").stat().st_size > 0, name
 
     numbers = json.loads((out / "numbers.json").read_text(encoding="utf-8"))
     assert numbers["schedule"] == {
@@ -144,6 +182,49 @@ def test_every_figure_is_written_in_both_themes_with_its_numbers(tmp_path):
     frame = numbers["per_frame"]["box_aligned/euler"]
     assert frame["spearman_l_std_vs_lstar_rmse"] == pytest.approx(1.0), "spread grows with error"
     assert frame["colourfulness_ratio_of_means"] == pytest.approx(0.5)
+    turns = numbers["gate_gradient_snapshots"]
+    assert turns["turn_step"] == TURN
+    assert turns["block_5"] == {"opening_before_turn": "4/4", "closing_after_turn": "5/5"}
+    assert turns["block_0"]["closing_after_turn"] == "0/5"
+    weights = numbers["weight_distributions"]
+    assert weights["adaln_weight_std"][1] > weights["adaln_weight_std"][0], "the weights fan out"
+    assert numbers["gradient_shrink"]["adaln"]["overall"] > 1.0, "the gradients shrink"
+
+
+def _leveldb_log(path: Path, payloads: list[bytes]) -> None:
+    """Write payloads in the .wandb framing: 32 KiB blocks, records split across them, padding."""
+    block, header = 32768, 7
+    out = bytearray(struct.pack("<4sHB", b":W&B", 0xBEE1, 0))
+    for payload in payloads:
+        first = True
+        while True:
+            left = block - len(out) % block
+            if left < header:
+                out.extend(b"\x00" * left)
+                left = block
+            chunk, payload = payload[: left - header], payload[left - header :]
+            kind = (1 if not payload else 2) if first else (3 if payload else 4)
+            crc = zlib.crc32(chunk, zlib.crc32(bytes([kind]))) & 0xFFFFFFFF
+            out.extend(struct.pack("<IHB", crc, len(chunk), kind) + chunk)
+            first = False
+            if not payload:
+                break
+    path.write_bytes(bytes(out))
+
+
+def test_the_wandb_log_reader_reassembles_records_across_blocks(tmp_path):
+    module = _load_script()
+    # 32,751 bytes leaves 3 at the end of the first block: too few for a header, so it is padding.
+    payloads = [b"a" * 32751, b"small", b"x" * 70000, b"", b"last"]
+    path = tmp_path / "run.wandb"
+    _leveldb_log(path, payloads)
+    assert list(module.wandb_records(path)) == payloads
+
+    corrupt = bytearray(path.read_bytes())
+    corrupt[20] ^= 0xFF
+    path.write_bytes(bytes(corrupt))
+    with pytest.raises(ValueError, match="checksum"):
+        list(module.wandb_records(path))
 
 
 def test_export_copies_only_the_small_files(tmp_path):

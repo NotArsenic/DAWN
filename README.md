@@ -74,7 +74,7 @@ The most interesting thing the run did by itself is in its **attention gates**: 
 initialised at zero, that decide how strongly each generator block follows DINO's own attention.
 All six opened, two of them nearly fully (0.94 and 0.85); one opened and then **closed again**
 as soon as the encoder began to receive the generator's gradient; and on 100 memorised frames
-none of them opened much ([§6.1](#61-the-attention-gates-opened-themselves)).
+none of them opened much ([Section 6.1](#61-the-attention-gates-opened-themselves)).
 
 <details>
 <summary><b>Contents</b></summary>
@@ -84,7 +84,7 @@ none of them opened much ([§6.1](#61-the-attention-gates-opened-themselves)).
 3. [Data](#3-data)
 4. [Experimental setup](#4-experimental-setup) and the campaign's gates
 5. [Results](#5-results): ceiling, test metrics, the gap, vehicles, uncertainty, colour, refiner, speed
-6. [Training dynamics](#6-training-dynamics-what-the-run-did-on-its-own): attention gates, schedule, validation, losses, convergence
+6. [Training dynamics](#6-training-dynamics-what-the-run-did-on-its-own): attention gates and their gradients, schedule, validation, losses, weight and gradient distributions, convergence
 7. [What this run settled](#7-what-this-run-settled)
 8. [Limitations](#8-limitations)
 9. [Reproducing](#9-reproducing): install, data, oracle, training, the campaign, inference, the figures
@@ -100,7 +100,7 @@ none of them opened much ([§6.1](#61-the-attention-gates-opened-themselves)).
 Input: a daytime thermal frame $`T \in [0,1]^{H\times W}`$ (the camera's 8-bit codes / 255,
 never gamma-converted). Output: the paired daytime photograph $`y`$ (linear RGB). The two
 cameras are a few centimetres apart and expose at slightly different times, so training pairs
-are only as good as their alignment ([§3](#3-data)).
+are only as good as their alignment ([Section 3](#3-data)).
 
 Two observations shape the whole design:
 
@@ -108,7 +108,7 @@ Two observations shape the whole design:
    vegetation each have a fairly stable relation between how warm they are and how bright they
    look, but that relation changes across the frame. A per-region curve of thermal can therefore
    explain most of the lightness, and how much it explains can be *measured* before any model is
-   trained (the oracle, [§5.1](#51-the-ceiling)).
+   trained (the oracle, [Section 5.1](#51-the-ceiling)).
 2. **Colour is ambiguous.** Nothing in a heat image says whether a car is red or blue. A
    regressor averages the possibilities into grey-brown; a generative model can commit to one
    plausible answer. Colour is the half that gets the generative machinery.
@@ -158,7 +158,7 @@ green the flow time.</sub>
 
 One frame costs **one** DINO pass and $`\text{NFE}\times K`$ passes of the small velocity net
 ($`2\times 8`$ at inference). That asymmetry is the main structural bet: eight uncertainty
-samples cost about 8 ms more than one, not eight times as much ([§5.8](#58-speed)).
+samples cost about 8 ms more than one, not eight times as much ([Section 5.8](#58-speed)).
 
 ### 2.2 Brightness: an affine bilateral grid on thermal
 
@@ -169,7 +169,7 @@ g = \mathrm{clamp}\big(\mathrm{box}_{5\times 5}(T),\ 0,\ 1\big)
 ```
 
 with replicate padding and no log or contrast stretch: thermal is not photon-starved like a dark
-photograph, and a per-frame p1–p99 stretch bought only +0.06 dB because thermal already spans most
+photograph, and a per-frame p1 to p99 stretch bought only +0.06 dB because thermal already spans most
 of $`[0, 1]`$. The grid
 $`\Gamma \in \mathbb{R}^{2\times K\times g_y\times g_x}`$ holds a gain $`a_n`$ and an offset
 $`b_n`$ at every node $`n = (k, i, j)`$: intensity bin $`k`$, cell row $`i`$, cell column $`j`$.
@@ -201,7 +201,7 @@ coarser fit so that empty or sparse bins stay sensible:
 \;+\; \lambda_n\Big[(a - \bar a_{c(n)})^2 + (b - \bar b_{c(n)})^2\Big],
 ```
 
-where $`m`$ is the pixel mask ([§3](#3-data)), $`(\bar a_c, \bar b_c)`$ is the same fit for
+where $`m`$ is the pixel mask ([Section 3](#3-data)), $`(\bar a_c, \bar b_c)`$ is the same fit for
 the node's whole cell (all bins pooled), which is itself pulled toward the whole-image fit, and
 $`\lambda_n = 10^{-3}`$ times the mean node weight. Each is a 2×2 system with a closed form. The
 per-node solve treats every node as if it alone explained its pixels, while the render blends
@@ -324,7 +324,7 @@ gradient reaches the encoder through this path, but the gate itself always gets 
 
 where $`S^{(\ell)}`$ are block $`\ell`$'s attention logits, and it carries no weight decay. Nothing
 forces a gate open: starting at 0, the generator is free to never use DINO's attention.
-[§6.1](#61-the-attention-gates-opened-themselves) shows what it chose.
+[Section 6.1](#61-the-attention-gates-opened-themselves) shows what it chose.
 
 ### 2.7 Training objective
 
@@ -335,7 +335,7 @@ Four terms, all masked so that invalid warp pixels and moving vehicles never con
 ```
 
 **Render.** The one-step estimate of the clean tokens, rendered at 256×320 and compared with the
-photograph in CIELAB (fallback-aligned pairs, [§3](#3-data), count half: $`\rho_b = 0.5`$):
+photograph in CIELAB (fallback-aligned pairs, [Section 3](#3-data), count half: $`\rho_b = 0.5`$):
 
 ```math
 \hat z_1 = z_t + (1 - t)\,v_\theta(z_t, t, c), \qquad
@@ -379,7 +379,7 @@ where $`\mathrm{sg}`$ is stop-gradient. AdamW, peak learning rate $`2\times10^{-
 clip 1.0, bf16 autocast. The EMA used for validation and the checkpoints warms up as
 $`\beta_n = \min\big(0.999,\ \tfrac{1+n}{10+n}\big)`$, so early validations measure trained
 weights rather than the initialisation. One encoder pass feeds 8 timesteps per image, so a step
-of 16 images is 128 velocity samples. The curves are in [§6.2](#62-the-schedule).
+of 16 images is 128 velocity samples. The curves are in [Section 6.2](#62-the-schedule).
 
 ### 2.9 Uncertainty from samples
 
@@ -395,7 +395,7 @@ their spread, on rendered L\*a\*b\* (never on tokens), unbiased:
 $`\sigma_{ab}`$ is a chroma distance on the same scale as a CIEDE2000, so the two can be ranked
 against each other. There is no variance head and no calibration target: a spread is a
 *disagreement*, not an error bar, and how well it tracks the error is measured, not assumed
-([§5.5](#55-uncertainty-measured)). The image to *display* is one member, not the ensemble mean,
+([Section 5.5](#55-uncertainty-measured)). The image to *display* is one member, not the ensemble mean,
 which is smoother and less colourful.
 
 ### 2.10 Stage 2: the local refiner
@@ -450,7 +450,7 @@ vehicles whose own residual says they moved between the exposures, and `vehicles
 pairs, where nothing is known about motion) masks every vehicle, stretched 17.4 px along its
 heading where it may have moved: 12% of a frame on average. Counts at every stage:
 [`data/manifests/logs/summary.md`](data/manifests/logs/summary.md). The pipeline itself is in
-[§9.2](#92-data).
+[Section 9.2](#92-data).
 
 ---
 
@@ -467,11 +467,11 @@ heading where it may have moved: 12% of a frame on average. Counts at every stag
 | Model selection | lowest CIEDE2000 on box-aligned val (`logging.select_metric`), not L\* PSNR, which is mostly the thermal-fitted grid and blind to colour going wrong |
 | Test | 1,378 test pairs, reported separately for 781 box-aligned (the headline) and 597 fallback |
 | Config | [`configs/flow.yaml`](configs/flow.yaml) + [`configs/gpu_5090.yaml`](configs/gpu_5090.yaml), saved with every run as `run_config.json` |
-| Telemetry | W&B `my-team/dawn` (run `gvg887ou`) and `my-team/dawn-refiner` (`jb9zzar1`); every metric is mirrored locally, and the copies in [`results/`](results/) are what this page is built from |
+| Telemetry | every logged metric is mirrored beside the run as CSV and JSONL; the copies in [`results/`](results/) are what this page is built from |
 
 ### The campaign and its gates
 
-The run is one command, `scripts/run_pipeline.py --yes` ([§9.5](#95-the-whole-campaign-one-command)),
+The run is one command, `scripts/run_pipeline.py --yes` ([Section 9.5](#95-the-whole-campaign-one-command)),
 and each stage is a gate for the next. A failed gate stops the campaign with a message that says
 what to do.
 
@@ -483,7 +483,7 @@ what to do.
 | `overfit` | can the model memorise 100 frames? | **23.11 dB** against their 26.06 dB oracle (88.7%) | ≥ 85% | 27 min |
 | `baseline` | the real run | best at step 18,000 | | 2.5 h |
 | `refiner` | does stage 2 help? | **+0.070 dB** over the unrefined grid | ≥ 0 | 8.8 min |
-| `evaluation` | the test split | [§5.2](#52-test-results) | | 4.2 min |
+| `evaluation` | the test split | [Section 5.2](#52-test-results) | | 4.2 min |
 
 All seven passed: **3.2 h end to end**. The record is
 [`results/pipeline_state.json`](results/pipeline_state.json).
@@ -532,8 +532,8 @@ peak at 100 and is masked like the losses; LPIPS (AlexNet) is whole-frame and un
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/test_distributions_dark.png">
-    <img src="docs/images/plots/test_distributions.png" width="900"
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/test_distributions_dark.svg">
+    <img src="docs/images/plots/test_distributions.svg" width="900"
          alt="Histograms of per-frame L* PSNR and CIEDE2000 on the test split. Box-aligned and fallback frames have almost the same distribution, with means of 20.05 and 20.11 dB; the oracle ceiling's distribution, measured on box-aligned val frames, sits well to the right with a mean of 25.13 dB and 3.25 CIEDE2000.">
   </picture>
 </p>
@@ -593,8 +593,8 @@ it exists only for box-aligned pairs in this evaluation, so the fallback rows of
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/per_frame_dark.png">
-    <img src="docs/images/plots/per_frame.png" width="900"
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/per_frame_dark.svg">
+    <img src="docs/images/plots/per_frame.svg" width="900"
          alt="Three scatter plots over the 781 box-aligned test frames. Left: per-frame brightness spread against realized L* RMSE, Spearman 0.77, every point far above the spread-equals-error line. Middle: colour spread against CIEDE2000, Spearman 0.76. Right: output colourfulness against the photo's, falling along a line of slope 0.64 rather than the diagonal.">
   </picture>
 </p>
@@ -634,8 +634,8 @@ interesting finding of the run.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/refiner_dark.png">
-    <img src="docs/images/plots/refiner.png" width="900"
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/refiner_dark.svg">
+    <img src="docs/images/plots/refiner.svg" width="900"
          alt="Two line charts over 8,000 refiner steps. Left: refined minus unrefined L* PSNR rises from 0.017 to 0.070 dB on box-aligned val and to 0.040 dB on fallback val. Right: the mean absolute residual the refiner applies rises from 0.15 to 0.32 L*.">
   </picture>
 </p>
@@ -667,23 +667,29 @@ costs about 17 ms (58 FPS).
 
 ## 6. Training dynamics: what the run did on its own
 
-Everything in this section is rebuilt from the CSV mirrors in [`results/`](results/) by
-`python scripts/plot_runs.py`, which also writes every number quoted here to
-[`docs/images/plots/numbers.json`](docs/images/plots/numbers.json).
+Everything in this section is rebuilt from [`results/`](results/) by `python scripts/plot_runs.py`,
+which also writes every number quoted here to
+[`docs/images/plots/numbers.json`](docs/images/plots/numbers.json). The curves come from the
+per-step CSV mirrors. The weight and gradient histograms (Figure 5c, Figure 9) are the ones
+`wandb.watch` recorded for the velocity net (64 bins; weights at 51 snapshots, gradients at 40,
+every 400 to 500 steps), extracted from the run's local log into `results/baseline/histograms.npz`.
 
 ### 6.1 The attention gates opened themselves
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/gates_dark.png">
-    <img src="docs/images/plots/gates.png" width="900"
-         alt="Six gate values over 20,000 training steps, all starting at zero. Block 4 rises to 0.94 and block 1 to 0.85; blocks 2, 3 and 0 settle at 0.55, 0.50 and 0.42; block 5 rises to 0.51 at step 3,900 and then falls to 0.31. A smaller panel shows the same gates on the 100-frame overfit run, where none exceeds 0.35.">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/gates_dark.svg">
+    <img src="docs/images/plots/gates.svg" width="900"
+         alt="Panel a: six gate values over 20,000 training steps, all starting at zero. Block 4 rises to 0.94 and block 1 to 0.85; blocks 2, 3 and 0 settle at 0.55, 0.50 and 0.42; block 5 rises to 0.51 at step 3,900 and then falls to 0.31. Panel b: the same gates on the 100-frame overfit run, where none exceeds 0.35. Panel c: a heat map of the gradient on each gate over training, blue where a descent step opens the gate and red where it closes it; block 5's row is blue until about step 3,900 and mostly red after.">
   </picture>
 </p>
 
-<p align="center"><sub><b>Figure 5.</b> The six DINO-attention gates g<sub>ℓ</sub> of §2.6, logged every 100 steps
-(live weights). Dark band: LoRA detached from the velocity loss; light band: the 500-step ramp.
-Right: the same six gates in the overfit gate's run (100 frames, 3,000 steps).</sub></p>
+<p align="center"><sub><b>Figure 5.</b> (a) The six DINO-attention gates g<sub>ℓ</sub> of Section 2.6, logged
+every 100 steps (live weights), coloured by depth. Dark band: LoRA detached from the velocity loss;
+light band: the 500-step ramp. (b) The same gates in the overfit gate's run (100 frames, 3,000
+steps). (c) The gradient on each gate, −∂L/∂g<sub>ℓ</sub>, one training batch per column on a
+symmetric-log colour scale: blue means a descent step opens the gate, red that it closes it.
+Dashed line: the detach lifts; dotted line: g<sub>5</sub> peaks.</sub></p>
 
 The gates start **closed**, at exactly zero, with no pressure to open: the generator could have
 trained to the end ignoring DINO's attention entirely. It did not.
@@ -698,7 +704,7 @@ Four things stand out:
 
 1. **They opened while the encoder was detached.** By step 3,000, while no velocity gradient had
    yet reached LoRA, five of the six gates were already between 0.27 and 0.54. This is possible
-   because the gate's gradient (§2.6) flows through the *detached* bias $`\log(A + \epsilon)`$: the
+   because the gate's gradient (Section 2.6) flows through the *detached* bias $`\log(A + \epsilon)`$: the
    generator was learning to use DINO's attention as a fixed prior before it could shape DINO's
    features.
 2. **Two blocks went nearly all the way.** $`g_4 = 0.94`$ and $`g_1 = 0.85`$ are close to the product
@@ -708,7 +714,11 @@ Four things stand out:
    400 steps after the ramp finished at 3,500, and then fell for the rest of the run to 0.31. Over
    the same transition the encoder's gradient norm rose from a median 0.114 in the 1,000 steps
    before the detach lifted to 0.185 in the 1,000 after the ramp: the encoder had started
-   receiving the generator's gradient. *A hypothesis, not a measurement:* once the patch tokens
+   receiving the generator's gradient. The gate's own gradient shows the turn directly (Figure 5c):
+   in **all 8** gradient snapshots up to step 3,900 it pushed $`g_5`$ open, and in **23 of the 32**
+   after it pushed it closed, against 10 to 14 of 32 for each of the other five blocks. The late
+   gradients are small and the learning rate is annealing to zero, consistent with $`g_5`$
+   settling at 0.31 rather than collapsing. *Why* it turned is a hypothesis, not a measurement: once the patch tokens
    themselves could be shaped for the velocity loss, the last block needed less of the raw
    attention prior. Nothing in this run isolates that; the nearest existing test is the parked
    `plain_schedule` ablation, which flips the detach in one step (and turns the EMA warmup off).
@@ -719,37 +729,37 @@ Four things stand out:
    model has to **generalise** across scenes, not when it can look frames up.
 
 [`docs/results.md`](docs/results.md) quotes the gates over steps 3,300 → 10,000 (block 4
-0.57 → 0.85, block 5 0.50 → 0.34), read off W&B mid-run; the values above are the full run's.
+0.57 → 0.85, block 5 0.50 → 0.34), read mid-run; the values above are the full run's.
 
 ### 6.2 The schedule
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/schedule_dark.png">
-    <img src="docs/images/plots/schedule.png" width="900"
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/schedule_dark.svg">
+    <img src="docs/images/plots/schedule.svg" width="900"
          alt="Three line charts over 20,000 steps. Learning rate: linear warmup to 2e-4 (1e-4 for LoRA) by step 1,000, then cosine to zero. Velocity gradient into LoRA: zero until step 3,000, linear to one by 3,500. EMA horizon: rising on a log scale to 1,000 steps by about step 9,000.">
   </picture>
 </p>
 
-<p align="center"><sub><b>Figure 6.</b> The three schedules of §2.8 as logged: the learning rates,
+<p align="center"><sub><b>Figure 6.</b> The three schedules of Section 2.8 as logged: the learning rates,
 the velocity-gradient scale s(k), and the EMA horizon 1/(1 − β).</sub></p>
 
 ### 6.3 Validation during training
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/validation_dark.png">
-    <img src="docs/images/plots/validation.png" width="900"
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/validation_dark.svg">
+    <img src="docs/images/plots/validation.svg" width="900"
          alt="Four line charts over training on 64 box-aligned val pairs. CIEDE2000 falls from 10.5 to 8.23 for Euler, staying above midpoint's error throughout, against a 3.55 ceiling. L* PSNR rises from 17.8 to 19.5 dB against a 23.9 ceiling. Colourfulness ratio dips during the detached phase and recovers to 0.64 against 0.93. Patch retrieval within one patch reaches 0.87 and exact retrieval 0.46, both almost entirely during the detached phase.">
   </picture>
 </p>
 
 <p align="center"><sub><b>Figure 7.</b> Sampled image quality on 64 box-aligned val pairs (EMA weights)
-every 500 steps, against the oracle on the same pairs (dashed). Vertical line: the selected
-checkpoint.</sub></p>
+every 500 steps. Blue circles: Euler; red squares: midpoint; dashed: the oracle on the same pairs.
+Dotted line: the selected checkpoint. (d) Patch retrieval, green within one patch, yellow exact.</sub></p>
 
 * **The detached phase builds the features, not the image.** CIEDE2000 drops from 10.53 to 9.23 in
-  the first 1,000 steps and then sits flat (9.15–9.30) until the detach lifts; colourfulness even
+  the first 1,000 steps and then sits flat (9.15 to 9.30) until the detach lifts; colourfulness even
   falls, 0.61 → 0.52. Meanwhile **patch retrieval** (is each adapted thermal token's nearest frozen
   RGB token its own?) climbs from 0.70 to 0.865 within one patch by step 3,000, against 0.874 at
   the end of the run. LoRA learned to see thermal as daylight from $`\mathcal L_\text{align}`$ and
@@ -757,7 +767,7 @@ checkpoint.</sub></p>
   improving again and does so steadily to the end.
 * **Retrieval rules out a contrastive `L_align`.** Exact retrieval stops at 0.46 while within-one-patch
   reaches 0.87 (chance 1/1,280): the features localise, off by about one 16-px patch, which is the
-  1–3 px residual camera offset. A contrastive loss that pushed a patch away from its neighbours
+  1 to 3 px residual camera offset. A contrastive loss that pushed a patch away from its neighbours
   would punish the model for being right.
 * **Euler beats midpoint at every validation**, on every metric except colourfulness.
 
@@ -765,27 +775,55 @@ checkpoint.</sub></p>
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/losses_dark.png">
-    <img src="docs/images/plots/losses.png" width="900"
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/losses_dark.svg">
+    <img src="docs/images/plots/losses.svg" width="900"
          alt="Six line charts of training losses against the same objective on held-out box-aligned val pairs. All held-out curves decrease to the end. Held-out exceeds train on the brightness segment of L_flow and on L_render, but matches train on the colour segment.">
   </picture>
 </p>
 
-<p align="center"><sub><b>Figure 8.</b> Each term of §2.7. Blue: training loss, one batch per point
-(faint) and smoothed; train sees flips and random thermal contrast curves. Orange: the same
-objective on held-out box-aligned val pairs, live weights, 8 batches per point.</sub></p>
+<p align="center"><sub><b>Figure 8.</b> Each term of Section 2.7. Grey: training loss, one batch per point;
+black: smoothed. Training sees flips and random thermal contrast curves. Blue: the same objective
+on held-out box-aligned val pairs, live weights, 8 batches per point.</sub></p>
 
 The held-out objective is still at its **minimum at the last step** (total 0.928, `L_flow` 0.539),
 so on 3,662 pairs over 87 epochs nothing memorised. Where train and held-out part is informative:
 the brightness segment of `L_flow` is 0.78 on train against 0.93 held-out and `L_render` 0.018
 against 0.025, while the **colour segment matches** (0.32 against 0.34). The brightness half
-generalises imperfectly; the colour half has no gap at all, which fits the collapse of §5.6: a
+generalises imperfectly; the colour half has no gap at all, which fits the collapse of Section 5.6: a
 model predicting close to the mean colour does as well on unseen frames as on seen ones. The
 brightness segment is also the harder of the two throughout (0.78 against 0.32), which is an
 argument for the open `segment_balance: equal` ablation (per-value balance gives colour's 32 values
 twice brightness's 16), not a measurement of it.
 
-### 6.5 Convergence
+### 6.5 Weight and gradient distributions
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/plots/distributions_dark.svg">
+    <img src="docs/images/plots/distributions.svg" width="900"
+         alt="Six heat maps of value distributions over training. Top row, weights: the adaLN-Zero modulation weights and the output projection start as a thin line at zero and fan out steadily over the run; the randomly initialised attention qkv weights start wide and barely change. Bottom row, gradients on a symmetric log axis: all three narrow sharply in the first 2,000 steps and then stay roughly constant, with batch-to-batch striping.">
+  </picture>
+</p>
+
+<p align="center"><sub><b>Figure 9.</b> The velocity net's weight (top) and gradient (bottom) distributions over
+training, from the run's <code>wandb.watch</code> histograms; each column is one snapshot, scaled so its
+densest bin is 1. (a) The 12 adaLN-Zero modulation projections pooled, (b) the output projection,
+both initialised at exactly zero; (c) the 6 attention <i>W<sub>qkv</sub></i> matrices pooled, randomly
+initialised. Gradients use a symmetric-log axis. Dashed line: the detach lifts.</sub></p>
+
+The attention gates are one instance of a pattern that runs through the whole generator: **the
+paths that start closed are where the learning shows.** adaLN-Zero initialises every block's
+shift, scale and residual gate to zero, so each block starts as the identity; their weights fan
+out from a spike at zero to a standard deviation of 1.5×10⁻³ by step 400 and 8.9×10⁻³ by step
+19,800 (Figure 9a), and the zero-initialised output projection grows from 4.9×10⁻³ to 1.7×10⁻²
+(9b). The randomly initialised attention weights, by contrast, end where they began: 3.63×10⁻² to
+3.84×10⁻², a 6% change (9c). The gradients (9d to 9f) shrink fastest early, by 3.7 to 7.1× over
+the first 2,400 steps, and slowly after that (the adaLN gradients from 8.1×10⁻⁴ at step 400 to
+3.8×10⁻⁵ at step 19,900, 21× in all), with the batch-to-batch striping of single-batch
+snapshots. There is no visible change in them when the detach lifts, as expected: these are the
+velocity net's own parameters, which receive the velocity loss from the first step.
+
+### 6.6 Convergence
 
 The selected checkpoint is step 18,000 (CIEDE2000 8.229), but every validation from step 16,000 to
 20,000 lies within **0.008** of it: the run converged as the cosine learning rate reached zero,
@@ -805,7 +843,7 @@ Each of these was an open argument before 8 October 2026; each is now a measurem
 | Can a brightness grid carry lightness? | **Yes** | oracle 25.08 dB ≥ the plan's 24 dB rule |
 | Euler or midpoint at NFE 2? | **Euler** | better on every accuracy metric, on both test subsets and at every validation; midpoint is more colourful and noisier |
 | Bilinear or BGU for colour? | **Bilinear, at edges too** | BGU 63% worse at edges against 42% whole-frame; the `bgu` ablation is retired |
-| Does the DINO attention bias earn its place? | **Yes, per block** | gates opened from 0 to 0.31–0.94, differently per block (§6.1) |
+| Does the DINO attention bias earn its place? | **Yes, per block** | gates opened from 0 to 0.31 to 0.94, differently per block (Section 6.1) |
 | Contrastive `L_align`? | **No** | retrieval 0.87 within one patch against 0.46 exactly: misses are the camera offset |
 | Keep the fallback pairs? | **Yes** | 20.11 / 8.37 against box-aligned 20.05 / 8.31 at test |
 | `timesteps_per_image: 8` on 32 GB? | **Affordable** | 0.40 s/step, 17.1 GB |
@@ -828,13 +866,13 @@ colourfulness ceiling at 93%. The full list is in `CLAUDE.md` under *Open decisi
    two, and vehicles that moved between the exposures are masked, not fixed.
 4. **Day only.** Night pairs and other thermal cameras are out of scope.
 5. **Colour is washed out on unseen scenes**: 64% of the photograph's colourfulness where the
-   parametrisation allows 93% (§5.6). The clearest target for a next run.
+   parametrisation allows 93% (Section 5.6). The clearest target for a next run.
 6. **The uncertainty maps rank, they do not calibrate.** Per frame, ρ = 0.77 with the error, at
-   about a fifth of its size (§5.5). Per-pixel calibration is not yet measured.
+   about a fifth of its size (Section 5.5). Per-pixel calibration is not yet measured.
 7. **No SSIM or LPIPS ceiling.** `check_oracle.py` measures only L\* PSNR and CIEDE2000, so how much
    of LPIPS 0.535 is the design's floor is unknown.
 8. **One model, no ablations.** The five in `configs/experiments.yaml` are parked; nothing here
-   compares design choices that were not run, and §6.1's reading of block 5 is a hypothesis.
+   compares design choices that were not run, and Section 6.1's reading of block 5 is a hypothesis.
 
 ---
 
@@ -909,7 +947,7 @@ python scripts/audit_alignment.py               # 100 accepted + 100 rejected pa
    Boxes that are exact copies across the two label files have zero residual by construction and
    are not evidence.
 4. **Fit** a similarity by RANSAC (a homography only if the similarity's residual alone fails) and
-   **accept** with the thresholds of §3.
+   **accept** with the thresholds of Section 3.
 5. **Edge check**: gradient-magnitude correlation between thermal and RGB, independent of the boxes.
 6. **Edge-correlation fallback** for the pairs the boxes cannot judge.
 7. **Warp** the thermal onto the RGB frame with `valid`, `moving` and `vehicles` masks, and write
@@ -948,7 +986,7 @@ Resume with `--resume runs/baseline/flow_last.pt`. Per step the trainer logs eac
 term's share of the total, per-module gradient norms, the conditioning ramp and the attention
 gates; per validation, for box-aligned and fallback pairs separately, L\* PSNR, CIEDE2000 and
 colourfulness at NFE 2 (Euler and midpoint) next to their oracle, patch retrieval, and the training
-objective on held-out pairs. Everything that goes to W&B is also written under `--out-dir` as
+objective on held-out pairs. Every metric is written under `--out-dir` as
 `train_log.jsonl`, `metrics/<kind>.csv` and `run_config.json`.
 
 <details>
@@ -981,7 +1019,7 @@ neither term contains the batch size: raising it only trades step count for step
 and the run would look healthy the whole way. If you do change the batch, rescale
 `flow.num_train_steps`, `flow.warmup_steps`, `flow.warmup_ramp_steps`, `logging.val_every` and
 `logging.save_every` with it; the start-of-run `Budget:` line prints the result in epochs.
-[`docs/training_budget_and_changes.md`](docs/training_budget_and_changes.md) §1, 1a and 1b have
+[`docs/training_budget_and_changes.md`](docs/training_budget_and_changes.md) sections 1, 1a and 1b have
 the reasoning.
 
 </details>
@@ -996,7 +1034,7 @@ python scripts/run_pipeline.py --summary   # the comparison table, at any point
 ```
 
 `configs/experiments.yaml` declares the campaign and nothing else decides what runs. The default is
-the **essentials** of §4 (four gates, one stage-1 run, the refiner, test evaluation): about 10
+the **essentials** of Section 4 (four gates, one stage-1 run, the refiner, test evaluation): about 10
 GPU-hours budgeted, 3.2 h measured on the 5090.
 
 | | stages | GPU-hours |
@@ -1032,14 +1070,16 @@ What each piece does and why: [`docs/inference_eval_phase.md`](docs/inference_ev
 
 ```bash
 python scripts/plot_runs.py                                            # results/ -> docs/images/plots/
-python scripts/plot_runs.py --runs runs --export results \
-    --oracle outputs/oracle                                            # refresh results/ from a new campaign first
+python scripts/plot_runs.py --runs runs --export results --oracle outputs/oracle \
+    --wandb-log wandb/run-<id>/run-<id>.wandb                          # refresh results/ from a new campaign first
 ```
 
 `results/` is a campaign's `runs/` with the checkpoints left out: the CSV mirrors and
 `run_config.json` of every run, the evaluation's `report.md`, `summary.json` and `per_pair.csv`, the
-oracle's report and per-pair rows, and `pipeline_state.json` (1.4 MB in all). Every figure is
-rendered for light and dark pages, and `numbers.json` holds every number §6 quotes.
+oracle's report and per-pair rows, `pipeline_state.json`, and `baseline/histograms.npz`, the
+weight and gradient histograms read out of the run's local `.wandb` log (2.0 MB in all; reading the
+log needs the `wandb` package, plotting does not). Every figure is a vector SVG
+rendered for light and dark pages, and `numbers.json` holds every number Section 6 quotes.
 
 ---
 
@@ -1064,7 +1104,7 @@ dawn/
 │   ├── conventions.md       # layouts, coordinates, colour spaces, token layout, data rules (read first)
 │   ├── results.md           # the first run's numbers and what they settled, long form
 │   ├── architecture.svg     # Figure 1
-│   ├── images/plots/        # Figures 2-8, light + dark, and numbers.json (scripts/plot_runs.py)
+│   ├── images/plots/        # Figures 2-9, light + dark SVG, and numbers.json (scripts/plot_runs.py)
 │   └── Dawn Night-Vision to Day Colorization for Drone Imagery.md   # the plan / spec
 ├── data/manifests/          # {train,val,test}_pairs.txt, fallback_pairs.txt, logs/ (committed)
 ├── results/                 # the first campaign's telemetry and evaluation, no checkpoints (committed)
@@ -1078,9 +1118,9 @@ dawn/
 │   ├── models/              # encoder (DINOv3 + LoRA), velocity (DiT + gated attention), color_head, refiner
 │   ├── eval/                # metrics (masked L* PSNR, SSIM, CIEDE2000, colourfulness, LPIPS),
 │   │                        # calibration, visualize
-│   ├── uncertainty/         # spread: the sample-spread maps (§2.9)
+│   ├── uncertainty/         # spread: the sample-spread maps (Section 2.9)
 │   ├── pipeline.py          # the testable half of run_pipeline.py
-│   └── runlog.py            # W&B + the JSONL / CSV mirrors, shared by both training scripts
+│   └── runlog.py            # metric logging (JSONL / CSV mirrors, optional W&B), both training scripts
 ├── scripts/
 │   ├── fetch_dronevehicle.py, prepare_dronevehicle.py, audit_alignment.py   # data
 │   ├── check_oracle.py, smoke_dino.py, train_flow.py, train_refiner.py       # model
@@ -1102,9 +1142,9 @@ Every script takes `--help`, and so does every subcommand of `prepare_dronevehic
 |---|---|
 | Data pipeline | **Done**, run on the real data: 5,385 aligned pairs out of 28,439 |
 | Model and training code | **Done**, one 20K-step run on an RTX 5090, 8 October 2026 |
-| Inference, uncertainty, evaluation | **Done**, run on the trained model (§5) |
+| Inference, uncertainty, evaluation | **Done**, run on the trained model (Section 5) |
 | Stage 2 refiner | **Trained**, passed its gate at +0.070 dB on the fitted grid; not yet evaluated on the generated grid, not in the headline numbers |
-| Per-pixel uncertainty calibration | Implemented (`dawn/eval/calibration.py`), **not yet run**; per-frame ρ = 0.77 is measured (§5.5) |
+| Per-pixel uncertainty calibration | Implemented (`dawn/eval/calibration.py`), **not yet run**; per-frame ρ = 0.77 is measured (Section 5.5) |
 | Ablations | Not run; five are parked in `configs/experiments.yaml` |
 | Left to build | `visualize.py` is not wired into `evaluate.py` (`report.num_examples` is read by nothing) |
 
