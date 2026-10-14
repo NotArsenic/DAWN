@@ -165,7 +165,7 @@ samples cost about 8 ms more than one, not eight times as much ([§5.8](#58-spee
 The guidance is the thermal itself, lightly blurred:
 
 ```math
-g = \operatorname{clamp}\big(\operatorname{box}_{5\times 5}(T),\ 0,\ 1\big)
+g = \mathrm{clamp}\big(\mathrm{box}_{5\times 5}(T),\ 0,\ 1\big)
 ```
 
 with replicate padding and no log or contrast stretch: thermal is not photon-starved like a dark
@@ -184,7 +184,7 @@ nodes at cell *centres*, and reads its 8 surrounding nodes with trilinear weight
 vary smoothly in space and in intensity:
 
 ```math
-\hat L(p) = \operatorname{clamp}\Big(\sum_{n \in \mathcal N(p)} w_n(p)\,\big[a_n\,T(p) + b_n\big],\ 0,\ 1\Big),
+\hat L(p) = \mathrm{clamp}\Big(\sum_{n \in \mathcal N(p)} w_n(p)\,\big[a_n\,T(p) + b_n\big],\ 0,\ 1\Big),
 \qquad \hat L^\ast(p) = 100\,\hat L(p).
 ```
 
@@ -214,7 +214,7 @@ block of colour pixels per token), upsampled **bilinearly** to the output and co
 grid's lightness:
 
 ```math
-\hat y = \operatorname{clip}_{[0,1]}\Big(\operatorname{Lab}^{-1}\big(100\,\hat L,\ \operatorname{Up}(A)\big)\Big).
+\hat y = \mathrm{clip}_{[0,1]}\Big(\mathrm{Lab}^{-1}\big(100\,\hat L,\ \mathrm{Up}(A)\big)\Big).
 ```
 
 The plan specified bilateral guided upsampling (Chen et al., 2016) so that colour edges would
@@ -293,23 +293,23 @@ come from a zero-initialised projection of the time embedding, so every block st
 identity:
 
 ```math
-h \leftarrow h + \gamma_1(t) \odot \operatorname{Attn}_\ell\big((1 + s_1(t)) \odot \operatorname{LN}(h) + \beta_1(t)\big),
+h \leftarrow h + \gamma_1(t) \odot \mathrm{Attn}_\ell\big((1 + s_1(t)) \odot \mathrm{LN}(h) + \beta_1(t)\big),
 \qquad
-h \leftarrow h + \gamma_2(t) \odot \operatorname{MLP}\big((1 + s_2(t)) \odot \operatorname{LN}(h) + \beta_2(t)\big).
+h \leftarrow h + \gamma_2(t) \odot \mathrm{MLP}\big((1 + s_2(t)) \odot \mathrm{LN}(h) + \beta_2(t)\big).
 ```
 
 **Gated DINO attention.** DINO's attention enters every block as an additive logit bias, scaled by
 one learned scalar per block, $`g_\ell`$, **initialised at 0**:
 
 ```math
-\operatorname{Attn}_\ell(Q, K, V) = \operatorname{softmax}\!\Big(\frac{QK^{\top}}{\sqrt d} + g_\ell\,\log(A + \epsilon)\Big)\,V,
+\mathrm{Attn}_\ell(Q, K, V) = \mathrm{softmax}\!\Big(\frac{QK^{\top}}{\sqrt d} + g_\ell\,\log(A + \epsilon)\Big)\,V,
 \qquad g_\ell^{(0)} = 0,\ \ \epsilon = 10^{-6}.
 ```
 
 Because the bias is a *log*, the gate is an exponent on DINO's attention:
 
 ```math
-\operatorname{softmax}(\cdot)_{ij} \;=\;
+\mathrm{softmax}(\cdot)_{ij} \;=\;
 \frac{\exp\!\big(q_i \cdot k_j / \sqrt d\big)\,(A_{ij} + \epsilon)^{g_\ell}}
      {\sum_{j'} \exp\!\big(q_i \cdot k_{j'} / \sqrt d\big)\,(A_{ij'} + \epsilon)^{g_\ell}} .
 ```
@@ -340,7 +340,7 @@ photograph in CIELAB (fallback-aligned pairs, [§3](#3-data), count half: $`\rho
 ```math
 \hat z_1 = z_t + (1 - t)\,v_\theta(z_t, t, c), \qquad
 \mathcal L_\text{render} = \mathbb E_b\!\left[\rho_b\,
-\frac{\sum_p m(p)\,\tfrac{1}{300}\,\big\lVert \operatorname{Lab}\big(\mathcal R(\hat z_1)\big)(p) - \operatorname{Lab}(y)(p)\big\rVert_1}{\sum_p m(p)}\right].
+\frac{\sum_p m(p)\,\tfrac{1}{300}\,\big\lVert \mathrm{Lab}\big(\mathcal R(\hat z_1)\big)(p) - \mathrm{Lab}(y)(p)\big\rVert_1}{\sum_p m(p)}\right].
 ```
 
 **Align.** The adapted encoder on thermal should produce the features the *frozen* encoder
@@ -355,7 +355,7 @@ token predicts the patch's soft a\*b\* histogram over the 261 bins (Zhang et al.
 bins, Gaussian $`\sigma = 5`$), counted only for patches at least half unmasked:
 
 ```math
-\mathcal L_\text{color} = -\frac{\sum_n \pi'_n \sum_{q=1}^{261} h_{nq}\,\log \operatorname{softmax}(\ell_n)_q}{\sum_n \pi'_n},
+\mathcal L_\text{color} = -\frac{\sum_n \pi'_n \sum_{q=1}^{261} h_{nq}\,\log \mathrm{softmax}(\ell_n)_q}{\sum_n \pi'_n},
 \qquad \pi'_n = \pi_n\,[\pi_n \ge 0.5].
 ```
 
@@ -370,11 +370,11 @@ fits a slowly moving feature distribution. The velocity gradient is then eased i
 instead of switched on, leaving the forward pass untouched:
 
 ```math
-\tilde f = \operatorname{sg}(f) + s(k)\,\big(f - \operatorname{sg}(f)\big), \qquad
+\tilde f = \mathrm{sg}(f) + s(k)\,\big(f - \mathrm{sg}(f)\big), \qquad
 s(k) = \begin{cases} 0, & k < 3000,\\[2pt] \min\!\big(1,\ \tfrac{k - 3000 + 1}{500}\big), & k \ge 3000,\end{cases}
 ```
 
-where $`\operatorname{sg}`$ is stop-gradient. AdamW, peak learning rate $`2\times10^{-4}`$
+where $`\mathrm{sg}`$ is stop-gradient. AdamW, peak learning rate $`2\times10^{-4}`$
 ($`10^{-4}`$ for LoRA), 1,000 steps of linear warmup then cosine to zero at step 20,000, gradient
 clip 1.0, bf16 autocast. The EMA used for validation and the checkpoints warms up as
 $`\beta_n = \min\big(0.999,\ \tfrac{1+n}{10+n}\big)`$, so early validations measure trained
@@ -389,7 +389,7 @@ their spread, on rendered L\*a\*b\* (never on tokens), unbiased:
 ```math
 \sigma_{L^\ast}(p) = \sqrt{\tfrac{1}{K-1}\textstyle\sum_{k}\big(L^{\ast}_{k}(p) - \bar L^{\ast}(p)\big)^{2}},
 \qquad
-\sigma_{ab}(p) = \sqrt{\operatorname{Var}_k\,a^{\ast}_{k}(p) + \operatorname{Var}_k\,b^{\ast}_{k}(p)} .
+\sigma_{ab}(p) = \sqrt{\mathrm{Var}_k\,a^{\ast}_{k}(p) + \mathrm{Var}_k\,b^{\ast}_{k}(p)} .
 ```
 
 $`\sigma_{ab}`$ is a chroma distance on the same scale as a CIEDE2000, so the two can be ranked
@@ -441,8 +441,8 @@ The thermal is warped onto the RGB frame (the RGB is never resampled) and every 
 pixel mask
 
 ```math
-m = \begin{cases} \texttt{valid} \wedge \neg\,\texttt{moving}, & \text{box-aligned},\\
-\texttt{valid} \wedge \neg\,\texttt{vehicles}, & \text{fallback},\end{cases}
+m = \begin{cases} \mathtt{valid} \wedge \neg\,\mathtt{moving}, & \text{box-aligned},\\
+\mathtt{valid} \wedge \neg\,\mathtt{vehicles}, & \text{fallback},\end{cases}
 ```
 
 where `valid` removes pixels the warp pulled from outside the thermal frame, `moving` removes
