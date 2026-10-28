@@ -2,7 +2,7 @@
 #
 #   --override configs/gpu_5090.yaml configs/abl_plain_schedule.yaml
 #
-# This is the CONTROL for the two changes in docs/training_budget_and_changes.md section 1b, so
+# This is the CONTROL for the two changes in, so
 # it deliberately moves two keys at once: together they are one question ("did the smoothings
 # help?"), and each is a strict generalization whose off value reproduces the old behaviour
 # exactly, so this run is the plan's schedule as written.

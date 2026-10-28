@@ -26,7 +26,7 @@
 # same memory to make the run WORSE: 3,662 train pairs over a batch of 64 is 57 steps an epoch, so
 # the whole 20,000-step budget would be 1,140 epochs of nothing -- or, held at ~87 epochs, about
 # 5,000 optimizer steps, of which the first 3,000 are spent with the conditioning detached. A 7.6M
-# transformer plus LoRA wants optimizer steps (docs/training_budget_and_changes.md section 1).
+# transformer plus LoRA wants optimizer steps.
 #
 # If you do change `optim.batch_size` here, rescale `flow.num_train_steps`,
 # `flow.warmup_steps`, `flow.warmup_ramp_steps`, `logging.val_every` and `logging.save_every`

@@ -25,7 +25,6 @@ env/
 
 # Data (large files -- download separately). The manifests are small and committed.
 data/*
-!data/manifests/
 *.pt
 *.pth
 *.ckpt
@@ -37,7 +36,6 @@ logs/
 wandb/
 runs/
 # ...except the committed data-filter logs (a later rule wins over `logs/` above)
-!data/manifests/logs/
 
 # OS
 .DS_Store
@@ -52,3 +50,5 @@ graphify-out/
 
 # DroneVehicle dataset files
 data/DroneVehicle/*
+# stray local tooling output
+hyperd.log

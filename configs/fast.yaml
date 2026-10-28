@@ -26,7 +26,7 @@
 #     batch 128 ->  2,500                      (120%: the detach NEVER lifts, silently)
 #
 # -- so a 7.8M transformer plus LoRA ends up underfitting however many epochs it saw
-# (docs/training_budget_and_changes.md section 1). The three levers that really move wall-clock
+#. The three levers that really move wall-clock
 # are epochs, timesteps_per_image, and how many runs you do. This file uses the first two; the
 # third is the default campaign, which runs one stage-1 run and parks the five ablations.
 #

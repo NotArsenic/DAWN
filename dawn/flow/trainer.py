@@ -476,8 +476,7 @@ class FlowTrainer:
             )
             logger.warning(
                 "flow.num_train_steps (%d) is close to flow.warmup_steps (%d): %s. If you raised "
-                "optim.batch_size, rescale the step counts with it "
-                "(docs/training_budget_and_changes.md).",
+                "optim.batch_size, rescale the step counts with it.",
                 total,
                 warmup,
                 verdict,

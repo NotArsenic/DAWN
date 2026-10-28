@@ -1,7 +1,6 @@
 # Stage 1: flow model training for day thermal -> RGB.
-# Layouts and conventions: docs/conventions.md
 
-# How the loss code treats the two kinds of aligned pairs (docs/conventions.md section 10.2).
+# How the loss code treats the two kinds of aligned pairs.
 # Decided by the maintainer; dawn/flow/trainer.py reads these keys.
 #   box-aligned pairs   aligned from the vehicle boxes; they have a `moving` mask.
 #   fallback pairs      aligned by edge correlation only (data/manifests/fallback_pairs.txt); no
@@ -41,7 +40,7 @@ color:
   # How the colour map (and the correction) are upsampled: bilinear | bgu. BILINEAR by the
   # maintainer's decision at Checkpoint A: on the real val pairs its colour ceiling is 0.87 mean
   # |delta a*b*| against the BGU's 1.3 (best setting) to 2.1 (16 x 20 cells), and the assembled
-  # oracle CIEDE2000 is 3.25 against 3.91 (scripts/check_oracle.py, docs/conventions.md section 6.3).
+  # oracle CIEDE2000 is 3.25 against 3.91 (scripts/check_oracle.py).
   upsample: bilinear
   # BGU (only read when upsample is bgu): a bilateral grid of a*b* ~ gain * L + offset fit at the
   # colour size and sliced at the output L. The best setting measured; ridge does not help.
@@ -52,7 +51,7 @@ color:
     refine_steps: 2
 
 # A generated L correction at the colour-map size, for what the grid cannot express. OFF until the
-# worst-10% oracle sheet and the GPU gate say it is needed (CLAUDE.md, open decisions).
+# worst-10% oracle sheet and the GPU gate say it is needed (an open design decision).
 brightness_correction:
   enabled: false
 
@@ -184,7 +183,7 @@ logging:
   # The W&B team or user the run belongs to. `null` (or no key at all) omits the entity from
   # wandb.init entirely and the account's own default is used, so a collaborator without access
   # to this one can still run. The project and entity actually used are logged at INFO on init.
-  wandb_entity: my-team
+  wandb_entity: null
   wandb_mode: online      # online | offline | disabled
   log_every: 100
   log_attn_gates: true    # log each block's learned DINO-attention gate every log_every steps
@@ -198,7 +197,7 @@ logging:
   # 20,000 / 500 = 40 validation points. At 2,500 a run produced EIGHT, which is not the
   # resolution needed to see a divergence begin on 3,662 pairs over ~87 epochs. Raise it only
   # after the gpu_probe has given you seconds/step: validation should stay a few percent of
-  # wall-clock (docs/training_budget_and_changes.md section 1a).
+  # wall-clock.
   val_every: 500
   num_val_samples: 64     # val pairs per subset (box-aligned, fallback) per validation
   # Batches of the TRAINING objective on held-out pairs, at every validation. `validate` scores
@@ -206,7 +205,7 @@ logging:
   # turns up is the memorization signal nothing else in the run reports. null = every val batch.
   val_loss_batches: 8
   # Patch retrieval: does each adapted thermal token's nearest frozen RGB token turn out to be
-  # its own? The evidence for or against a contrastive L_align (docs/proposals_review.md 4.1).
+  # its own? The evidence for or against a contrastive L_align.
   # Costs one extra frozen DINO pass per validation batch.
   val_retrieval: true
   # Which validation number picks flow_best.pt, on the `pairs.eval_subset` subset:

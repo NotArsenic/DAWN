@@ -106,7 +106,7 @@ def test_fit_gets_its_weights_from_slice(monkeypatch):
     fit_mod.fit_affine_grid(
         thermal, torch.rand(1, 1, 32, 32), compute_guidance(thermal), grid_size=(K, GY, GX)
     )
-    assert calls, "fit_affine_grid must call slice.trilinear_weights (docs/conventions.md rule 1)"
+    assert calls, "fit_affine_grid must call slice.trilinear_weights"
 
 
 def test_upsample_gets_its_weights_from_slice(monkeypatch):

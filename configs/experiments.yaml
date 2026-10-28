@@ -15,13 +15,13 @@
 # numbers to put in the README, and the gates that prove the numbers mean something.
 #
 # The `ablations:` block below is PARKED and does not run unless you pass `--ablations`. Each
-# answers an open decision in CLAUDE.md, which is a research question, not a deliverable: they
+# answers an open design decision, which is a research question, not a deliverable: they
 # cost five extra runs for knowledge about the method rather than a better model. Run one on its
 # own later if a curve makes you curious (`--only correction`), not as a matter of course.
 #
 # THE ONE RULE IF YOU DO RUN THEM: one knob against the baseline, never two. Changing the
 # schedule and (say) brightness_correction in the same run makes the result unattributable
-# (docs/training_budget_and_changes.md section 2). `abl_plain_schedule` is the single deliberate
+#. `abl_plain_schedule` is the single deliberate
 # exception and says why in its own file.
 
 # Appended to every train/eval command. This is where the hardware choice lives: drop
@@ -99,7 +99,7 @@ runs:
 
 # --- parked: research, not a deliverable --------------------------------------------------------
 # Not run unless `--ablations`. Five more runs, each the baseline plus exactly one knob, each
-# answering an open decision in CLAUDE.md. They make the method better understood, not the model
+# answering an open design decision. They make the method better understood, not the model
 # better. If you run one, run it alone: `--only correction`.
 ablations:
   - name: correction
@@ -140,7 +140,7 @@ ablations:
 
 # --- stage 2 -----------------------------------------------------------------------------------
 # Trained once, off the fitted grid, so it does not depend on which stage-1 run won
-# (docs/proposals_review.md section 8 -- that independence is also its known weakness).
+#.
 refiner:
   name: refiner
   hours: 1

@@ -42,5 +42,5 @@ lpips>=0.1.4          # the plan's "does it look like a photo" metric
 scikit-image>=0.21    # SSIM
 
 # Experiment tracking. Not optional in practice: without it a 20K-step run completes with no
-# tracking at all and one WARNING line to say so (docs/training_budget_and_changes.md section 5).
+# tracking at all and one WARNING line to say so.
 wandb>=0.16

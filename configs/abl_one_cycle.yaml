@@ -4,7 +4,7 @@
 #
 # ONE knob against the baseline. Worth knowing before reading the result: over this budget the
 # two schedules spend almost the same time near their peak (29.6% vs 29.0% of steps above 0.8x,
-# docs/proposals_review.md section 1), so the real differences are the ramp length (4,000 steps
+#), so the real differences are the ramp length (4,000 steps
 # against 1,000) and the floor the tail lands on. Expect a small effect, and do not early-stop
 # this one: a one cycle is a FIXED budget whose gain is in the last low-LR stretch.
 

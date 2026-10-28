@@ -251,7 +251,8 @@ def test_the_refiner_config_matches_the_plans_architecture_and_loss():
 
 def test_the_two_stages_log_to_different_projects_under_one_entity():
     flow, refiner = _load("flow.yaml")["logging"], _load("refiner.yaml")["logging"]
-    assert flow["wandb_entity"] == "my-team"
+    # null so a fresh clone logs to the runner's own default workspace
+    assert flow["wandb_entity"] is None
     assert (flow["wandb_project"], refiner["wandb_project"]) == ("dawn", "dawn-refiner")
     assert "wandb_entity" not in refiner
 

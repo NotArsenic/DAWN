@@ -1,5 +1,5 @@
 # Stage 2: the local refiner, the plan's optional sharpener on brightness.
-# Model: dawn/models/refiner.py   Training: scripts/train_refiner.py   Layouts: docs/conventions.md
+# Model: dawn/models/refiner.py   Training: scripts/train_refiner.py
 #
 # Merged as flow.yaml + data.yaml + THIS file, later files winning:
 #   python scripts/train_refiner.py --device cuda
@@ -48,14 +48,14 @@ refiner:
   # A frame smaller than this on an axis keeps that whole axis instead of erroring, which is what
   # the debug and mps overlays (256x320) need. Crop offsets are a fresh draw per step from the
   # trainer's own generator, seeded from --seed; the global RNG is never reseeded
-  # (docs/conventions.md section 10.3, and `crop_windows` in scripts/train_refiner.py).
+  #.
   crop_size: 256
   # The plan's loss: L1 to RGB brightness + 0.01 * |residual|, masked. The penalty is what makes
   # "do nothing" the default -- the refiner has to earn every L* it moves -- and it is the reason
   # `residual/abs_mean_Lstar` is worth watching: a run pinned against the +/- 10 bound is either
   # finding real structure or fighting the penalty, and only the improvement says which.
   residual_penalty: 0.01
-  # The budget, in EPOCHS (docs/training_budget_and_changes.md section 1):
+  # The budget, in EPOCHS:
   #
   #     8000 steps * optim.batch_size 16 / 3662 train pairs = 35 epochs
   #
@@ -81,7 +81,7 @@ optim:
   batch_size: 16           # unchanged from stage 1, so the epoch arithmetic above carries over
   grad_clip: 1.0
   # fp32. There is no large matmul here for bf16 to speed up, and target building, the grid fit
-  # and the losses are float32 by convention anyway (docs/conventions.md section 1); the stage-2
+  # and the losses are float32 by convention anyway; the stage-2
   # script never opens an autocast context on any device.
   precision: fp32
   ema_decay: 0.999         # a ~1,000-step horizon: 4.4 epochs of this budget
@@ -99,7 +99,7 @@ loader:
   num_workers: 8
 
 logging:
-  wandb_project: dawn-refiner  # stage 1 is `dawn`; wandb_entity (my-team) is inherited
+  wandb_project: dawn-refiner  # stage 1 is `dawn`; wandb_entity is inherited
   # none | refiner. Stage 2's scope map is scripts/train_refiner.py: WATCH_SCOPES -- `velocity`
   # and `all` are stage 1's and name modules this trainer does not have, so they would raise at
   # the start of the run rather than log nothing for 8,000 steps.

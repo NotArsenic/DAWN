@@ -405,7 +405,7 @@ def test_the_shipped_budget_is_the_one_its_comment_claims_in_epochs():
 def test_the_shipped_logging_goes_to_the_stage_two_workspace_with_a_valid_watch_scope():
     log = _shipped()["logging"]
     assert log["wandb_project"] == "dawn-refiner"  # stage 1 is `dawn`
-    assert log["wandb_entity"] == "my-team"  # inherited from flow.yaml, not repeated
+    assert log["wandb_entity"] is None  # inherited from flow.yaml, not repeated
     assert log["watch_scope"] in WATCH_SCOPES and log["watch_scope"] != "none"
     assert WATCH_SCOPES[log["watch_scope"]] == ("refiner",)
 

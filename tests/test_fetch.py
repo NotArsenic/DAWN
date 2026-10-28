@@ -256,8 +256,8 @@ def test_an_archive_that_is_corrupt_throughout_still_raises(tmp_path):
 
 
 def test_a_handful_of_unpaired_stems_is_tolerated(tmp_path, caplog):
-    """A bad download costs a few files; the day stage already drops pairs missing a modality
-    (docs/conventions.md 10.1), so stopping the whole run over 0.1% is out of proportion."""
+    """A bad download costs a few files; the day stage already drops pairs missing a
+    modality, so stopping the whole run over 0.1% is out of proportion."""
     _populate(tmp_path / "train", "train")  # 120 paired stems
     (tmp_path / "train" / "trainimg" / "99999.jpg").write_bytes(b"")  # 1 unpaired, 0.8%
     with caplog.at_level("WARNING"):

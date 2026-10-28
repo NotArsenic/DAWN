@@ -2,7 +2,7 @@
 # Code: dawn/data/{dronevehicle,day_filter,align,dedup,pairs}.py, scripts/prepare_dronevehicle.py.
 # Every threshold says what it means and its unit. "STARTING VALUE" marks the ones the plan
 # gave or the maintainer picked before looking at the alignment audit: they are expected to be
-# revisited after it (docs/conventions.md section 10).
+# revisited after it.
 
 dronevehicle:
   # Raw layout: <root>/<split>/{<split>img, <split>imgr, <split>label, <split>labelr}/<stem>.*

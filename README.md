@@ -85,11 +85,10 @@ none of them opened much ([Section 6.1](#61-the-attention-gates-opened-themselve
 4. [Experimental setup](#4-experimental-setup) and the campaign's gates
 5. [Results](#5-results): ceiling, test metrics, the gap, vehicles, uncertainty, colour, refiner, speed
 6. [Training dynamics](#6-training-dynamics-what-the-run-did-on-its-own): attention gates and their gradients, schedule, validation, losses, weight and gradient distributions, convergence
-7. [What this run settled](#7-what-this-run-settled)
-8. [Limitations](#8-limitations)
-9. [Reproducing](#9-reproducing): install, data, oracle, training, the campaign, inference, the figures
-10. [Project structure](#10-project-structure)
-11. [Status](#status) · [References](#references) · [Citation](#citation) · [License](#license)
+7. [Findings and limitations](#7-findings-and-limitations)
+8. [Reproducing](#8-reproducing): install, data, oracle, training, the campaign, inference, the figures
+9. [Project structure](#9-project-structure)
+10. [Status](#status) · [References](#references) · [Citation](#citation) · [License](#license)
 
 </details>
 
@@ -124,9 +123,9 @@ Two observations shape the whole design:
 | $`L`$ | lightness the grid predicts, $`L = L^\ast/100`$ | $`[0, 1]`$ |
 | $`t`$ | flow time, 0 = noise, 1 = data | $`[0, 1]`$ |
 
-Every layout, unit and coordinate convention is pinned in
-[`docs/conventions.md`](docs/conventions.md); the original design is the plan,
-[`docs/Dawn Night-Vision to Day Colorization for Drone Imagery.md`](docs/Dawn%20Night-Vision%20to%20Day%20Colorization%20for%20Drone%20Imagery.md).
+Every layout, unit and coordinate convention is fixed in code: `dawn/flow/tokens.py` owns the
+token layout, `dawn/grid/` the brightness grid, and `dawn/flow/render.py` is the single render
+path.
 
 ---
 
@@ -139,115 +138,70 @@ Every layout, unit and coordinate convention is pinned in
        alt="Dawn architecture: a LoRA-tuned DINOv3 ViT-S+/16 encoder tower conditions a 6-block DiT velocity tower; the velocity is integrated, unpacked into a brightness grid and an a*b* map, rendered in CIELAB and optionally refined into a daytime RGB frame.">
 </p>
 
-**Figure 1: the whole model on one sheet**, laid out in the idiom of Figure 1 of *Attention Is
-All You Need*. The left tower is the conditioning encoder: 12 identical blocks of self-attention
-(LoRA on qkv and the output projection; everything else frozen) and a gated MLP. The right tower
-is the generator: 6 DiT blocks in which adaLN-Zero injects the flow time $`t`$ and the residuals
-are *gated* rather than normalised, so a freshly initialised block is the identity. Blue marks the
-two routes the thermal conditioning takes: patch tokens **added** to the input tokens alongside
-the thumbnail and position embedding, and the encoder's own last-layer attention entering
-**every** block as an additive logit bias behind a per-block gate that starts at 0. Above the
-generator is everything that is not a network: two Euler steps, the unpack into the only two
-things the model generates, the render in CIELAB, and the optional stage-2 refiner that touches
-$`L`$ alone.
+**Figure 1.** Left tower: the frozen DINOv3 encoder, LoRA on qkv and the output projection. Right
+tower: the generator, 6 DiT blocks where adaLN-Zero injects the flow time and residuals are
+*gated*, so a fresh block is the identity. Blue marks the two conditioning routes: patch tokens
+**added** to the input tokens, and DINO's last-layer attention entering every block as a logit
+bias behind a per-block gate starting at 0. Above the generator: two Euler steps, the unpack, the
+CIELAB render, and the optional refiner on $`L`$ alone.
 
-<sub>Orange blocks are self-attention, blue feed-forward, yellow normalisation and the gated
-residuals, green conditioning (adaLN-Zero, and the render), grey what goes in and comes out.
-Black arrows carry data, grey a residual around a sub-layer, blue the thermal conditioning,
-green the flow time.</sub>
-
-One frame costs **one** DINO pass and $`\text{NFE}\times K`$ passes of the small velocity net
-($`2\times 8`$ at inference). That asymmetry is the main structural bet: eight uncertainty
-samples cost about 8 ms more than one, not eight times as much ([Section 5.8](#58-speed)).
+One frame costs **one** DINO pass and $`\text{NFE}\times K`$ velocity passes (2x8 at inference), the main
+structural bet ([Section 5.8](#58-speed)).
 
 ### 2.2 Brightness: an affine bilateral grid on thermal
 
-The guidance is the thermal itself, lightly blurred:
-
-```math
-g = \mathrm{clamp}\big(\mathrm{box}_{5\times 5}(T),\ 0,\ 1\big)
-```
-
-with replicate padding and no log or contrast stretch: thermal is not photon-starved like a dark
-photograph, and a per-frame p1 to p99 stretch bought only +0.06 dB because thermal already spans most
-of $`[0, 1]`$. The grid
-$`\Gamma \in \mathbb{R}^{2\times K\times g_y\times g_x}`$ holds a gain $`a_n`$ and an offset
-$`b_n`$ at every node $`n = (k, i, j)`$: intensity bin $`k`$, cell row $`i`$, cell column $`j`$.
-Each pixel $`p`$ sits at continuous grid coordinates
-
-```math
-\Big(\tfrac{(r_p + 0.5)\,g_y}{H} - 0.5,\ \ \tfrac{(c_p + 0.5)\,g_x}{W} - 0.5,\ \ g(p)\,K - 0.5\Big),
-```
-
-nodes at cell *centres*, and reads its 8 surrounding nodes with trilinear weights $`w_n(p)`$
-(summing to 1, edges replicated). Lightness is an affine function of thermal whose coefficients
-vary smoothly in space and in intensity:
+Guidance $`g`$ is the thermal after a 5x5 box blur with replicate padding, clamped to $`[0, 1]`$ (no log,
+no contrast stretch). The grid holds a gain $`a_n`$ and offset $`b_n`$ at every node
+$`n = (k, i, j)`$: intensity bin, cell row, cell column, on a 32x40 grid of 16x16 cells. Each pixel
+reads its 8 surrounding nodes with trilinear weights $`w_n(p)`$ at cell *centres*, so lightness is
+affine in thermal with coefficients varying smoothly in space and intensity:
 
 ```math
 \hat L(p) = \mathrm{clamp}\Big(\sum_{n \in \mathcal N(p)} w_n(p)\,\big[a_n\,T(p) + b_n\big],\ 0,\ 1\Big),
 \qquad \hat L^\ast(p) = 100\,\hat L(p).
 ```
 
-This is the bilateral-grid idea of Chen et al. (2007), used as in HDRNet (Gharbi et al., 2017) but
-with a *one-channel* input and $`L = L^\ast/100`$ as the output, which measured 24.72 dB against
-24.52 for fitting linear luminance and optimises the quantity that is evaluated.
-
-**Fitting the target grid.** Training targets are fitted per image, on the GPU, with no gradient.
-Each node solves a weighted ridge regression against the pixels that touch it, pulled toward a
-coarser fit so that empty or sparse bins stay sensible:
-
-```math
-(a_n, b_n) = \arg\min_{a,\,b}\ \sum_p m(p)\,w_n(p)\,\big(a\,T(p) + b - L(p)\big)^2
-\;+\; \lambda_n\Big[(a - \bar a_{c(n)})^2 + (b - \bar b_{c(n)})^2\Big],
-```
-
-where $`m`$ is the pixel mask ([Section 3](#3-data)), $`(\bar a_c, \bar b_c)`$ is the same fit for
-the node's whole cell (all bins pooled), which is itself pulled toward the whole-image fit, and
-$`\lambda_n = 10^{-3}`$ times the mean node weight. Each is a 2×2 system with a closed form. The
-per-node solve treats every node as if it alone explained its pixels, while the render blends
-eight, so one **refinement pass** fits the render residual and adds it (+0.5 dB of ceiling).
+A bilateral grid (Chen et al., 2007; Gharbi et al., 2017) with one-channel input and
+$`L = L^\ast/100`$ out. Targets are fitted per image on GPU with no gradient: each node is a weighted
+ridge regression against the pixels touching it, pulled toward its cell's fit so sparse bins stay
+sane, then one refinement pass fits the render residual (`dawn/grid/fit.py`).
 
 ### 2.3 Colour and assembly in CIELAB
 
-Colour is a generated a\*b\* map $`A \in \mathbb{R}^{2\times 4g_y\times 4g_x}`$ (128×160: a 4×4
-block of colour pixels per token), upsampled **bilinearly** to the output and combined with the
-grid's lightness:
+Colour is a generated a\*b\* map (128x160, a 4x4 block per token), upsampled **bilinearly** and
+combined with the grid's lightness:
 
 ```math
 \hat y = \mathrm{clip}_{[0,1]}\Big(\mathrm{Lab}^{-1}\big(100\,\hat L,\ \mathrm{Up}(A)\big)\Big).
 ```
 
-The plan specified bilateral guided upsampling (Chen et al., 2016) so that colour edges would
-follow brightness edges. On the real data it was worse at every grid swept (mean
-$`|\Delta a^\ast b^\ast|`$ ceiling 0.90 bilinear against 1.28 for the best BGU), **and worse at
-edges too** (1.45 against 2.37 on the top decile of gradient magnitude), because its per-cell
-affine model of colour on $`L`$ smooths away colour that is not a function of $`L`$. This single
-render path, `dawn/flow/render.py`, serves `L_render`, validation, the oracle and inference alike.
+The plan specified bilateral guided upsampling; it lost at every grid swept, whole-frame and at
+edges alike, because its per-cell affine model of colour on $`L`$ smooths away colour that is not a
+function of $`L`$. One render path, `dawn/flow/render.py`, serves `L_render`, validation, the
+oracle and inference.
 
 ### 2.4 One token per DINO patch
 
-The brightness cells, the DINO patches and the generator's tokens are the same 32×40 grid. Token
-$`n = i\,g_x + j`$ carries everything the model generates for its patch:
+Brightness cells, DINO patches and generator tokens are the same 32x40 grid. Token
+$`n = i\,g_x + j`$ carries everything generated for its patch:
 
 ```math
 x_n = \big[\underbrace{a_{0,n},\, b_{0,n},\, \dots,\, a_{K-1,n},\, b_{K-1,n}}_{2K = 16\ \text{brightness}}\ \big|\
 \underbrace{a^\ast_{n,1..16},\ b^\ast_{n,1..16}}_{32\ \text{colour: its}\ 4\times 4\ \text{block}}\big] \in \mathbb{R}^{48},
 ```
 
-standardised per *segment* (a bin-0 offset and a bin-7 offset never share a mean):
-$`z = (x - \mu)/\sigma`$, with $`\mu, \sigma`$ fitted once on 2,000 training targets and stored in
-every checkpoint. `dawn/flow/tokens.py` is the only place that packs or unpacks this layout.
+standardised per *segment*, so a bin-0 and a bin-7 offset never share a mean. `dawn/flow/tokens.py`
+is the only place that packs or unpacks this.
 
 ### 2.5 Flow matching
 
-The generator is a conditional rectified flow (Lipman et al., 2023; Liu et al., 2023) on the
-standardised tokens $`z_1`$:
+A conditional rectified flow (Lipman et al., 2023; Liu et al., 2023) on the standardised tokens,
 
 ```math
 z_t = (1 - t)\,z_0 + t\,z_1, \qquad z_0 \sim \mathcal N(0, I), \qquad t \sim \mathcal U[0, 1],
 ```
 
-and the velocity net $`v_\theta`$ regresses the straight-line velocity $`z_1 - z_0`$:
+with $`v_\theta`$ regressing the straight-line velocity:
 
 ```math
 \mathcal L_\text{flow} = \sum_{s\,\in\,\{\text{bri},\,\text{col}\}} \frac{D_s}{D}\;
@@ -255,136 +209,67 @@ and the velocity net $`v_\theta`$ regresses the straight-line velocity $`z_1 - z
 \qquad D_\text{bri} = 16,\ D_\text{col} = 32.
 ```
 
-The weights $`\omega`$ are the number of (masked) pixels behind each brightness node, and the
-kept fraction of each colour pixel, normalised to mean 1 per segment and sample, so a node
-nobody saw does not count. At inference the flow is integrated with **two Euler steps** (NFE 2):
-
-```math
-z_{k+1} = z_k + \tfrac{1}{S}\,v_\theta\big(z_k,\ \tfrac{k}{S},\ c\big), \qquad k = 0, \dots, S-1,\quad S = 2,
-```
-
-then unstandardised once, unpacked into $`(\Gamma, A)`$ and rendered.
+$`\omega`$ is the masked pixel count behind each brightness node and the kept fraction of each colour
+pixel, normalised to mean 1 per segment, so a node nobody saw does not count. Inference takes two
+Euler steps of $`\tfrac12`$, unstandardises once, unpacks and renders.
 
 ### 2.6 The conditioning: LoRA-DINOv3 and gated attention
 
-**Encoder.** DINOv3 ViT-S+/16 (28.7M parameters, frozen) reads the thermal copied to three
-channels. Every attention block's qkv and output projection carries a rank-8 LoRA adapter
-(Hu et al., 2022), 0.22M trainable parameters in 24 modules:
+**Encoder.** DINOv3 ViT-S+/16, 28.7M parameters, frozen; thermal copied to three channels. Every
+block's qkv and output projection carries a rank-8 LoRA adapter (Hu et al., 2022), 0.22M
+trainable parameters in 24 modules, zero-initialised so step 0 is exactly the pretrained encoder.
+Out come 1,280 patch tokens and the last layer's patch-to-patch attention $`A`$ (heads averaged,
+CLS and registers stripped, rows renormalised, detached).
 
-```math
-W' = W + \tfrac{\alpha}{r}\,BA, \qquad r = 8,\ \alpha = 16,\ B = 0 \text{ at initialisation},
-```
+**Velocity net.** Six DiT blocks (Peebles & Xie, 2023), width 256, 4 heads, 7.82M parameters.
+Each token's input embedding sums four terms: its noised tokens, the DINO patch feature, the
+thermal area-averaged to 32x40, and a learned position embedding. Time enters each block by
+adaLN-Zero from a zero-initialised projection, so every block starts as the identity.
 
-so at step 0 the adapted encoder is exactly the pretrained one (the smoke test logs
-`|adapted - adapters off| = 0.000e+00`). It produces 1,280 patch tokens $`f \in \mathbb R^{N\times 384}`$
-and its last layer's patch-to-patch attention $`A \in \mathbb{R}^{N\times N}`$ (heads averaged,
-CLS and the 4 register tokens stripped, rows renormalised, detached).
-
-**Velocity net.** Six DiT blocks (Peebles & Xie, 2023), width 256, 4 heads, 7.82M parameters. The
-input embedding adds the conditioning to every token:
-
-```math
-h^{(0)}_n = W_z\,z_{t,n} + W_f\,f_n + W_\tau\,\tau_n + P_n ,
-```
-
-with $`\tau`$ the thermal area-averaged to 32×40 and $`P`$ a learned position embedding. Time
-enters each block by adaLN-Zero; the shift $`\beta`$, scale $`s`$ and residual gate $`\gamma`$
-come from a zero-initialised projection of the time embedding, so every block starts as the
-identity:
-
-```math
-h \leftarrow h + \gamma_1(t) \odot \mathrm{Attn}_\ell\big((1 + s_1(t)) \odot \mathrm{LN}(h) + \beta_1(t)\big),
-\qquad
-h \leftarrow h + \gamma_2(t) \odot \mathrm{MLP}\big((1 + s_2(t)) \odot \mathrm{LN}(h) + \beta_2(t)\big).
-```
-
-**Gated DINO attention.** DINO's attention enters every block as an additive logit bias, scaled by
-one learned scalar per block, $`g_\ell`$, **initialised at 0**:
+**Gated DINO attention.** DINO's attention is an additive logit bias per block, scaled by one
+learned scalar **initialised at 0**:
 
 ```math
 \mathrm{Attn}_\ell(Q, K, V) = \mathrm{softmax}\!\Big(\frac{QK^{\top}}{\sqrt d} + g_\ell\,\log(A + \epsilon)\Big)\,V,
 \qquad g_\ell^{(0)} = 0,\ \ \epsilon = 10^{-6}.
 ```
 
-Because the bias is a *log*, the gate is an exponent on DINO's attention:
-
-```math
-\mathrm{softmax}(\cdot)_{ij} \;=\;
-\frac{\exp\!\big(q_i \cdot k_j / \sqrt d\big)\,(A_{ij} + \epsilon)^{g_\ell}}
-     {\sum_{j'} \exp\!\big(q_i \cdot k_{j'} / \sqrt d\big)\,(A_{ij'} + \epsilon)^{g_\ell}} .
-```
-
-At $`g_\ell = 0`$ the block ignores DINO; at $`g_\ell = 1`$ its attention is the product of its own
-and DINO's (a product of experts); in between, DINO's prior is tempered. A starts detached, so no
-gradient reaches the encoder through this path, but the gate itself always gets one,
-
-```math
-\frac{\partial \mathcal L}{\partial g_\ell} = \sum_{i,j} \frac{\partial \mathcal L}{\partial S^{(\ell)}_{ij}}\,\log(A_{ij} + \epsilon),
-```
-
-where $`S^{(\ell)}`$ are block $`\ell`$'s attention logits, and it carries no weight decay. Nothing
-forces a gate open: starting at 0, the generator is free to never use DINO's attention.
-[Section 6.1](#61-the-attention-gates-opened-themselves) shows what it chose.
+Because the bias is a *log*, $`g_\ell`$ is an exponent on DINO's attention: at 0 the block ignores
+DINO, at 1 the two attentions multiply, in between the prior is tempered. $`A`$ is detached, so no
+gradient reaches the encoder this way, but the gate always gets one and carries no weight decay.
+Nothing forces a gate open ([Section 6.1](#61-the-attention-gates-opened-themselves) shows what it
+chose).
 
 ### 2.7 Training objective
 
-Four terms, all masked so that invalid warp pixels and moving vehicles never contribute:
+Four terms, all masked so invalid warp pixels and moving vehicles never contribute:
 
 ```math
 \mathcal L = \mathcal L_\text{flow} + 0.1\,\mathcal L_\text{render} + 0.5\,\mathcal L_\text{align} + 0.2\,\mathcal L_\text{color}.
 ```
 
-**Render.** The one-step estimate of the clean tokens, rendered at 256×320 and compared with the
-photograph in CIELAB (fallback-aligned pairs, [Section 3](#3-data), count half: $`\rho_b = 0.5`$):
-
-```math
-\hat z_1 = z_t + (1 - t)\,v_\theta(z_t, t, c), \qquad
-\mathcal L_\text{render} = \mathbb E_b\!\left[\rho_b\,
-\frac{\sum_p m(p)\,\tfrac{1}{300}\,\big\lVert \mathrm{Lab}\big(\mathcal R(\hat z_1)\big)(p) - \mathrm{Lab}(y)(p)\big\rVert_1}{\sum_p m(p)}\right].
-```
-
-**Align.** The adapted encoder on thermal should produce the features the *frozen* encoder
-(adapters disabled with peft's `disable_adapter()`) produces on the paired RGB:
-
-```math
-\mathcal L_\text{align} = \frac{\sum_n \pi_n\,\big(1 - \cos\big(f_\phi(T)_n,\ f_{\phi_0}(y)_n\big)\big)}{\sum_n \pi_n},
-```
-
-with $`\pi_n`$ the kept fraction of patch $`n`$. **Colour.** A linear head on each adapted patch
-token predicts the patch's soft a\*b\* histogram over the 261 bins (Zhang et al., 2016: 5 nearest
-bins, Gaussian $`\sigma = 5`$), counted only for patches at least half unmasked:
-
-```math
-\mathcal L_\text{color} = -\frac{\sum_n \pi'_n \sum_{q=1}^{261} h_{nq}\,\log \mathrm{softmax}(\ell_n)_q}{\sum_n \pi'_n},
-\qquad \pi'_n = \pi_n\,[\pi_n \ge 0.5].
-```
-
-$`\mathcal L_\text{align}`$ and $`\mathcal L_\text{color}`$ train LoRA only (and the head); the head
-is discarded at inference.
+**Render** is a masked L1 in CIELAB between the photograph and the one-step estimate
+$`\hat z_1 = z_t + (1-t)\,v_\theta`$, rendered at 256x320; fallback-aligned pairs ([Section 3](#3-data)) count
+half. **Align** is $`1 - \cos`$ between the adapted encoder's thermal patch tokens and the frozen
+encoder's tokens on the paired RGB, weighted by each patch's kept fraction. **Colour** is a
+cross-entropy from a linear head on each adapted patch token against the patch's soft a\*b\*
+histogram over the 261 bins (Zhang et al., 2016), counted only for patches at least half
+unmasked. The last two train LoRA and the head only; the head is discarded at inference.
 
 ### 2.8 Schedule: detach, then ramp
 
-For the first 3,000 steps the encoder's patch tokens reach the velocity net **detached**, so LoRA
-learns from $`\mathcal L_\text{align}`$ and $`\mathcal L_\text{color}`$ alone while the generator
-fits a slowly moving feature distribution. The velocity gradient is then eased in over 500 steps
-instead of switched on, leaving the forward pass untouched:
-
-```math
-\tilde f = \mathrm{sg}(f) + s(k)\,\big(f - \mathrm{sg}(f)\big), \qquad
-s(k) = \begin{cases} 0, & k < 3000,\\[2pt] \min\!\big(1,\ \tfrac{k - 3000 + 1}{500}\big), & k \ge 3000,\end{cases}
-```
-
-where $`\mathrm{sg}`$ is stop-gradient. AdamW, peak learning rate $`2\times10^{-4}`$
-($`10^{-4}`$ for LoRA), 1,000 steps of linear warmup then cosine to zero at step 20,000, gradient
-clip 1.0, bf16 autocast. The EMA used for validation and the checkpoints warms up as
-$`\beta_n = \min\big(0.999,\ \tfrac{1+n}{10+n}\big)`$, so early validations measure trained
-weights rather than the initialisation. One encoder pass feeds 8 timesteps per image, so a step
-of 16 images is 128 velocity samples. The curves are in [Section 6.2](#62-the-schedule).
+For 3,000 steps the encoder's patch tokens reach the velocity net **detached**, so LoRA learns
+from the align and colour terms alone; the velocity gradient is then eased in linearly over 500
+steps rather than switched on, leaving the forward pass untouched. AdamW, peak LR 2e-4 (1e-4 for
+LoRA), 1,000 steps linear warmup then cosine to zero at 20,000, clip 1.0, bf16. The validation EMA
+warms up from 0.1 to 0.999, so early validations measure trained weights rather than the
+initialisation. One encoder pass feeds 8 timesteps, so a step of 16 images is 128 velocity samples
+([Section 6.2](#62-the-schedule)).
 
 ### 2.9 Uncertainty from samples
 
-$`K`$ independent noises $`z_0^{(k)}`$ give $`K`$ renders from **one** encoder pass. The maps are
-their spread, on rendered L\*a\*b\* (never on tokens), unbiased:
+$`K`$ noises give $`K`$ renders from **one** encoder pass. The maps are their spread, on rendered
+L\*a\*b\* and never on tokens, unbiased:
 
 ```math
 \sigma_{L^\ast}(p) = \sqrt{\tfrac{1}{K-1}\textstyle\sum_{k}\big(L^{\ast}_{k}(p) - \bar L^{\ast}(p)\big)^{2}},
@@ -392,26 +277,17 @@ their spread, on rendered L\*a\*b\* (never on tokens), unbiased:
 \sigma_{ab}(p) = \sqrt{\mathrm{Var}_k\,a^{\ast}_{k}(p) + \mathrm{Var}_k\,b^{\ast}_{k}(p)} .
 ```
 
-$`\sigma_{ab}`$ is a chroma distance on the same scale as a CIEDE2000, so the two can be ranked
-against each other. There is no variance head and no calibration target: a spread is a
-*disagreement*, not an error bar, and how well it tracks the error is measured, not assumed
-([Section 5.5](#55-uncertainty-measured)). The image to *display* is one member, not the ensemble mean,
-which is smoother and less colourful.
+$`\sigma_{ab}`$ is a chroma distance on the same scale as a CIEDE2000, so the two can be ranked against
+each other. No variance head, no calibration target: a spread is a *disagreement*, not an error
+bar ([Section 5.5](#55-uncertainty-measured)). Display one member, not the ensemble mean.
 
 ### 2.10 Stage 2: the local refiner
 
-An optional 2,545-parameter depthwise-separable CNN on lightness only, with a 9×9 receptive field
-(far smaller than a vehicle, which is the point), bounded so it can sharpen but not invent:
-
-```math
-L' = L + 0.1\,\tanh\big(r_\psi(L,\ T)\big).
-```
-
-It is trained on the *fitted* (oracle) grid's $`L`$ and meets the *generated* one at inference; that
-mismatch is the plan's, and is what lets stage 2 train before stage 1 exists. Colour is untouched,
-and without `--refiner` inference is byte-identical to stage 1.
-
----
+An optional 2,545-parameter depthwise-separable CNN on lightness only, 9x9 receptive field (far
+smaller than a vehicle), bounded as $`L' = L + 0.1\tanh(r_\psi(L, T))`$ so it can sharpen but not invent.
+It trains on the *fitted* grid's $`L`$ and meets the *generated* one at inference; that mismatch is
+what lets stage 2 train before stage 1 exists. Colour is untouched, and without `--refiner`
+inference is byte-identical to stage 1.
 
 ## 3. Data
 
@@ -448,9 +324,8 @@ m = \begin{cases} \mathtt{valid} \wedge \neg\,\mathtt{moving}, & \text{box-align
 where `valid` removes pixels the warp pulled from outside the thermal frame, `moving` removes
 vehicles whose own residual says they moved between the exposures, and `vehicles` (for fallback
 pairs, where nothing is known about motion) masks every vehicle, stretched 17.4 px along its
-heading where it may have moved: 12% of a frame on average. Counts at every stage:
-[`data/manifests/logs/summary.md`](data/manifests/logs/summary.md). The pipeline itself is in
-[Section 9.2](#92-data).
+heading where it may have moved: 12% of a frame on average. Counts at every stage land in `data/manifests/logs/summary.md` when the pipeline runs
+([Section 8.2](#82-data)).
 
 ---
 
@@ -458,7 +333,7 @@ heading where it may have moved: 12% of a frame on average. Counts at every stag
 
 | | |
 |---|---|
-| Hardware | one rented **RTX 5090** (32 GB), 8 October 2026 |
+| Hardware | **RTX 5090** (32 GB) on an AMD EPYC 7C13 64-core host with 129 GB RAM, 8 October 2026 |
 | Trainable parameters | velocity 7.82M · LoRA 0.22M · colour head 0.10M = **8.14M** (of 36.8M) |
 | Batch | 16 images × 8 timesteps = 128 velocity samples per step; `L_render` on a random 64 of them |
 | Budget | 20,000 steps = 229 steps/epoch × **87.4 epochs**; detached for the first 13.1 epochs |
@@ -471,7 +346,7 @@ heading where it may have moved: 12% of a frame on average. Counts at every stag
 
 ### The campaign and its gates
 
-The run is one command, `scripts/run_pipeline.py --yes` ([Section 9.5](#95-the-whole-campaign-one-command)),
+The run is one command, `scripts/run_pipeline.py --yes` ([Section 8.5](#85-the-whole-campaign-one-command)),
 and each stage is a gate for the next. A failed gate stops the campaign with a message that says
 what to do.
 
@@ -539,7 +414,7 @@ peak at 100 and is masked like the losses; LPIPS (AlexNet) is whole-frame and un
 </p>
 
 <p align="center"><sub><b>Figure 2.</b> One value per frame. Box-aligned and fallback test frames are
-indistinguishable, and there is no cluster of catastrophic failures hiding in the mean (PSNR p10
+indistinguishable, and no cluster of catastrophic failures is concealed by the mean (PSNR p10
 16.99, p90 23.89). The dashed distribution is the oracle on box-aligned val frames.</sub></p>
 
 The best decile nearly touches the ceiling (CIEDE2000 p10 5.07 against 3.25); the average is
@@ -583,7 +458,7 @@ reason the overfit gate exists.
 | CIEDE2000 | 8.31 | **12.54** |
 | SSIM | 0.556 | **0.374** |
 
-About 50% more colour error on exactly the objects a drone application cares about. Thermal
+About 50% more colour error on the objects a drone application cares about most. Thermal
 carries no paint, so a red car and a blue car are the same input and the model paints the
 statistically likely colour. The vehicle region is the `vehicles` mask (every vehicle, dilated);
 it exists only for box-aligned pairs in this evaluation, so the fallback rows of `report.md`
@@ -622,7 +497,7 @@ this evaluation.
 
 Three numbers that look independent are one phenomenon: **the model has collapsed toward the
 conditional mean**. It behaves like a regressor emitting one safe answer rather than a generator
-drawing from a distribution of plausible colourings; if its samples were genuinely diverse, their
+drawing from a distribution of plausible colourings; if its samples were more diverse, their
 spread would be larger *and* averaging them would help far more than 0.23 dB. The duller end of
 the distribution is where it shows most (output p10 colourfulness 4.08 against the photographs'
 8.84), which is what defaulting to grey when the signal is weak looks like. Flow matching was
@@ -728,8 +603,8 @@ Four things stand out:
    points the same way as the rest: DINO's attention structure is a prior that pays off when the
    model has to **generalise** across scenes, not when it can look frames up.
 
-[`docs/results.md`](docs/results.md) quotes the gates over steps 3,300 → 10,000 (block 4
-0.57 → 0.85, block 5 0.50 → 0.34), read mid-run; the values above are the full run's.
+Read mid-run, over steps 3,300 → 10,000, the gates were block 4 0.57 → 0.85 and block 5
+0.50 → 0.34; the values above are the full run's.
 
 ### 6.2 The schedule
 
@@ -833,52 +708,26 @@ buy a longer tail.
 
 ---
 
-## 7. What this run settled
+## 7. Findings and limitations
 
-Each of these was an open argument before 8 October 2026; each is now a measurement
-([`docs/results.md`](docs/results.md) has the long form).
-
-| Question | Answer | Evidence |
-|---|---|---|
-| Can a brightness grid carry lightness? | **Yes** | oracle 25.08 dB ≥ the plan's 24 dB rule |
-| Euler or midpoint at NFE 2? | **Euler** | better on every accuracy metric, on both test subsets and at every validation; midpoint is more colourful and noisier |
-| Bilinear or BGU for colour? | **Bilinear, at edges too** | BGU 63% worse at edges against 42% whole-frame; the `bgu` ablation is retired |
-| Does the DINO attention bias earn its place? | **Yes, per block** | gates opened from 0 to 0.31 to 0.94, differently per block (Section 6.1) |
-| Contrastive `L_align`? | **No** | retrieval 0.87 within one patch against 0.46 exactly: misses are the camera offset |
-| Keep the fallback pairs? | **Yes** | 20.11 / 8.37 against box-aligned 20.05 / 8.31 at test |
-| `timesteps_per_image: 8` on 32 GB? | **Affordable** | 0.40 s/step, 17.1 GB |
-| Does the refiner earn its place? | **Marginally, on the fitted grid** | +0.070 dB; untested on the generated grid |
-
-Still open, and the two with measured headroom: the **brightness correction**
-(`configs/correction.yaml`: ceiling 25.08 → 26.85 dB, CIEDE2000 3.33 → 2.77; a layout change, so
-its own run) and the **colour-map resolution** (`color.block`), which is what caps the
-colourfulness ceiling at 93%. The full list is in `CLAUDE.md` under *Open decisions*.
+The grid carries lightness (oracle 25.08 dB against the plan's 24 dB rule), Euler beats midpoint
+at NFE 2, bilinear colour upsampling beats BGU at edges as well as whole-frame, the DINO attention
+gates open by themselves and differently per block, fallback pairs score the same as box-aligned
+ones, and the refiner gains +0.070 dB on the fitted grid but is untested on the generated one. The
+limits are the physics and the data: anything without a heat signature is guessed, the training set
+is 3,662 pairs aligned to a pixel or two with moved vehicles masked rather than fixed, night and
+other thermal cameras are out of scope, colour reaches 64% of the photograph's colourfulness where
+the parametrisation allows 93%, and the uncertainty maps rank error (Spearman 0.77) at about a
+fifth of its size rather than calibrating it. There is no SSIM or LPIPS ceiling to read those two
+against, and no ablation was run. The two with measured headroom are the brightness correction
+(ceiling 25.08 to 26.85 dB) and the colour-map resolution, both layout changes needing their own
+run.
 
 ---
 
-## 8. Limitations
+## 8. Reproducing
 
-1. **Invented detail.** Anything without a heat signature (paint, text, lane markings, a car's
-   colour) is guessed. Read the uncertainty maps next to the output.
-2. **A small training set.** 3,662 training pairs: only pairs that pass a strict alignment filter
-   are used, about 63% of the day pairs (35% by boxes alone, the rest through the edge fallback).
-3. **Residual misalignment.** The cameras are not co-registered; pairs are aligned to a pixel or
-   two, and vehicles that moved between the exposures are masked, not fixed.
-4. **Day only.** Night pairs and other thermal cameras are out of scope.
-5. **Colour is washed out on unseen scenes**: 64% of the photograph's colourfulness where the
-   parametrisation allows 93% (Section 5.6). The clearest target for a next run.
-6. **The uncertainty maps rank, they do not calibrate.** Per frame, ρ = 0.77 with the error, at
-   about a fifth of its size (Section 5.5). Per-pixel calibration is not yet measured.
-7. **No SSIM or LPIPS ceiling.** `check_oracle.py` measures only L\* PSNR and CIEDE2000, so how much
-   of LPIPS 0.535 is the design's floor is unknown.
-8. **One model, no ablations.** The five in `configs/experiments.yaml` are parked; nothing here
-   compares design choices that were not run, and Section 6.1's reading of block 5 is a hypothesis.
-
----
-
-## 9. Reproducing
-
-### 9.1 Install
+### 8.1 Install
 
 ```bash
 git clone https://github.com/rzx01/dawn.git
@@ -906,7 +755,7 @@ ruff check dawn scripts tests
   repo: accept its license and `export HF_TOKEN=...`. Either way the DINOv3 license applies. Tests
   never download weights.
 
-### 9.2 Data
+### 8.2 Data
 
 ```bash
 python scripts/fetch_dronevehicle.py        # download ~14 GB, unpack, arrange, verify
@@ -955,14 +804,14 @@ python scripts/audit_alignment.py               # 100 accepted + 100 rejected pa
 8. **Dedup**: a val/test pair whose RGB *and* thermal perceptual hashes are both within 6 bits of
    the same train pair is dropped (3 pairs).
 
-Committed: `data/manifests/{train,val,test}_pairs.txt`, `fallback_pairs.txt` and
-`data/manifests/logs/{day,align,dedup}.csv` plus `summary.md` (every decision, with every pair's
-fitted transform). Every threshold lives in `configs/data.yaml`. Re-running is idempotent; `--force`
+`write` emits `data/manifests/{train,val,test}_pairs.txt`, `fallback_pairs.txt` and
+`logs/{day,align,dedup}.csv` plus `summary.md` (every decision, with every pair's fitted
+transform); `data/` is generated, not committed. Every threshold lives in `configs/data.yaml`. Re-running is idempotent; `--force`
 redoes finished work. The pairs are served by `dawn.data.pairs.AlignedPairs`.
 
 </details>
 
-### 9.3 The oracle
+### 8.3 The oracle
 
 ```bash
 python scripts/check_oracle.py      # the ceiling on all val pairs -> outputs/oracle/report.md + worst-10% sheets (CPU is fine)
@@ -972,7 +821,7 @@ The worst-10% sheets (`outputs/oracle/worst10_grid_only_*.jpg`) are cluttered ya
 painted containers and roofs, and shadows: fine texture and surface paint that thermal does not
 carry.
 
-### 9.4 Training
+### 8.4 Training
 
 ```bash
 python scripts/train_flow.py --config configs/flow.yaml --override configs/debug.yaml --device cpu     # 40 steps on real pairs, ~30 s
@@ -1019,12 +868,10 @@ neither term contains the batch size: raising it only trades step count for step
 and the run would look healthy the whole way. If you do change the batch, rescale
 `flow.num_train_steps`, `flow.warmup_steps`, `flow.warmup_ramp_steps`, `logging.val_every` and
 `logging.save_every` with it; the start-of-run `Budget:` line prints the result in epochs.
-[`docs/training_budget_and_changes.md`](docs/training_budget_and_changes.md) sections 1, 1a and 1b have
-the reasoning.
 
 </details>
 
-### 9.5 The whole campaign, one command
+### 8.5 The whole campaign, one command
 
 ```bash
 python scripts/run_pipeline.py --list      # what would run, in order, with the GPU-hours
@@ -1053,7 +900,7 @@ GPU-hours budgeted, 3.2 h measured on the 5090.
   parked: they buy knowledge about the method, not a better model. Run one alone with
   `--only correction`.
 
-### 9.6 Inference and evaluation
+### 8.6 Inference and evaluation
 
 ```bash
 python scripts/infer.py --checkpoint runs/baseline/flow_best.pt --input frames/ --device cuda    # RGB + l_std + ab_std maps, K=8
@@ -1064,9 +911,7 @@ python scripts/evaluate.py --checkpoint runs/baseline/flow_best.pt --split test_
 python scripts/benchmark_latency.py --checkpoint runs/baseline/flow_best.pt --device cuda --samples 8
 ```
 
-What each piece does and why: [`docs/inference_eval_phase.md`](docs/inference_eval_phase.md).
-
-### 9.7 The figures on this page
+### 8.7 The figures on this page
 
 ```bash
 python scripts/plot_runs.py                                            # results/ -> docs/images/plots/
@@ -1083,7 +928,7 @@ rendered for light and dark pages, and `numbers.json` holds every number Section
 
 ---
 
-## 10. Project structure
+## 9. Project structure
 
 <details>
 <summary><b>What lives where</b></summary>
@@ -1101,12 +946,9 @@ dawn/
 │   ├── eval.yaml            # evaluation: subsets, NFE, K, vehicle region
 │   └── experiments.yaml     # the whole campaign: gates, baseline, ablations, stage 2, eval
 ├── docs/
-│   ├── conventions.md       # layouts, coordinates, colour spaces, token layout, data rules (read first)
-│   ├── results.md           # the first run's numbers and what they settled, long form
 │   ├── architecture.svg     # Figure 1
-│   ├── images/plots/        # Figures 2-9, light + dark SVG, and numbers.json (scripts/plot_runs.py)
-│   └── Dawn Night-Vision to Day Colorization for Drone Imagery.md   # the plan / spec
-├── data/manifests/          # {train,val,test}_pairs.txt, fallback_pairs.txt, logs/ (committed)
+│   └── images/plots/        # Figures 2-9, light + dark SVG, and numbers.json (scripts/plot_runs.py)
+├── data/                    # generated: manifests, logs, aligned PNGs (gitignored)
 ├── results/                 # the first campaign's telemetry and evaluation, no checkpoints (committed)
 ├── release/visdrone_labels/ # earlier VisDrone day/night hand labels, pending a separate release
 ├── dawn/

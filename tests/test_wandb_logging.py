@@ -219,7 +219,7 @@ def test_the_shipped_config_names_the_stage_1_project_and_the_entity():
     pytest.importorskip("omegaconf")
     logging_cfg = load_config("configs/flow.yaml", "configs/data.yaml", [])["logging"]
     assert logging_cfg["wandb_project"] == "dawn", "stage 2 is the one that logs to dawn-refiner"
-    assert logging_cfg["wandb_entity"] == "my-team"
+    assert logging_cfg["wandb_entity"] is None
 
 
 def test_the_stage_1_script_still_re_exports_the_names():

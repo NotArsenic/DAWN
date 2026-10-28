@@ -4,7 +4,7 @@
 #
 # Merged on flow.yaml + data.yaml, later files winning, like every other overlay. The MODEL side
 # (layout, resolution, upsampling, stats) is NOT read from here -- it comes out of the checkpoint,
-# because a checkpoint is tied to what it was trained with (docs/conventions.md section 5.1).
+# because a checkpoint is tied to what it was trained with.
 
 eval:
   split: test_pairs        # the manifest to score. val_pairs while iterating; test_pairs once.
@@ -22,7 +22,7 @@ eval:
   num_samples: 8
 
   # Draw z_0 from the image ID, so the reported numbers are reproducible on any machine and do
-  # not depend on batch composition (docs/conventions.md section 10.3).
+  # not depend on batch composition.
   seed_from_image_id: true
 
   # Report box-aligned and fallback pairs separately. Fallback pairs are aligned by edge
