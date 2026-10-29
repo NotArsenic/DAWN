@@ -955,7 +955,6 @@ dawn/
 │   └── images/plots/        # Figures 2-9, light + dark SVG, and numbers.json (scripts/plot_runs.py)
 ├── data/                    # generated: manifests, logs, aligned PNGs (gitignored)
 ├── results/                 # the first campaign's telemetry and evaluation, no checkpoints (committed)
-├── release/visdrone_labels/ # earlier VisDrone day/night hand labels, pending a separate release
 ├── dawn/
 │   ├── data/                # dronevehicle, day_filter, align, dedup, pairs, report, audit, sheets,
 │   │                        # color (sRGB, CIELAB), resample (area_downsample), seeding
@@ -1028,11 +1027,14 @@ Every script takes `--help`, and so does every subcommand of `prepare_dronevehic
 
 ## License
 
-The code is MIT (see `LICENSE`). Three things are not covered by it:
+The code and the released checkpoints are MIT (see `LICENSE`). Two things are not covered by it:
 
-- **DroneVehicle.** Its license terms have not been checked yet. Do not release aligned pairs,
-  manifests derived from it or checkpoints trained on it until they are. The per-pair rows in
-  `results/` name DroneVehicle image IDs and carry no image content.
+- **DroneVehicle.** The dataset ([VisDrone/DroneVehicle](https://github.com/VisDrone/DroneVehicle),
+  [McCheng/DroneVehicle](https://huggingface.co/datasets/McCheng/DroneVehicle)) states no license
+  on either page; the authors only ask that you cite Sun et al. (2022) if you use it. Without an
+  explicit grant, treat its terms as the authors' own and use it for research. We do not
+  redistribute DroneVehicle images, labels or aligned pairs, and the per-pair rows in `results/`
+  name image IDs and carry no image content. The checkpoints are trained on it, so check with the
+  authors before any commercial use.
 - **DINOv3 weights** are gated and have their own license; accept it on Hugging Face before use.
-- **VisDrone labels** in `release/visdrone_labels/` are our own hand labels of VisDrone-DET frames and
-  wait for a separate release; the images are not included and VisDrone's terms apply to them.
+  The checkpoints hold only the LoRA adapters, not the base weights.
