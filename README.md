@@ -731,7 +731,7 @@ run.
 ### 8.1 Install
 
 ```bash
-git clone https://github.com/rzx01/dawn.git
+git clone https://github.com/NotArsenic/dawn
 cd dawn
 
 # The 5090 is Blackwell (sm_120) and needs a CUDA 12.8+ build: install torch FIRST, from the
@@ -1020,7 +1020,7 @@ Every script takes `--help`, and so does every subcommand of `prepare_dronevehic
   title  = {DAWN: Real-Time Thermal-to-Daylight Synthesis on Drone images with LoRA-DINOv3 Gated Attention and Rectified Flow},
   author = {NotArsenic@Github, rzx01@Github},
   year   = {2026},
-  url    = {https://github.com/rzx01/dawn},
+  url    = {https://github.com/NotArsenic/dawn},
   note   = {Model: https://huggingface.co/Arsenicc/DAWN}
 }
 ```
