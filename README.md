@@ -1,4 +1,4 @@
-<h1 align="center">Dawn</h1>
+<h1 align="center">DAWN: Real-Time Thermal-to-Daylight Synthesis on Drone images with LoRA-DINOv3 Gated Attention and Rectified Flow</h1>
 
 <p align="center">
   <b>Day thermal → colour for drone imagery.</b><br>
@@ -12,6 +12,7 @@
   <img alt="license MIT" src="https://img.shields.io/badge/license-MIT-1BAF7A?style=flat-square&labelColor=1c1c1c">
   <img alt="L* PSNR 20.05 dB" src="https://img.shields.io/badge/L*_PSNR-20.05_dB-EDA100?style=flat-square&labelColor=1c1c1c">
   <img alt="speed 40 FPS" src="https://img.shields.io/badge/speed-40_FPS-E87BA4?style=flat-square&labelColor=1c1c1c">
+  <a href="https://huggingface.co/Arsenicc/DAWN"><img alt="Hugging Face model" src="https://img.shields.io/badge/%F0%9F%A4%97_model-Arsenicc%2FDAWN-FFD21E?style=flat-square&labelColor=1c1c1c"></a>
 </p>
 
 <p align="center">
@@ -902,6 +903,10 @@ GPU-hours budgeted, 3.2 h measured on the 5090.
 
 ### 8.6 Inference and evaluation
 
+The trained model is on Hugging Face: [Arsenicc/DAWN](https://huggingface.co/Arsenicc/DAWN).
+It holds `stage1/flow_best.pt` (the generator, for `--checkpoint`) and `stage2/refiner_best.pt` (for
+`--refiner`).
+
 ```bash
 python scripts/infer.py --checkpoint runs/baseline/flow_best.pt --input frames/ --device cuda    # RGB + l_std + ab_std maps, K=8
 python scripts/infer.py --checkpoint runs/baseline/flow_best.pt \
@@ -1013,10 +1018,11 @@ Every script takes `--help`, and so does every subcommand of `prepare_dronevehic
 
 ```bibtex
 @software{dawn2026,
-  title  = {Dawn: Day Thermal to Colour for Drone Imagery},
+  title  = {DAWN: Real-Time Thermal-to-Daylight Synthesis on Drone images with LoRA-DINOv3 Gated Attention and Rectified Flow},
   author = {NotArsenic@Github, rzx01@Github},
   year   = {2026},
-  url    = {https://github.com/rzx01/dawn}
+  url    = {https://github.com/rzx01/dawn},
+  note   = {Model: https://huggingface.co/Arsenicc/DAWN}
 }
 ```
 
